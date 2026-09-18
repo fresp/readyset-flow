@@ -51,7 +51,8 @@ to `~/.omp/agent/skills/`. There's no build step — omp loads extensions as `.t
 
 `~/.omp/agent/` is a shared namespace — other extensions' files already live there. Every file
 this package installs is prefixed `readyset-` (`readyset-brainstorm.ts`, `readyset-omp-config.ts`,
-`readyset-spec.ts`, `readyset-review.ts`) specifically so it can never collide with or silently
+`readyset-spec.ts`, `readyset-review-overlay.ts`, `readyset-review.ts`) specifically so it can
+never collide with or silently
 overwrite something already installed there, regardless of what else you have running.
 
 Pass `--target <path>` to install somewhere else instead — a scratch directory for testing, or
@@ -117,9 +118,11 @@ It picks a brainstorm, and depending on its status:
   re-deriving it. Both phases are logged to `CONTEXT.md` as they happen. This then drops straight
   into the review gate below (no manual re-invocation needed).
 - **Already proposed** — goes straight to the review gate: **Approve & Execute** / **Refine**
-  (describe what to change, loops back into another revision turn) / **Jump to section** (browse
-  one section at a time — see below) / **Buka untuk direview** (pushes the full compiled document
-  into the editor pane, nothing changed) / **Discard**.
+  (describe what to change, loops back into another revision turn) / **Sidebar view** (a
+  persistent section list + content pane, like native `/plan`'s review — see below) or **Jump to
+  section** as a fallback where `Sidebar view` isn't available / **Discard**. The full compiled
+  document is always pushed into the editor pane too, on every pass through the gate, so it's
+  never more than one pane-switch away regardless of which option is picked.
 - **Approve & Execute** implements the tasks. Each completed task must carry an indented
   `_Verified: <what was checked, and the result>` note under it — if the implementation checks a
   box without one, the review gate stops and offers to send it back for another pass rather than
@@ -138,20 +141,20 @@ It picks a brainstorm, and depending on its status:
 - `archiveChange` merges delta specs into the main spec **append-only** — never a real
   ADDED/MODIFIED/REMOVED diff-merge. Safe (nothing is deleted or silently rewritten), but cruder
   than a proper schema-aware archiver; review the merged spec afterward.
-- The review screen is a `ctx.ui.select` picker plus a `setWidget` summary (capped at 10 lines)
-  — the ceiling of what omp's extension API exposes to third-party extensions. Extensions cannot
-  register a sidebar, tree view, webview, or any other persistent navigable region — UI is
-  confined to modal dialogs (`select`/`confirm`/`input`/`editor`) and single stacked regions
-  above/below the editor. So the review gate does the closest thing available instead: it pushes
-  the whole change as one compiled document into the editor pane via `setEditorText` — a numbered
-  table of contents with a status tag per section (`[done]`, `[2/3 ticked]`, etc.), then every
-  section body below it, separated by `═`/`─` rules instead of bare markdown headers (the editor
-  pane doesn't render markdown, so visual rules read better than `##`/`###` as plain text) — and
-  adds a **Jump to section** option on the gate that opens a `select` menu of just the section
-  headings/status, so a section can be viewed in isolation instead of scrolling the whole thing;
-  picking "◂ Back to full document" restores the compiled view. It is a menu-driven stand-in for
-  a sidebar, not a sidebar — there's no persistent list of sections next to the content the way
-  `/plan`'s native Plan Review shows one; each jump is a full swap of what's in the editor pane.
+- The review screen has two tiers, chosen automatically by feature-detecting `ctx.ui.custom` at
+  gate time. Where it's available (an interactive terminal session — the normal way `omp` is
+  actually run), **Sidebar view** renders a real persistent two-pane overlay via `ctx.ui.custom()`
+  — the same mechanism native `/plan`'s own review sidebar is built from, not a simulation of one:
+  a section list on the left (`↑`/`↓` to switch), that section's content on the right, `PgUp`/
+  `PgDn` to scroll it, `Esc` to close. Where `ctx.ui.custom` isn't available (RPC/ACP/print
+  contexts, or an older omp without it), the gate falls back to **Jump to section** — a
+  `select` menu of just the section headings/status, swapping the editor pane's full content
+  one section at a time; picking "◂ Back to full document" restores the compiled view. Either
+  way, the full change is also always pushed into the editor pane as one compiled document via
+  `setEditorText` — a numbered table of contents with a status tag per section (`[done]`,
+  `[2/3 ticked]`, etc.), then every section body below it, separated by `═`/`─` rules instead of
+  bare markdown headers (the editor pane doesn't render markdown, so visual rules read better than
+  `##`/`###` as plain text) — so it's on screen regardless of which navigation mode is active.
 
 ## Files a change accumulates
 
@@ -176,6 +179,8 @@ src/
     readyset-brainstorm.ts   shared helpers: frontmatter parsing, status reconciliation, lane detection
     readyset-spec.ts         Readyset's own change-artifact format: scaffold/validate/progress/archive
     readyset-omp-config.ts   reads omp's own ~/.omp/agent/config.yml for a default --model fallback
+    readyset-review-overlay.ts  the Sidebar view Component — pure layout function + a
+                             ctx.ui.custom()-driven overlay, zero runtime dependency on @oh-my-pi/pi-tui
   extensions/
     readyset-review.ts      the /readyset-review command itself
   skill/
@@ -190,7 +195,7 @@ Installed layout, once `readyset-review install` has run (default target `~/.omp
 
 ```
 ~/.omp/agent/
-  lib/readyset-brainstorm.ts, readyset-spec.ts, readyset-omp-config.ts
+  lib/readyset-brainstorm.ts, readyset-spec.ts, readyset-omp-config.ts, readyset-review-overlay.ts
   extensions/readyset-review.ts
   skills/readyset/SKILL.md
 ```
