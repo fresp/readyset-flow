@@ -1,0 +1,279 @@
+import { mkdir, rm, writeFile, readFile, mkdtemp } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import assert from "node:assert/strict";
+import {
+  ensureReadysetRoot,
+  scaffoldChange,
+  validateChange,
+  getProgress,
+  archiveChange,
+  changePaths,
+  listSubmodules,
+  hasExploration,
+  appendContext,
+  readContext,
+  checkTaskVerification,
+  readReview,
+} from "../src/lib/readyset-spec.ts";
+
+let pass = 0;
+let fail = 0;
+async function test(name: string, fn: () => Promise<void>) {
+  try {
+    await fn();
+    pass++;
+    console.log(`ok - ${name}`);
+  } catch (e) {
+    fail++;
+    console.log(`FAIL - ${name}`);
+    console.log(e);
+  }
+}
+
+async function freshCwd() {
+  return await mkdtemp(join(tmpdir(), "osl-"));
+}
+
+await test("ensureReadysetRoot creates dirs", async () => {
+  const cwd = await freshCwd();
+  await ensureReadysetRoot(cwd);
+  const stat = await import("node:fs/promises").then((m) => m.stat);
+  assert.ok((await stat(join(cwd, "readyset", "changes"))).isDirectory());
+  assert.ok((await stat(join(cwd, "readyset", "changes", "archive"))).isDirectory());
+  assert.ok((await stat(join(cwd, "readyset", "specs"))).isDirectory());
+});
+
+await test("scaffoldChange is idempotent and creates specs dir", async () => {
+  const cwd = await freshCwd();
+  const paths1 = await scaffoldChange(cwd, "my-change");
+  const paths2 = await scaffoldChange(cwd, "my-change");
+  assert.equal(paths1.dir, paths2.dir);
+  const stat = await import("node:fs/promises").then((m) => m.stat);
+  assert.ok((await stat(paths1.specsDir)).isDirectory());
+});
+
+await test("validateChange: missing everything -> multiple issues", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "empty-change");
+  const result = await validateChange(cwd, "empty-change");
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some((i) => i.file === "proposal.md" && i.problem === "missing"));
+  assert.ok(result.issues.some((i) => i.file === "specs/"));
+  assert.ok(result.issues.some((i) => i.file === "tasks.md" && i.problem === "missing"));
+});
+
+await test("validateChange: proposal missing sections", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "partial-change");
+  await writeFile(paths.proposal, "# Some proposal\n\nno sections here\n", "utf8");
+  const result = await validateChange(cwd, "partial-change");
+  assert.ok(result.issues.some((i) => i.problem.includes("Why")));
+  assert.ok(result.issues.some((i) => i.problem.includes("What Changes")));
+});
+
+await test("validateChange: full valid artifact passes", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "good-change");
+  await writeFile(
+    paths.proposal,
+    "## Why\n\nBecause reasons.\n\n## What Changes\n\n- did a thing\n",
+    "utf8",
+  );
+  await writeFile(paths.design, "## Context\n\nblah\n", "utf8");
+  await mkdir(join(paths.specsDir, "my-capability"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "my-capability", "spec.md"),
+    "## Purpose\n\nfoo\n\n## ADDED Requirements\n\n### Requirement: Does the thing\n\n#### Scenario: happy path\n\n- **WHEN** the user does X\n- **THEN** Y happens\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "## Tasks\n\n- [ ] 1.1 do the thing\n", "utf8");
+  const result = await validateChange(cwd, "good-change");
+  assert.deepEqual(result.issues, []);
+  assert.equal(result.ok, true);
+});
+
+await test("validateChange: requirement without WHEN/THEN flagged", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "bad-scenario-change");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "cap"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "cap", "spec.md"),
+    "## Purpose\n\nx\n\n### Requirement: Foo\n\nno scenario here\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "bad-scenario-change");
+  assert.ok(result.issues.some((i) => i.problem.includes("WHEN/THEN")));
+});
+
+await test("getProgress: not_started / in_progress / all_done / missing", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "progress-change");
+
+  const missing = await getProgress(cwd, "progress-change");
+  assert.equal(missing, undefined);
+
+  await writeFile(paths.tasks, "## Tasks\n\n(nothing checked off, no boxes)\n", "utf8");
+  const notStarted = await getProgress(cwd, "progress-change");
+  assert.deepEqual(notStarted, { done: 0, total: 0, state: "not_started" });
+
+  await writeFile(paths.tasks, "- [ ] 1.1 a\n- [x] 1.2 b\n- [ ] 1.3 c\n", "utf8");
+  const inProgress = await getProgress(cwd, "progress-change");
+  assert.deepEqual(inProgress, { done: 1, total: 3, state: "in_progress" });
+
+  await writeFile(paths.tasks, "- [x] 1.1 a\n- [X] 1.2 b\n", "utf8");
+  const allDone = await getProgress(cwd, "progress-change");
+  assert.deepEqual(allDone, { done: 2, total: 2, state: "all_done" });
+});
+
+await test("archiveChange: moves dir and creates new spec file", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "archive-change-1");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "widgets"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "widgets", "spec.md"),
+    "## Purpose\n\nwidgets\n\n### Requirement: Spin\n\n#### Scenario: spins\n\n- **WHEN** spun\n- **THEN** it spins\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [x] 1.1 done\n", "utf8");
+
+  const result = await archiveChange(cwd, "archive-change-1");
+  assert.match(result.archivedDir, /archive-change-1$/);
+  assert.equal(result.mergedSpecFiles.length, 1);
+
+  const mergedContent = await readFile(result.mergedSpecFiles[0], "utf8");
+  assert.ok(mergedContent.includes("Spin"));
+
+  // original change dir should be gone
+  let stillThere = true;
+  try {
+    await readFile(paths.proposal);
+  } catch {
+    stillThere = false;
+  }
+  assert.equal(stillThere, false);
+});
+
+await test("archiveChange: appends to existing spec rather than overwriting", async () => {
+  const cwd = await freshCwd();
+  await ensureReadysetRoot(cwd);
+  await mkdir(join(cwd, "readyset", "specs", "widgets"), { recursive: true });
+  await writeFile(
+    join(cwd, "readyset", "specs", "widgets", "spec.md"),
+    "## Purpose\n\noriginal widgets spec\n\n### Requirement: Existing\n\n#### Scenario: already there\n\n- **WHEN** x\n- **THEN** y\n",
+    "utf8",
+  );
+
+  const paths = await scaffoldChange(cwd, "archive-change-2");
+  await mkdir(join(paths.specsDir, "widgets"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "widgets", "spec.md"),
+    "### Requirement: NewOne\n\n#### Scenario: new\n\n- **WHEN** a\n- **THEN** b\n",
+    "utf8",
+  );
+
+  const result = await archiveChange(cwd, "archive-change-2");
+  const mergedContent = await readFile(result.mergedSpecFiles[0], "utf8");
+  assert.ok(mergedContent.includes("original widgets spec"));
+  assert.ok(mergedContent.includes("Existing"));
+  assert.ok(mergedContent.includes("NewOne"));
+  assert.ok(mergedContent.includes("From change: archive-change-2"));
+});
+
+await test("changePaths with empty cwd produces clean relative paths", async () => {
+  const paths = changePaths("", "my-id");
+  assert.equal(paths.proposal, "readyset/changes/my-id/proposal.md");
+  assert.equal(paths.tasks, "readyset/changes/my-id/tasks.md");
+  assert.equal(paths.specsDir, "readyset/changes/my-id/specs");
+});
+
+await test("listSubmodules: no .gitmodules -> empty array", async () => {
+  const cwd = await freshCwd();
+  const result = await listSubmodules(cwd);
+  assert.deepEqual(result, []);
+});
+
+await test("listSubmodules: parses multiple submodules, including the one that got dropped live", async () => {
+  const cwd = await freshCwd();
+  await writeFile(
+    join(cwd, ".gitmodules"),
+    [
+      '[submodule "services/platform-api"]',
+      "\tpath = services/platform-api",
+      "\turl = git@example.com:oca/platform-api.git",
+      "",
+      '[submodule "services/portal"]',
+      "\tpath = services/portal",
+      "\turl = git@example.com:oca/portal.git",
+    ].join("\n"),
+    "utf8",
+  );
+  const result = await listSubmodules(cwd);
+  assert.equal(result.length, 2);
+  assert.ok(result.some((s) => s.name === "services/platform-api" && s.path === "services/platform-api"));
+  assert.ok(result.some((s) => s.name === "services/portal" && s.path === "services/portal"));
+});
+
+await test("hasExploration: false when missing/empty, true once written", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "exp-change");
+  assert.equal(await hasExploration(cwd, "exp-change"), false);
+  const paths = changePaths(cwd, "exp-change");
+  await writeFile(paths.exploration, "   \n", "utf8"); // whitespace-only still counts as empty
+  assert.equal(await hasExploration(cwd, "exp-change"), false);
+  await writeFile(paths.exploration, "## Findings\n\nsubmodule X pinned at commit Y\n", "utf8");
+  assert.equal(await hasExploration(cwd, "exp-change"), true);
+});
+
+await test("appendContext/readContext: creates file, appends in order, tags phase+timestamp", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "ctx-change");
+  assert.equal(await readContext(cwd, "ctx-change"), undefined);
+  await appendContext(cwd, "ctx-change", "Explore", "Found two submodules, both pinned to old commits.");
+  await appendContext(cwd, "ctx-change", "Propose", "Wrote proposal.md citing both submodule findings.");
+  const content = await readContext(cwd, "ctx-change");
+  assert.match(content, /## Explore —/);
+  assert.match(content, /## Propose —/);
+  assert.ok(content.indexOf("## Explore") < content.indexOf("## Propose"));
+  assert.match(content, /Found two submodules/);
+});
+
+await test("checkTaskVerification: counts checked tasks missing a _Verified: note", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "verify-change");
+  await writeFile(
+    paths.tasks,
+    [
+      "- [x] 1.1 did the thing",
+      "  _Verified: ran `npm test`, 5/5 pass_",
+      "- [x] 1.2 did another thing",
+      "- [ ] 1.3 not done yet",
+      "- [x] 1.4 also did this",
+      "  _Verified: curl returned 200_",
+    ].join("\n"),
+    "utf8",
+  );
+  const result = await checkTaskVerification(cwd, "verify-change");
+  assert.deepEqual(result, { checkedTasks: 3, withVerificationNote: 2, missing: 1 });
+});
+
+await test("checkTaskVerification: no tasks.md -> undefined", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "no-tasks-change");
+  const result = await checkTaskVerification(cwd, "no-tasks-change");
+  assert.equal(result, undefined);
+});
+
+await test("readReview: undefined when missing, content once written", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "review-change");
+  assert.equal(await readReview(cwd, "review-change"), undefined);
+  await writeFile(paths.review, "## Findings\n\nNo blockers found.\n", "utf8");
+  assert.match(await readReview(cwd, "review-change"), /No blockers found/);
+});
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail > 0 ? 1 : 0);
