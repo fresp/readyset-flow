@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { renderSidebarLayout, type OverlaySection } from "../src/lib/readyset-review-overlay.ts";
+import { renderSidebarLayout, ReviewSidebarOverlay, type OverlaySection } from "../src/lib/readyset-review-overlay.ts";
 
 let pass = 0;
 let fail = 0;
@@ -96,6 +96,43 @@ await test("long titles and footer hints are ellipsized, not chopped off with no
 	const longTitle = "Readyset review — Complete Embedded Signup Onboarding (System User, Phone Registration, WABA Sync, and a very long tail of extra detail that will not fit)";
 	const lines = renderSidebarLayout(longTitle, sections(), 1, 0, 60, 20, identity, identity, identity);
 	assert.match(lines[0], /…$/, "truncated title should end with an ellipsis marker, not a hard cut");
+});
+
+const fakeTheme = { fg: (_name: string, text: string) => text, bold: (text: string) => text } as any;
+
+/** A worst-case stub: `matches` says yes to EVERY logical action name, for every byte sequence —
+ *  the scenario a real terminal run (2026-09-18) showed actually happens for PageUp/PageDown
+ *  against "tui.select.up"/"down". If PageUp/PageDown still only scroll the body and never touch
+ *  `selectedIndex`, the fix (checking them first, unconditionally, before any `keybindings.matches`
+ *  call) holds regardless of how broadly a real KeybindingsManager binds those logical actions. */
+const matchesEverything = { matches: () => true } as any;
+
+await test("PageUp/PageDown always scroll the body, even when keybindings.matches also says yes to tui.select.up/down for them", () => {
+	const overlay = new ReviewSidebarOverlay(fakeTheme, matchesEverything, "Title", sections(), () => {});
+	// Only the sidebar half of each row (left of the " │ " divider) — the body half is expected
+	// to change when scrolling, so comparing whole lines would conflate "selection moved" with
+	// "body content changed at the same row".
+	const sidebarHalf = (lines: string[]) => lines.map((l) => l.split(" │ ")[0]).filter((s) => s.includes("›"));
+
+	const before = overlay.render(100);
+	const beforeSidebar = sidebarHalf(before);
+	overlay.handleInput("\x1b[6~"); // PageDown
+	const afterPageDown = overlay.render(100);
+	assert.deepEqual(beforeSidebar, sidebarHalf(afterPageDown), "PageDown must not move the sidebar selection");
+	assert.notDeepEqual(before, afterPageDown, "PageDown must actually scroll the body");
+
+	overlay.handleInput("\x1b[5~"); // PageUp
+	assert.deepEqual(beforeSidebar, sidebarHalf(overlay.render(100)), "PageUp must not move the sidebar selection");
+});
+
+await test("cancel (Esc) still works even though PageUp/PageDown are checked first", () => {
+	let cancelled = false;
+	const cancelOnly = { matches: (_data: string, name: string) => name === "tui.select.cancel" } as any;
+	const overlay = new ReviewSidebarOverlay(fakeTheme, cancelOnly, "Title", sections(), () => {
+		cancelled = true;
+	});
+	overlay.handleInput("\x1b");
+	assert.ok(cancelled, "Esc should still close the overlay");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

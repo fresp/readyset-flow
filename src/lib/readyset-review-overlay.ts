@@ -212,6 +212,27 @@ export class ReviewSidebarOverlay implements Component {
 	invalidate(): void {}
 
 	handleInput(data: string): void {
+		// PageUp/PageDown are checked FIRST and unconditionally, before anything routed through
+		// `keybindings.matches`. A real terminal run (2026-09-18) showed PgUp/PgDn moving the
+		// sidebar *selection* instead of scrolling the body — i.e. `keybindings.matches(data,
+		// "tui.select.up"/"down")` was evaluating true for the PageUp/PageDown byte sequences too
+		// (most likely because those logical actions are bound more broadly than just the arrow
+		// keys in the real KeybindingsManager, e.g. as a coarser "move selection" gesture). Rather
+		// than guess at exactly why, these two raw checks are now unconditional and go first, so
+		// PgUp/PgDn always scroll the body regardless of what `keybindings.matches` decides about
+		// them — the ordering itself is the fix, not just the check's existence (which was already
+		// here before and simply never got reached).
+		if (data === "\x1b[5~") {
+			this.#scrollOffset = Math.max(0, this.#scrollOffset - BODY_SCROLL_STEP);
+			return;
+		}
+		if (data === "\x1b[6~") {
+			const section = this.#sections[this.#selectedIndex];
+			const maxOffset = section ? Math.max(0, section.bodyLines.length - 1) : 0;
+			this.#scrollOffset = Math.min(maxOffset, this.#scrollOffset + BODY_SCROLL_STEP);
+			return;
+		}
+
 		if (this.#keybindings.matches(data, "tui.select.cancel")) {
 			this.#done(undefined);
 			return;
@@ -226,19 +247,6 @@ export class ReviewSidebarOverlay implements Component {
 		if (this.#keybindings.matches(data, "tui.select.down")) {
 			this.#selectedIndex = this.#selectedIndex === this.#sections.length - 1 ? 0 : this.#selectedIndex + 1;
 			this.#scrollOffset = 0;
-			return;
-		}
-		// Raw VT sequences for PageUp/PageDown — deliberately not routed through `keybindings`
-		// (there is no `tui.select.pageUp` equivalent for "scroll the body pane" in this design;
-		// see the module doc comment for why Up/Down are reserved for section navigation instead).
-		if (data === "\x1b[5~") {
-			this.#scrollOffset = Math.max(0, this.#scrollOffset - BODY_SCROLL_STEP);
-			return;
-		}
-		if (data === "\x1b[6~") {
-			const section = this.#sections[this.#selectedIndex];
-			const maxOffset = section ? Math.max(0, section.bodyLines.length - 1) : 0;
-			this.#scrollOffset = Math.min(maxOffset, this.#scrollOffset + BODY_SCROLL_STEP);
 			return;
 		}
 	}
