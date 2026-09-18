@@ -296,7 +296,14 @@ async function withPinnedModel<T>(
 ): Promise<T> {
 	if (!modelSpec) return fn();
 
-	const setModel = (pi as unknown as { setModel?: (spec: unknown) => unknown }).setModel;
+	// Bound to `pi`, not just extracted — a bare `pi.setModel` reference loses its `this` when
+	// called detached (`const f = obj.method; f()`), which is exactly what a real terminal run
+	// (2026-09-18) hit: "undefined is not an object (evaluating 'this.runtime')" on every call,
+	// pin and fallback and restore alike, because the real setModel implementation reads state
+	// off `this` internally. `.bind(pi)` keeps the existence check below working unchanged
+	// (bind on undefined would throw, so the optional chain still yields `undefined` when
+	// `pi.setModel` isn't there) while fixing every call site without touching them.
+	const setModel = (pi as unknown as { setModel?: (spec: unknown) => unknown }).setModel?.bind(pi);
 	if (!setModel || !ctx.models?.current) {
 		ctx.ui.notify(
 			`Model "${modelSpec}" (from ${source}) was given, but this omp build doesn't expose pi.setModel/ctx.models.current — ` +

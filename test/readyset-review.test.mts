@@ -531,6 +531,78 @@ await test("--model pins a model for the run's turns and restores the original m
   assert.ok(fakeUiWrap.notifications.some((n) => /Pinned model "anthropic\/claude-opus-5"/.test(n.message)));
 });
 
+await test("setModel is called bound to pi, not detached -- a real terminal run hit 'this.runtime' undefined from a bare extracted reference", async () => {
+  // The other model-pinning tests' fake `setModel` is a plain shorthand method that ignores
+  // `this` entirely, so it would pass whether or not withPinnedModel keeps setModel bound to
+  // `pi` -- it can't catch a `this`-binding regression. This one can: `this.runtime` is only
+  // reachable when setModel is actually invoked as `pi.setModel(...)` (or an equivalent bound
+  // call), which is exactly what broke in a real omp session (2026-09-18): `const setModel =
+  // pi.setModel` followed by a bare `setModel(spec)` call loses `this`, and the real
+  // implementation apparently reads state off it, producing "undefined is not an object
+  // (evaluating 'this.runtime')" on every pin attempt -- primary, fallback, and restore alike.
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-11-pinned-this.md", {
+    title: "Pinned This",
+    status: "proposed",
+    created: "2026-01-11",
+    change_id: "pinned-this",
+  });
+  const dir = join(cwd, "readyset", "changes", "pinned-this");
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** b\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const setModelCalls: unknown[] = [];
+  const fakePi = {
+    runtime: "ok", // present only on `pi` itself -- reachable only through a correctly-bound `this`
+    sendUserMessage(_prompt: string, _opts: unknown) {},
+    registerCommand(_name: string, _def: unknown) {},
+    setModel(spec: unknown) {
+      // Mirrors the real failure mode: a detached call has `this` as undefined (strict mode,
+      // ES modules), so `this.runtime` throws before ever recording the call.
+      if (!(this as { runtime?: string }).runtime) {
+        throw new TypeError("undefined is not an object (evaluating 'this.runtime')");
+      }
+      setModelCalls.push(spec);
+    },
+  };
+  const handler = await loadHandler(fakePi as any);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-11 · Pinned This");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: async () => {},
+    models: {
+      current: () => "session-default-model",
+      resolve: (spec: string) => `resolved:${spec}`,
+    },
+  };
+
+  await handler(["--model", "some/model"], ctx);
+
+  assert.deepEqual(
+    setModelCalls,
+    ["resolved:some/model", "session-default-model"],
+    "setModel should have been called (bound to pi) for both the pin and the restore",
+  );
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Pinned model "some\/model"/.test(n.message)),
+    "should have reported a successful pin, not a 'this.runtime' failure",
+  );
+  assert.ok(
+    !fakeUiWrap.notifications.some((n) => /this\.runtime/.test(n.message)),
+    "a detached setModel call would have surfaced the this.runtime TypeError as a warning -- it must not",
+  );
+});
+
 await test("without --model, setModel is never called even though the API is available", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-11-unpinned.md", {
