@@ -1,0 +1,131 @@
+---
+name: readyset
+description: Use when working with Readyset changes (readyset/changes/<id>/) — writing or reading EXPLORATION.md, proposal.md, design.md, specs/**/spec.md, tasks.md, CONTEXT.md, or REVIEW.md, whether inside /readyset-review or in a manual turn (e.g. "check readyset/changes/foo", "why did the propose turn skip X").
+---
+
+# Readyset
+
+Readyset turns a brainstorm into a grounded, reviewable, executable change under
+`readyset/changes/<id>/`. This skill is the reference for the file formats and phase
+discipline `/readyset-review` enforces in code — read it whenever you're working with a Readyset
+change directly (reading one to answer a question, hand-editing an artifact, or picking up a
+change that got interrupted mid-phase) rather than only through the command's own triggered
+turns.
+
+## The phase order, and why it's in this order
+
+```
+Explore -> Propose -> (Review gate: Approve / Refine / Discard) -> Apply -> Code review -> Archive
+```
+
+Each phase exists to catch something the previous one is bad at catching on its own:
+
+1. **Explore** (`EXPLORATION.md`) — grounds the change in real repo state *before* any
+   planning prose gets written. Read any docker-compose/.env.example for config keys the
+   change touches, check `.gitmodules` and submodule commits against superproject gitlinks,
+   run relevant tests. Write one entry per thing actually checked: what you checked (exact
+   file/command/commit) and what you found (the real value or output, not a paraphrase). "I
+   checked X, found nothing relevant" is a legitimate entry — don't force a problem into
+   existence to have something to report.
+
+   This phase exists because prose alone is not enough: an earlier version of Propose was
+   told, in its own prompt, to check `.gitmodules` — and still silently dropped a submodule
+   from its output under the combined load of writing proposal + design + specs + tasks in
+   one turn. Making Explore its own turn, with the submodule list already extracted and
+   handed to it, is a structural fix; a stronger sentence in the same crowded prompt was not.
+
+2. **Propose** (`proposal.md`, `design.md`, `specs/**/spec.md`, `tasks.md`) — the planning
+   artifacts, grounded in Explore's findings rather than re-deriving them. See "File formats"
+   below for the required shape of each file.
+
+3. **Review gate** — a human decides: Approve & Execute, Refine (describe what's wrong, loops
+   back into another Propose-equivalent turn), or Discard. Nothing executes without this.
+
+4. **Apply** — implements `tasks.md` one task at a time. A task is only checked off once
+   something actually verified it (a test run, a curl, a script execution) — not once code
+   was written that's expected to work. See "The `_Verified:` note" below.
+
+5. **Code review** (`REVIEW.md`) — a fresh turn, after Apply, before Archive. It is told
+   explicitly that its job is to find problems, not confirm the work — the turn that just
+   implemented something is a poor judge of its own diff, since it already believes its
+   choices were correct. If this phase finds nothing, it says so plainly rather than padding
+   the file to look thorough.
+
+6. **Archive** — moves the change to `readyset/changes/archive/<id>/` and merges its delta
+   specs into `readyset/specs/` (append-only — never a real ADDED/MODIFIED/REMOVED diff-merge;
+   review the merged spec afterward).
+
+`CONTEXT.md` is appended to after every phase transition, deterministically, by the
+extension itself — not by the model. If you're picking up a change mid-flight, read
+`CONTEXT.md` first; it's the ground truth for what phases have actually run, in order, with a
+one-line summary of each.
+
+## File formats
+
+**`EXPLORATION.md`** — a findings log. One entry per thing checked: what was checked (exact
+file path / command / commit), what was found (the actual value/output). No fixed section
+headers required, but every entry needs a checked-vs-found pair — a claim with no "here's what
+I actually looked at" attached does not belong in this file.
+
+**`proposal.md`**
+- `## Why` — 1-2 paragraphs on the problem.
+- `## What Changes` — bullet list of concrete changes.
+
+**`design.md`**
+- `## Context`
+- `## Goals / Non-Goals`
+- `## Decisions` — numbered, each with Rationale and Alternatives considered.
+- `## Risks / Trade-offs`
+
+**`specs/<capability-slug>/spec.md`**
+- `## Purpose`
+- `## ADDED Requirements` (or `MODIFIED`/`REMOVED` when changing existing behavior already
+  covered by an existing spec under `readyset/specs/`) — one or more `### Requirement: <name>`
+  blocks, each followed by one or more `#### Scenario: <name>` blocks written as:
+  - `**WHEN** <trigger>`
+  - `**THEN** <observable outcome>`
+
+**`tasks.md`** — numbered sections, each task a `- [ ] N.M <description>` checkbox line.
+
+### The `_Verified:` note
+
+Immediately below a checked task line, add an indented note in this exact format:
+
+```
+- [x] 1.1 Add rate limiting to the webhook endpoint
+  _Verified: ran `npm test`, 12/12 pass; curl'd the endpoint 15x in 1s, got 429 on the 11th_
+```
+
+For a task with no real way to verify (a doc-only change, say), still add a note explaining
+why rather than leaving the box unexplained:
+
+```
+- [x] 2.3 Update README with the new config key
+  _Verified: doc-only, no behavior to check_
+```
+
+A checked box with no `_Verified:` note under it means the task was marked done without
+anything that actually checked it — `checkTaskVerification()` in `readyset-spec.ts` counts
+these, and the review gate in `/readyset-review` will stop and offer to send the change back
+for another pass if any are missing. Don't check a box you haven't verified just to look
+further along.
+
+**`REVIEW.md`** — a findings list from the code-review phase: does the implementation
+actually match every requirement's WHEN/THEN scenarios (or does it narrow/skip/half-implement
+any of them), are the `_Verified:` notes credible (a vague note like "looks correct" is not a
+verification), and any correctness bug or regression risk visible in the touched files,
+whether or not `tasks.md` mentioned it.
+
+**`CONTEXT.md`** — append-only, one `## <Phase> — <ISO timestamp>` entry per phase
+transition, written by the extension automatically. Never hand-edit this file; it's an audit
+trail, not a planning document.
+
+## What Readyset deliberately does not do
+
+- `validateChange` is a shallow structural check (required sections exist, at least one
+  requirement+scenario, at least one task) — not a real schema validator. A "validate: pass"
+  in the review panel means structurally complete, not semantically correct.
+- `archiveChange`'s spec merge is append-only, never a real diff-merge. Review the merged
+  spec after archiving.
+- None of Readyset's own file-format or phase logic is a fork of, or stays compatible with, any
+  other spec-driven-development tool. It doesn't read from or write to any other tool's files.
