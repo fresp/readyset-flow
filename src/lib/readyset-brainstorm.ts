@@ -4,7 +4,7 @@
  * Lives OUTSIDE `agent/extensions/` on purpose: omp's extension discovery scans one
  * subdirectory level under the extensions dir, so a helper placed at
  * `extensions/lib/*.ts` could be picked up and executed as an extension.
- * From an extension, import it as `../lib/brainstorm.ts`.
+ * From an extension, import it as `../lib/readyset-brainstorm.ts`.
  *
  * If this repo gains other commands that also read brainstorms, they should import from
  * here rather than keeping their own copy — divergent copies of the branch regex are

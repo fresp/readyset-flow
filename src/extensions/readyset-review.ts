@@ -6,7 +6,7 @@ import {
 	loadBrainstorms,
 	markApproved,
 	reconcileStatuses,
-} from "../lib/brainstorm.ts";
+} from "../lib/readyset-brainstorm.ts";
 import { readFile } from "node:fs/promises";
 import {
 	appendContext,
@@ -22,7 +22,7 @@ import {
 	scaffoldChange,
 	validateChange,
 } from "../lib/readyset-spec.ts";
-import { readFallbackModel, readPinnedModel } from "../lib/omp-config.ts";
+import { readFallbackModel, readPinnedModel } from "../lib/readyset-omp-config.ts";
 
 /**
  * /readyset-review — Readyset's core command: propose, review, and execute a brainstorm

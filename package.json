@@ -14,7 +14,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/omp-config.test.mts && node --experimental-strip-types test/readyset-review.test.mts"
+    "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/readyset-omp-config.test.mts && node --experimental-strip-types test/readyset-review.test.mts"
   },
   "keywords": [
     "omp",

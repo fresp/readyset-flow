@@ -2,7 +2,7 @@ import { writeFile, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
-import { parseFallbackModel, parseModelOverride, parseOmpDefaultModel, readFallbackModel, readPinnedModel } from "../src/lib/omp-config.ts";
+import { parseFallbackModel, parseModelOverride, parseOmpDefaultModel, readFallbackModel, readPinnedModel } from "../src/lib/readyset-omp-config.ts";
 
 let pass = 0;
 let fail = 0;

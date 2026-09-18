@@ -2,57 +2,72 @@
 /**
  * Readyset's install CLI.
  *
- * Usage (from the root of the repo you want Readyset in):
+ * Usage:
  *   npx readyset-review install
- *   npx readyset-review install --target /path/to/repo   (defaults to cwd)
+ *   npx readyset-review install --target /path/to/.omp   (defaults to ~/.omp)
+ *
+ * Readyset installs GLOBALLY, into the user's own omp home directory (`~/.omp`), not into a
+ * per-project repo. It's a personal workflow extension — like the other extensions already
+ * living in `~/.omp/agent/extensions/` — meant to be available in every repo you work in, not
+ * scoped to one. `--target` exists for testing against a scratch directory, not for per-repo
+ * installs; if you actually want a project-scoped install, point `--target` at
+ * `<repo>/.omp` yourself (omp does support that layout too — see docs/extension-loading.md —
+ * this installer just doesn't default to it).
  *
  * Deliberately NOT wired to npm's `postinstall` lifecycle. postinstall runs with cwd set to
- * this package's own directory inside node_modules, not the consuming repo's root — using it
- * would mean either guessing at the consumer's root or writing outside node_modules during an
- * install nobody explicitly asked for. An explicit `readyset-review install` command (the same pattern
- * tools like husky use) is predictable: it only touches files when you run it, and it always
- * targets the directory you ran it from.
+ * this package's own directory inside node_modules, not `~/.omp` — using it would mean an
+ * install nobody explicitly asked for, writing outside node_modules. An explicit
+ * `readyset-review install` command (the same pattern tools like husky use) is predictable: it
+ * only touches files when you run it.
  *
- * What it does: copies the .ts source files straight into .omp/lib/ and .omp/extensions/ in the
- * target repo, and the skill doc into .agent/skills/. No build step — omp loads extensions as
- * .ts files directly (its own loader handles the stripping), so there is nothing to compile.
- * Every run overwrites the previously installed copies; this is how you pick up a Readyset
- * update (bump the package, re-run `readyset-review install`). Don't hand-edit the installed
- * files — edits are lost on the next install.
+ * What it does: copies the .ts source files into `<target>/agent/lib/` and
+ * `<target>/agent/extensions/`, and the skill doc into `<target>/agent/skills/`. No build step —
+ * omp loads extensions as .ts files directly (its own loader handles the stripping), so there is
+ * nothing to compile. Every run overwrites the previously installed copies; this is how you pick
+ * up a Readyset update (bump the package, re-run `readyset-review install`). Don't hand-edit the
+ * installed files — edits are lost on the next install.
  *
- * These destinations are omp's own documented project-level discovery paths (verified against
- * omp's `docs/extension-loading.md` and `docs/skills.md`, not guessed): extensions are
- * auto-discovered from `<cwd>/.omp/extensions` ("Native auto-discovery comes from: Project
- * directory: `<cwd>/.omp/extensions`" — the project root is scanned non-recursively, cwd only,
- * no ancestor-directory search), and skills from the "agents" provider's canonical project
- * location `.agent[s]/skills/<name>/SKILL.md` (both `.agent/` and `.agents/` are accepted; this
- * installer uses `.agent/`). An earlier version of this installer used `agent/lib/`,
- * `agent/extensions/`, `agent/skills/` (no leading dot) — that was an unverified guess and omp
- * never actually discovered anything installed there. If you installed with that older version,
- * re-run install and delete the stale `agent/` directory it left behind.
+ * These destinations are omp's own documented user-level discovery paths (verified against
+ * omp's `docs/extension-loading.md` and `docs/skills.md`, and against a real `~/.omp` on a
+ * machine already running other extensions — not guessed): "User-level (global): the active
+ * agent directory's extensions/" resolves to `~/.omp/agent/extensions` by default, with a
+ * matching `~/.omp/agent/lib/` convention already in use there for shared helpers, and
+ * `~/.omp/agent/skills/<name>/SKILL.md` for skills.
+ *
+ * Every installed filename is prefixed `readyset-` (`readyset-brainstorm.ts`,
+ * `readyset-omp-config.ts`, `readyset-spec.ts`, `readyset-review.ts`) — deliberately, because
+ * `~/.omp/agent/` is a shared namespace: a real `~/.omp/agent/lib/brainstorm.ts` was found
+ * already installed and in active use by other extensions (`brainstorm-plan.ts`,
+ * `brainstorm-propose.ts`, `brainstorm-review.ts`) on the machine this was verified against.
+ * An unprefixed `brainstorm.ts` from this package would have silently overwritten that file —
+ * same name, similar shape, different content — and broken those other extensions the moment
+ * this package was installed. Nothing this package installs can collide with another
+ * extension's files as long as that extension doesn't also use the `readyset-` prefix.
  */
 
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { mkdir, copyFile, readFile } from "node:fs/promises";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..", "..");
+const DEFAULT_TARGET = join(homedir(), ".omp");
 
 const INSTALL_MAP = [
-	{ from: join(packageRoot, "src", "lib", "brainstorm.ts"), to: join(".omp", "lib", "brainstorm.ts") },
-	{ from: join(packageRoot, "src", "lib", "readyset-spec.ts"), to: join(".omp", "lib", "readyset-spec.ts") },
-	{ from: join(packageRoot, "src", "lib", "omp-config.ts"), to: join(".omp", "lib", "omp-config.ts") },
-	{ from: join(packageRoot, "src", "extensions", "readyset-review.ts"), to: join(".omp", "extensions", "readyset-review.ts") },
+	{ from: join(packageRoot, "src", "lib", "readyset-brainstorm.ts"), to: join("agent", "lib", "readyset-brainstorm.ts") },
+	{ from: join(packageRoot, "src", "lib", "readyset-spec.ts"), to: join("agent", "lib", "readyset-spec.ts") },
+	{ from: join(packageRoot, "src", "lib", "readyset-omp-config.ts"), to: join("agent", "lib", "readyset-omp-config.ts") },
+	{ from: join(packageRoot, "src", "extensions", "readyset-review.ts"), to: join("agent", "extensions", "readyset-review.ts") },
 	// Reference doc, not a runtime file — read by an agent working a Readyset change directly
 	// (outside a /readyset-review-triggered turn), not loaded by the extension itself. Installed
-	// under .agent/skills/<name>/SKILL.md — omp's documented canonical project-level skill
-	// location (the "agents" provider), confirmed against docs/skills.md.
-	{ from: join(packageRoot, "src", "skill", "SKILL.md"), to: join(".agent", "skills", "readyset", "SKILL.md") },
+	// under agent/skills/<name>/SKILL.md, matching the real ~/.omp/agent/skills/<name>/SKILL.md
+	// layout already in use on the machine this was verified against.
+	{ from: join(packageRoot, "src", "skill", "SKILL.md"), to: join("agent", "skills", "readyset", "SKILL.md") },
 ];
 
 function parseArgs(argv) {
-	const args = { command: argv[0], target: process.cwd() };
+	const args = { command: argv[0], target: DEFAULT_TARGET };
 	for (let i = 1; i < argv.length; i++) {
 		if (argv[i] === "--target" && argv[i + 1]) {
 			args.target = argv[i + 1];
@@ -72,7 +87,7 @@ async function install(targetRoot) {
 		installedCount++;
 	}
 	console.log(`\nReadyset: ${installedCount} file(s) installed into ${targetRoot}`);
-	console.log("Run `/readyset-review` in omp inside this repo to use it.");
+	console.log("Run `/readyset-review` in omp (in any repo) to use it.");
 	console.log("Re-run `npx readyset-review install` after bumping the readyset-review version to pick up updates.");
 }
 
@@ -95,7 +110,7 @@ async function main() {
 
 	console.log("Readyset CLI\n");
 	console.log("Usage:");
-	console.log("  readyset-review install [--target <path>]   Install/update Readyset's extension files into a repo (defaults to cwd)");
+	console.log("  readyset-review install [--target <path>]   Install/update Readyset's extension files (defaults to ~/.omp)");
 	console.log("  readyset-review version                     Print the installed Readyset package version");
 	process.exitCode = args.command ? 1 : 0;
 }
