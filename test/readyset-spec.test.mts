@@ -108,6 +108,50 @@ await test("validateChange: requirement without WHEN/THEN flagged", async () => 
   assert.ok(result.issues.some((i) => i.problem.includes("WHEN/THEN")));
 });
 
+await test("validateChange: one requirement with a scenario no longer hides a sibling requirement with none", async () => {
+  // The old validator checked "does a WHEN/THEN exist anywhere in this file" -- a single real
+  // scenario satisfied that file-wide regex regardless of which requirement it belonged to, so
+  // a file with one good requirement and one empty one passed silently. This is the case that
+  // regression-tests the per-requirement scoping in splitRequirementBlocks.
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "mixed-requirements-change");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "cap"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n" +
+      "### Requirement: Has a scenario\n\n#### Scenario: ok\n\n- **WHEN** a\n- **THEN** b\n\n" +
+      "### Requirement: Missing its scenario\n\nnothing here but prose\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "mixed-requirements-change");
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.issues.some((i) => i.problem.includes('"Missing its scenario"') && i.problem.includes("WHEN/THEN")),
+    `expected an issue naming "Missing its scenario", got: ${JSON.stringify(result.issues)}`,
+  );
+  assert.ok(
+    !result.issues.some((i) => i.problem.includes('"Has a scenario"')),
+    "the requirement that does have a scenario should not be flagged",
+  );
+});
+
+await test("validateChange: missing '## ADDED/MODIFIED/REMOVED Requirements' section is flagged even with a valid requirement", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "no-delta-header-change");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "cap"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "cap", "spec.md"),
+    "## Purpose\n\nx\n\n### Requirement: Foo\n\n#### Scenario: ok\n\n- **WHEN** a\n- **THEN** b\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "no-delta-header-change");
+  assert.ok(result.issues.some((i) => /ADDED\/MODIFIED\/REMOVED/.test(i.problem)));
+});
+
 await test("getProgress: not_started / in_progress / all_done / missing", async () => {
   const cwd = await freshCwd();
   const paths = await scaffoldChange(cwd, "progress-change");

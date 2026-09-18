@@ -134,10 +134,13 @@ It picks a brainstorm, and depending on its status:
 
 ## What it deliberately does not do
 
-- `validateChange` is a **shallow structural check** (required sections exist, at least one
-  requirement+scenario, at least one task) — not a real schema validator. It catches an empty or
-  malformed artifact, not a semantically wrong one. A "validate: pass" in the review panel is not
-  a claim the plan is correct, only that it's structurally complete.
+- `validateChange` is a **structural check** (required sections exist, every requirement
+  individually carries an ADDED/MODIFIED/REMOVED delta header and its own WHEN/THEN, at least
+  one task) — not a real schema validator. It's scoped *per requirement*, not per file: a
+  spec.md with three requirements and only one scenario fails, it doesn't pass on the strength
+  of its one good sibling. But it still catches an empty or malformed artifact, not a
+  semantically wrong one. A "validate: pass" in the review panel is not a claim the plan is
+  correct, only that every requirement is structurally complete.
 - `archiveChange` merges delta specs into the main spec **append-only** — never a real
   ADDED/MODIFIED/REMOVED diff-merge. Safe (nothing is deleted or silently rewritten), but cruder
   than a proper schema-aware archiver; review the merged spec afterward.

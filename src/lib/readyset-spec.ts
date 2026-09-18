@@ -175,11 +175,47 @@ export async function findSpecFiles(specsDir: string): Promise<string[]> {
 	return found;
 }
 
+interface RequirementBlock {
+	name: string;
+	body: string;
+}
+
 /**
- * Shallow structural validation — not a real schema check (see file header). Verifies:
+ * Splits a spec.md's raw text into one block per `### Requirement: <name>` heading, each
+ * block's body running from just after that heading up to (but not including) the next `##`
+ * or `###` heading — or end of file. A `#### Scenario:` heading (four `#`s) is deliberately
+ * NOT a boundary, so every scenario under a requirement stays inside that requirement's block.
+ *
+ * This exists so validation can check each requirement individually for its own WHEN/THEN
+ * pair, rather than checking "does a WHEN/THEN exist anywhere in the file" — the old check,
+ * which let a file with three requirements and only one scenario pass silently, because the
+ * one real scenario satisfied a file-wide regex regardless of which requirement it belonged to.
+ */
+function splitRequirementBlocks(raw: string): RequirementBlock[] {
+	const headingRe = /^###[ \t]*Requirement:[ \t]*(.+)$/gim;
+	const matches = [...raw.matchAll(headingRe)];
+	const boundaryRe = /^#{2,3}[ \t]/m;
+
+	return matches.map((m) => {
+		const start = m.index! + m[0].length;
+		const rest = raw.slice(start);
+		const boundary = rest.match(boundaryRe);
+		const end = boundary ? start + boundary.index! : raw.length;
+		return { name: m[1].trim(), body: raw.slice(start, end) };
+	});
+}
+
+/**
+ * Structural validation — not a real schema check (see file header), but scoped per
+ * requirement rather than per file (see `splitRequirementBlocks`). Verifies:
  *   - proposal.md exists with a "## Why" and a "## What Changes" section
- *   - at least one specs/<capability>/spec.md exists with at least one
- *     "### Requirement:" and, under it, at least one "#### Scenario:" with a WHEN/THEN pair
+ *   - at least one specs/<capability>/spec.md exists
+ *   - each spec.md has at least one "## ADDED/MODIFIED/REMOVED Requirements" section —
+ *     openspec's own delta-spec convention this format is modeled on, and the thing that
+ *     makes a spec a *delta* against `readyset/specs/` rather than an unscoped restatement
+ *   - each spec.md has at least one "### Requirement:", and EVERY one of them individually
+ *     carries its own WHEN and THEN — not just one requirement in the file having a scenario
+ *     while its siblings have none
  *   - tasks.md exists with at least one checkbox line
  */
 export async function validateChange(cwd: string, changeId: string): Promise<ValidateResult> {
@@ -199,17 +235,25 @@ export async function validateChange(cwd: string, changeId: string): Promise<Val
 	if (specFiles.length === 0) {
 		issues.push({ file: "specs/", problem: "no spec.md found under specs/<capability>/" });
 	} else {
-		let anyValidScenario = false;
 		for (const specFile of specFiles) {
 			const raw = await readFile(specFile, "utf8").catch(() => "");
-			const hasRequirement = /^###\s*Requirement:/im.test(raw);
-			const hasWhenThen = /\*\*WHEN\*\*[\s\S]*?\*\*THEN\*\*/im.test(raw) || /-\s*\*\*WHEN\*\*/im.test(raw);
-			if (hasRequirement && hasWhenThen) anyValidScenario = true;
-			if (!hasRequirement) issues.push({ file: specFile, problem: "no '### Requirement:' found" });
-			else if (!hasWhenThen) issues.push({ file: specFile, problem: "requirement has no WHEN/THEN scenario" });
-		}
-		if (!anyValidScenario && specFiles.length > 0) {
-			// Already covered by the per-file issues above; this branch intentionally adds nothing extra.
+
+			if (!/^##[ \t]*(ADDED|MODIFIED|REMOVED)[ \t]+Requirements\b/im.test(raw)) {
+				issues.push({ file: specFile, problem: "no '## ADDED/MODIFIED/REMOVED Requirements' section found" });
+			}
+
+			const requirements = splitRequirementBlocks(raw);
+			if (requirements.length === 0) {
+				issues.push({ file: specFile, problem: "no '### Requirement:' found" });
+				continue;
+			}
+			for (const req of requirements) {
+				const hasWhen = /\*\*WHEN\*\*/im.test(req.body);
+				const hasThen = /\*\*THEN\*\*/im.test(req.body);
+				if (!hasWhen || !hasThen) {
+					issues.push({ file: specFile, problem: `Requirement "${req.name}" has no WHEN/THEN scenario` });
+				}
+			}
 		}
 	}
 
