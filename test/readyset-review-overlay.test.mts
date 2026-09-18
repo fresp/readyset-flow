@@ -73,5 +73,30 @@ await test("empty sections list does not throw and still renders a footer", () =
 	assert.ok(lines.at(-1)?.includes("Esc back to review"));
 });
 
+await test("sidebar drops a status that just repeats a count already baked into the heading", () => {
+	const withCounts: OverlaySection[] = [
+		{ id: "specs", heading: "Specs (1)", status: "1 file(s)", bodyLines: [] },
+		{ id: "tasks", heading: "Tasks (0/30)", status: "0/30 ticked", bodyLines: [] },
+	];
+	const joined = renderSidebarLayout("Title", withCounts, 0, 0, 100, 20, identity, identity, identity).join("\n");
+	assert.match(joined, /Specs \(1\)/);
+	assert.ok(!joined.includes("(1) (1 file(s))"), "should not double-show the same count");
+	assert.match(joined, /Tasks \(0\/30\)/);
+	assert.ok(!joined.includes("(0/30) (0/30 ticked)"), "should not double-show the same count");
+});
+
+await test("sidebar keeps a status that adds real information (not just a repeated count)", () => {
+	const lines = renderSidebarLayout("Title", sections(), 0, 0, 100, 20, identity, identity, identity);
+	const joined = lines.join("\n");
+	assert.match(joined, /Exploration \(done\)/);
+	assert.match(joined, /Proposal \(proposal\.md\)/);
+});
+
+await test("long titles and footer hints are ellipsized, not chopped off with no indicator", () => {
+	const longTitle = "Readyset review — Complete Embedded Signup Onboarding (System User, Phone Registration, WABA Sync, and a very long tail of extra detail that will not fit)";
+	const lines = renderSidebarLayout(longTitle, sections(), 1, 0, 60, 20, identity, identity, identity);
+	assert.match(lines[0], /…$/, "truncated title should end with an ellipsis marker, not a hard cut");
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

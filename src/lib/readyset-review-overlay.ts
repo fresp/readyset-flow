@@ -55,9 +55,20 @@ function asciiWidth(text: string): number {
 	return text.length;
 }
 
-/** Truncate to at most `width` ASCII columns, no ellipsis (matches this file's plain output). */
+/** Truncate to at most `width` ASCII columns, no ellipsis — used only where an ellipsis itself
+ *  wouldn't fit (width <= 1). Everywhere else, prefer `truncateWithEllipsis`. */
 function asciiTruncate(text: string, width: number): string {
 	return text.length <= width ? text : text.slice(0, Math.max(0, width));
+}
+
+/** Truncate to at most `width` columns, marking the cut with a single `…` instead of chopping
+ *  mid-word. A hard, silent cut (the previous behavior) reads as broken rendering rather than
+ *  "there's more, scroll or widen the pane" — the ellipsis is the whole fix. */
+function truncateWithEllipsis(text: string, width: number): string {
+	if (width <= 0) return "";
+	if (asciiWidth(text) <= width) return text;
+	if (width === 1) return "…";
+	return asciiTruncate(text, width - 1) + "…";
 }
 
 export interface OverlaySection {
@@ -70,16 +81,35 @@ export interface OverlaySection {
 
 export type ReviewOverlayResult = undefined;
 
-const MIN_SIDEBAR_WIDTH = 20;
-const MAX_SIDEBAR_WIDTH = 34;
+const MIN_SIDEBAR_WIDTH = 22;
+const MAX_SIDEBAR_WIDTH = 36;
 const BODY_SCROLL_STEP = 10;
 
 /** Pad-or-truncate a single line to exactly `width` visible columns. */
 function fitLine(text: string, width: number): string {
 	if (width <= 0) return "";
-	const clipped = asciiTruncate(text, width);
+	const clipped = truncateWithEllipsis(text, width);
 	const pad = Math.max(0, width - asciiWidth(clipped));
 	return clipped + " ".repeat(pad);
+}
+
+/**
+ * Splits a section's heading + status into the two pieces to render, dropping the status
+ * entirely when it's redundant with the heading. Several sections bake their count straight
+ * into the heading (`Specs (1)`, `Tasks (0/30)`) — appending the status on top of that
+ * (`Specs (1) (1 file(s))`, `Tasks (0/30) (0/30 ticked)`) says the same number twice and, in a
+ * narrow sidebar, is exactly what gets chopped off first. The check only looks at the trailing
+ * `(...)` of the heading (if any) and drops the status when it starts with that same text — so
+ * it only fires on genuine repeated data (a shared count), never on a heading/status that merely
+ * share an ordinary word (`Proposal` has no trailing parenthetical, so `proposal.md` still shows
+ * — the filename is real information there).
+ */
+function sidebarParts(heading: string, status: string): { heading: string; status: string | undefined } {
+	const headingParen = heading.match(/\(([^)]+)\)\s*$/)?.[1];
+	if (headingParen && status.startsWith(headingParen)) {
+		return { heading, status: undefined };
+	}
+	return { heading, status };
 }
 
 /** Pure layout function, separated from the Component class so it can be unit tested without a
@@ -96,7 +126,7 @@ export function renderSidebarLayout(
 	dim: (text: string) => string,
 ): string[] {
 	const innerWidth = Math.max(20, width);
-	const sidebarWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.floor(innerWidth * 0.28)));
+	const sidebarWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.floor(innerWidth * 0.3)));
 	const bodyWidth = Math.max(10, innerWidth - sidebarWidth - 3); // 3 = " │ "
 	const bodyRows = Math.max(3, height - 4); // minus title, header rule, footer, footer rule
 
@@ -110,15 +140,7 @@ export function renderSidebarLayout(
 
 	for (let row = 0; row < bodyRows; row++) {
 		const isSelected = row < sections.length && row === selectedIndex;
-		let sideText: string;
-		if (row < sections.length) {
-			const s = sections[row];
-			const marker = row === selectedIndex ? "› " : "  ";
-			sideText = `${marker}${s.heading} (${s.status})`;
-		} else {
-			sideText = "";
-		}
-		const sideCell = isSelected ? bold(fg(fitLine(sideText, sidebarWidth))) : fitLine(sideText, sidebarWidth);
+		const sideCell = row < sections.length ? renderSideCell(sections[row], isSelected, sidebarWidth, fg, bold, dim) : " ".repeat(sidebarWidth);
 
 		const bodyLine = visibleBody[row] ?? "";
 		const bodyCell = fitLine(bodyLine, bodyWidth);
@@ -131,6 +153,43 @@ export function renderSidebarLayout(
 	lines.push(dim(fitLine(` ↑/↓ section${scrollHint} · Esc back to review`, innerWidth)));
 
 	return lines;
+}
+
+/**
+ * Renders one sidebar row: the marker + heading get the "selected" treatment (bold + accent
+ * color), the status — when it isn't dropped as redundant by `sidebarParts` — stays dim
+ * regardless of selection, so it reads as secondary metadata rather than competing with the
+ * heading for attention. Padded to exactly `width` visible columns so the `│` divider lines up
+ * across every row.
+ */
+function renderSideCell(
+	section: OverlaySection,
+	isSelected: boolean,
+	width: number,
+	fg: (text: string) => string,
+	bold: (text: string) => string,
+	dim: (text: string) => string,
+): string {
+	const marker = isSelected ? "› " : "  ";
+	const avail = Math.max(0, width - asciiWidth(marker));
+	const { heading, status } = sidebarParts(section.heading, section.status);
+
+	const headingFit = truncateWithEllipsis(heading, avail);
+	const headingWidth = asciiWidth(headingFit);
+	let statusFit = "";
+	if (status) {
+		const remaining = avail - headingWidth;
+		// " (" + ")" = 3 columns of overhead; need at least one more for a truncated status to
+		// be worth showing at all, otherwise just drop it rather than render "()" or " (…)".
+		if (remaining >= 4) {
+			statusFit = ` (${truncateWithEllipsis(status, remaining - 3)})`;
+		}
+	}
+
+	const pad = Math.max(0, avail - headingWidth - asciiWidth(statusFit));
+	const headingStyled = isSelected ? bold(fg(headingFit)) : headingFit;
+	const statusStyled = statusFit ? dim(statusFit) : "";
+	return marker + headingStyled + statusStyled + " ".repeat(pad);
 }
 
 export class ReviewSidebarOverlay implements Component {
