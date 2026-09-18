@@ -149,6 +149,14 @@ function proposeTurnPrompt(b: BrainstormMeta): string {
 		"already checked against real repo state in a prior turn. Do not re-derive or contradict it; every claim in " +
 		"proposal.md/design.md that touches something EXPLORATION.md covered should point back to that finding, not restate " +
 		"a fresh guess.\n\n" +
+		"If you need a fact this change depends on and EXPLORATION.md doesn't cover it — a submodule's gitlink vs. its " +
+		"checked-out commit, an extra config file, anything load-bearing to a Decision or a blocking task — you may check " +
+		"it yourself with a real command, but two things are not optional: (1) never write 'EXPLORATION.md recorded/found " +
+		"this' for something EXPLORATION.md does not actually contain — say 'verified during planning' instead, so the " +
+		"provenance in proposal.md/design.md/tasks.md is never false; (2) append what you checked and found to " +
+		`${paths.exploration} itself (a new '## Additional findings (Propose turn)' section, same one-entry-per-thing-` +
+		"checked format Explore used), so the next person reading EXPLORATION.md sees the complete grounding trail, not " +
+		"just what the Explore turn happened to cover.\n\n" +
 		ARTIFACT_GUIDE +
 		"\n\nCarry over the brainstorm's Decision, Seam, Scope and Acceptance Criteria (keep the criteria as WHEN/THEN " +
 		"scenarios), and use its Spec Impact section to shape the delta specs. Do not reopen options the brainstorm " +
