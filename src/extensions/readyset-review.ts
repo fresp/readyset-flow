@@ -23,6 +23,20 @@ import {
 	validateChange,
 } from "../lib/readyset-spec.ts";
 import { readFallbackModel, readPinnedModel } from "../lib/readyset-omp-config.ts";
+import { ReviewSidebarOverlay, type OverlaySection } from "../lib/readyset-review-overlay.ts";
+
+/** Minimal structural shape this file actually calls — deliberately not importing the real
+ *  `Theme`/`KeybindingsManager` types from `@oh-my-pi/pi-tui` even as types, so this file has
+ *  zero dependency (type or runtime) on that package resolving at all. `readyset-review-overlay.ts`
+ *  takes the real types as type-only imports (erased at strip-time); this is the boundary where
+ *  the wider extension hands them through without needing to know their full shape. */
+interface OverlayTheme {
+	fg: (name: string, text: string) => string;
+	bold: (text: string) => string;
+}
+interface OverlayKeybindings {
+	matches: (data: string, name: string) => boolean;
+}
 
 /**
  * /readyset-review — Readyset's core command: propose, review, and execute a brainstorm
@@ -214,6 +228,14 @@ interface ReviewCtx {
 		setEditorText: (text: string) => void;
 		setWidget?: (lines: string[]) => void;
 		notify: (message: string, level?: "info" | "warning" | "error") => void;
+		// Interactive-mode-only (docs/extensions.md): renders a real custom TUI component with
+		// keyboard focus — the same mechanism native /plan's own review sidebar is built from.
+		// Absent (or a no-op) in RPC/ACP/print modes, so every call site feature-detects it and
+		// falls back to `browseReviewSections`'s menu-driven view rather than assuming it exists.
+		custom?: <T>(
+			factory: (tui: unknown, theme: OverlayTheme, keybindings: OverlayKeybindings, done: (result: T) => void) => unknown,
+			options?: { overlay?: boolean; overlayOptions?: Record<string, unknown> },
+		) => Promise<T>;
 	};
 	waitForIdle: () => Promise<void>;
 	// Both documented on the general handler ctx (see extensions.md "Handler Context
@@ -517,15 +539,12 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
  * contents up top (section name + at-a-glance status), then each section between `───` rules
  * — and pushes it to the editor pane via `ctx.ui.setEditorText`.
  *
- * Honest ceiling: omp's extension API has no confirmed way to register a navigable
- * multi-section sidebar the way native `/plan`'s Plan Review does (a clickable outline down
- * the left, content on the right) — confirmed against upstream docs: "Extensions cannot
- * create sidebars, tree views, webviews, split panes, or other persistent navigable regions.
- * UI is confined to modal dialogs or single stacked widgets above/below the editor." The TOC
- * plus rules here, and the "Jump to section" menu (`browseReviewSections` below) that lets a
- * user view one section at a time instead of scrolling the whole thing, are the closest
- * functional equivalent this extension can build within that ceiling — a menu-driven jump
- * instead of a persistent clickable list, not a visual recreation of it.
+ * A real persistent sidebar (native `/plan`'s clickable outline + content pane) turned out to
+ * be possible after all via `ctx.ui.custom()` in Interactive mode — see `readyset-review-overlay.ts`
+ * and `openSidebarOverlay` below, offered as "Sidebar view" on the gate whenever `ctx.ui.custom`
+ * is present. This compiled document remains the fallback for RPC/ACP/print contexts (and for
+ * "Buka untuk direview", which is deliberately a no-navigation dump), and `browseReviewSections`
+ * below remains the fallback "one section at a time" menu when `ctx.ui.custom` isn't available.
  */
 async function buildReviewDocument(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<string> {
 	const sections = await buildReviewSections(ctx, chosen, snapshot);
@@ -555,6 +574,36 @@ async function buildSingleSectionDocument(ctx: ReviewCtx, chosen: BrainstormMeta
  * comment for why a real one isn't possible). Loops until the user picks "Back to full
  * document", pushing just the picked section's content to the editor each time.
  */
+/**
+ * "Sidebar view" — a real persistent section list + content pane, via `ctx.ui.custom()`
+ * (Interactive mode only; see `readyset-review-overlay.ts`'s module doc comment for how this
+ * was confirmed against `@oh-my-pi/pi-tui`'s own real source, not assumed). Up/Down moves the
+ * section cursor, PgUp/PgDn scrolls the body, Esc returns to the gate. `ctx.ui.custom` is
+ * feature-detected by the caller, not here — this function assumes it exists.
+ */
+async function openSidebarOverlay(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<void> {
+	const sections = await buildReviewSections(ctx, chosen, snapshot);
+	const overlaySections: OverlaySection[] = [];
+	for (const s of sections) {
+		overlaySections.push({ id: s.id, heading: s.heading, status: s.status, bodyLines: (await s.render()).split("\n") });
+	}
+
+	type OverlayCtorArgs = ConstructorParameters<typeof ReviewSidebarOverlay>;
+	await ctx.ui.custom!<undefined>((_tui, theme, keybindings, done) =>
+		new ReviewSidebarOverlay(
+			theme as unknown as OverlayCtorArgs[0],
+			keybindings as unknown as OverlayCtorArgs[1],
+			`Readyset review — ${chosen.title} (${chosen.changeId})`,
+			overlaySections,
+			done,
+		),
+	{ overlay: true, overlayOptions: { fullscreen: true } },
+	).catch((err) => {
+		ctx.ui.notify(`Sidebar view failed to open: ${err instanceof Error ? err.message : String(err)}. Falling back to Jump to section.`, "warning");
+		return browseReviewSections(ctx, chosen, snapshot);
+	});
+}
+
 async function browseReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<void> {
 	const sections = await buildReviewSections(ctx, chosen, snapshot);
 	const BACK = "◂ Back to full document";
@@ -617,15 +666,23 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			? `${snapshot.counted.done}/${snapshot.counted.total} tasks ticked`
 			: "tasks.md not found yet";
 
+		const hasSidebar = typeof ctx.ui.custom === "function";
 		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
 			{ label: "Approve & Execute", description: `implement per tasks.md, then report progress — ${taskSummary}` },
 			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
-			{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" },
+			...(hasSidebar
+				? [{ label: "Sidebar view", description: "persistent section list + content, like native /plan's review — ↑/↓ · PgUp/PgDn · Esc" }]
+				: [{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" }]),
 			{ label: "Buka untuk direview", description: "see the full compiled document in the editor pane — no changes made" },
 			{ label: "Discard", description: "leave as proposed, do nothing" },
 		]);
 
 		if (!choice || choice === "Discard") return;
+
+		if (choice === "Sidebar view") {
+			await openSidebarOverlay(ctx, chosen, snapshot);
+			continue; // stay in the loop; re-show the panel/gate (and full document) after they close the overlay
+		}
 
 		if (choice === "Jump to section") {
 			await browseReviewSections(ctx, chosen, snapshot);

@@ -58,6 +58,7 @@ const INSTALL_MAP = [
 	{ from: join(packageRoot, "src", "lib", "readyset-brainstorm.ts"), to: join("agent", "lib", "readyset-brainstorm.ts") },
 	{ from: join(packageRoot, "src", "lib", "readyset-spec.ts"), to: join("agent", "lib", "readyset-spec.ts") },
 	{ from: join(packageRoot, "src", "lib", "readyset-omp-config.ts"), to: join("agent", "lib", "readyset-omp-config.ts") },
+	{ from: join(packageRoot, "src", "lib", "readyset-review-overlay.ts"), to: join("agent", "lib", "readyset-review-overlay.ts") },
 	{ from: join(packageRoot, "src", "extensions", "readyset-review.ts"), to: join("agent", "extensions", "readyset-review.ts") },
 	// Reference doc, not a runtime file — read by an agent working a Readyset change directly
 	// (outside a /readyset-review-triggered turn), not loaded by the extension itself. Installed

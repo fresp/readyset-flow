@@ -773,5 +773,56 @@ await test("Jump to section shows one section at a time, then restores the full 
   assert.match(restoredDoc, /DESIGN/);
 });
 
+await test("Sidebar view: offered instead of Jump to section when ctx.ui.custom exists, and wires sections through to the factory", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-16-sidebar.md", {
+    title: "Sidebar Test",
+    status: "proposed",
+    created: "2026-01-16",
+    change_id: "sidebar-test",
+  });
+  const dir = join(cwd, "readyset", "changes", "sidebar-test");
+  await mkdir(dir, { recursive: true });
+  await writeFile(dir + "/proposal.md", "## Why\n\nsidebar test proposal\n", "utf8");
+  await writeFile(dir + "/tasks.md", "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  const customCalls: unknown[] = [];
+  const ui = {
+    ...fakeUiWrap.ui,
+    async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (r: unknown) => void) => unknown, options: unknown) {
+      customCalls.push(options);
+      // Exercise the factory the way real Interactive mode would: build the overlay, confirm it
+      // renders without throwing, then immediately close it (as if the user pressed Esc).
+      let resolved: unknown;
+      const overlay = factory(
+        {},
+        { fg: (_n: string, t: string) => t, bold: (t: string) => t },
+        { matches: () => false },
+        (r: unknown) => (resolved = r),
+      ) as { render: (w: number) => string[]; handleInput?: (d: string) => void };
+      const rendered = overlay.render(100);
+      assert.ok(Array.isArray(rendered) && rendered.length > 0, "overlay factory should produce a real Component with render()");
+      assert.ok(rendered.some(l => l.includes("Proposal")), "overlay should include the Proposal section heading");
+      overlay.handleInput?.("\x1b"); // simulate Esc via the real keybindings.matches("tui.select.cancel") path would normally fire; our stub always returns false, so call done() directly instead
+      return resolved;
+    },
+  };
+
+  fakeUiWrap.selectQueue.push("2026-01-16 · Sidebar Test"); // pick
+  fakeUiWrap.selectQueue.push("Sidebar view"); // offered because ui.custom exists
+  fakeUiWrap.selectQueue.push("Discard"); // leave the gate after the overlay closes
+
+  const ctx = { cwd, ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.equal(customCalls.length, 1, "ctx.ui.custom should be called exactly once for Sidebar view");
+  assert.equal((customCalls[0] as { overlay?: boolean }).overlay, true);
+  assert.ok(!fakeUiWrap.selectPrompts.some(p => p === "Jump to a section — \"sidebar-test\""), "Jump to section's menu should not appear when Sidebar view is available");
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
