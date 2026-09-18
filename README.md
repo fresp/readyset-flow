@@ -41,9 +41,15 @@ npm install --save-dev readyset-review
 npx readyset-review install
 ```
 
-This copies Readyset's `.ts` source straight into `agent/lib/` and `agent/extensions/` in the
-current directory (or pass `--target <path>` for a different repo root). There is no build step
-— omp loads extensions as `.ts` files directly, so the source is what gets installed.
+This copies Readyset's `.ts` source into `.omp/lib/` and `.omp/extensions/`, and the skill doc
+into `.agent/skills/`, in the current directory (or pass `--target <path>` for a different repo
+root). There is no build step — omp loads extensions as `.ts` files directly, so the source is
+what gets installed. These are omp's own documented project-level discovery paths — extensions
+auto-discover from `<cwd>/.omp/extensions` (`docs/extension-loading.md`), skills from the
+canonical `.agent[s]/skills/<name>/SKILL.md` location (`docs/skills.md`) — not a guess: an
+earlier version of this installer used an undotted `agent/` convention that omp never actually
+scanned, so nothing installed with it was ever loaded. If you installed with that older version,
+re-run install and delete the stale `agent/` directory.
 
 Re-run `npx readyset-review install` after bumping the `readyset-review` version in a consuming repo to pick
 up changes. **Don't hand-edit the installed files** — they get overwritten on the next install.
@@ -168,13 +174,23 @@ src/
   skill/
     SKILL.md                reference doc for the phase order + file formats; read by an agent
                              working a Readyset change directly, not loaded by the extension —
-                             installed to agent/skills/readyset/SKILL.md (see note below)
+                             installed to .agent/skills/readyset/SKILL.md (see note below)
   cli/
     install.mjs            `readyset-review install` — copies src/lib + src/extensions + src/skill into a target repo
 ```
 
-`agent/skills/readyset/SKILL.md`'s install path follows the same `agent/lib` + `agent/extensions`
-convention the other files use, but — unlike the extension API, which was checked against
-upstream omp docs — this hasn't been confirmed against omp's own skill-discovery location. If
-your omp build looks for skills somewhere else, move the installed file there; the content
-itself doesn't depend on where it lives.
+Installed layout in a target repo, once `readyset-review install` has run:
+
+```
+.omp/
+  lib/brainstorm.ts, readyset-spec.ts, omp-config.ts
+  extensions/readyset-review.ts
+.agent/
+  skills/readyset/SKILL.md
+```
+
+Both destinations are omp's own documented project-level discovery paths, confirmed against
+`docs/extension-loading.md` (`<cwd>/.omp/extensions`, non-recursive, cwd only) and `docs/skills.md`
+(canonical `.agent[s]/skills/<name>/SKILL.md`, `.agent/` or `.agents/` both accepted) — not a
+guess, unlike an earlier version of this installer which used an undotted `agent/` convention
+that omp never actually scanned.
