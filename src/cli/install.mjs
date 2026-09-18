@@ -49,6 +49,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { mkdir, copyFile, readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..", "..");
@@ -68,11 +69,16 @@ const INSTALL_MAP = [
 ];
 
 function parseArgs(argv) {
-	const args = { command: argv[0], target: DEFAULT_TARGET };
+	const args = { command: argv[0], target: DEFAULT_TARGET, cwd: process.cwd(), positional: [] };
 	for (let i = 1; i < argv.length; i++) {
 		if (argv[i] === "--target" && argv[i + 1]) {
 			args.target = argv[i + 1];
 			i++;
+		} else if (argv[i] === "--cwd" && argv[i + 1]) {
+			args.cwd = argv[i + 1];
+			i++;
+		} else {
+			args.positional.push(argv[i]);
 		}
 	}
 	return args;
@@ -97,6 +103,65 @@ async function printVersion() {
 	console.log(pkg.version);
 }
 
+/**
+ * `readyset-review validate <change-id> [--cwd <path>]` — the same structural check the omp
+ * gate runs before every "Approve & Execute"/Refine/Sidebar view, exposed here so it can run
+ * outside an omp session (CI, a pre-commit hook, a plain terminal) without needing omp
+ * installed at all. Runs `validate-runner.mts` (which does the real `validateChange` call) as
+ * a subprocess with `--experimental-strip-types`, since `install.mjs` itself stays flag-free
+ * (see the module doc comment and `validate-runner.mts`'s own for why).
+ *
+ * Exit code mirrors `validateChange`'s `ok`: 0 = pass, 1 = structural issues found -- so this
+ * composes directly into a CI step (`readyset-review validate my-change || exit 1`) or a
+ * pre-commit hook without any extra parsing.
+ */
+async function validate(changeId, targetCwd) {
+	if (!changeId) {
+		console.error("Usage: readyset-review validate <change-id> [--cwd <path>]");
+		process.exitCode = 1;
+		return;
+	}
+	const runner = join(packageRoot, "src", "cli", "validate-runner.mts");
+	const result = spawnSync(process.execPath, ["--experimental-strip-types", runner, targetCwd, changeId], {
+		encoding: "utf8",
+	});
+
+	if (result.error) {
+		console.error(`Couldn't run the validator: ${result.error.message}`);
+		console.error(
+			"`readyset-review validate` needs Node 22.6+ (it runs readyset-spec.ts's real check via " +
+				"--experimental-strip-types, the same way this package's own test suite does) -- " +
+				"`install`/`version` have no such requirement.",
+		);
+		process.exitCode = 1;
+		return;
+	}
+
+	const stdout = result.stdout?.trim();
+	if (!stdout || result.status === 2) {
+		console.error(result.stderr?.trim() || "The validator crashed without output.");
+		process.exitCode = 1;
+		return;
+	}
+
+	let parsed;
+	try {
+		parsed = JSON.parse(stdout);
+	} catch {
+		console.error("The validator produced output that wasn't valid JSON:");
+		console.error(stdout);
+		if (result.stderr?.trim()) console.error(result.stderr.trim());
+		process.exitCode = 1;
+		return;
+	}
+
+	console.log(parsed.summary);
+	for (const issue of parsed.issues) {
+		console.log(`  - ${issue.file}: ${issue.problem}`);
+	}
+	process.exitCode = parsed.ok ? 0 : 1;
+}
+
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
 
@@ -108,11 +173,18 @@ async function main() {
 		await printVersion();
 		return;
 	}
+	if (args.command === "validate") {
+		await validate(args.positional[0], args.cwd);
+		return;
+	}
 
 	console.log("Readyset CLI\n");
 	console.log("Usage:");
-	console.log("  readyset-review install [--target <path>]   Install/update Readyset's extension files (defaults to ~/.omp)");
-	console.log("  readyset-review version                     Print the installed Readyset package version");
+	console.log("  readyset-review install [--target <path>]        Install/update Readyset's extension files (defaults to ~/.omp)");
+	console.log("  readyset-review validate <change-id> [--cwd <path>]");
+	console.log("                                                    Run the same structural check the omp gate runs, outside omp");
+	console.log("                                                    (CI, pre-commit) -- exit code 0 on pass, 1 on issues found");
+	console.log("  readyset-review version                          Print the installed Readyset package version");
 	process.exitCode = args.command ? 1 : 0;
 }
 

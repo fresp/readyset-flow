@@ -63,6 +63,28 @@ Re-run `npx readyset-review install` after bumping the `readyset-review` version
 changes. **Don't hand-edit the installed files** — they get overwritten on the next install. If
 you need different behavior, change it here and re-publish, not in the installed copy.
 
+## Validate from the CLI
+
+```
+readyset-review validate <change-id> [--cwd <path>]
+```
+
+Runs the exact same structural check (`validateChange`) the omp gate runs before every Approve &
+Execute / Refine / Sidebar view — but from a plain terminal, no omp session needed. Exit code is
+`0` on pass, `1` on structural issues found, so it composes directly into CI or a pre-commit hook:
+
+```
+readyset-review validate complete-embedded-signup-onboarding || exit 1
+```
+
+`install`/`version` only need whatever Node the `engines` field promises (`>=18`) — `install.mjs`
+deliberately never imports a `.ts` file itself. `validate` is the exception: it needs to run
+`readyset-spec.ts`'s real check, not a re-implementation that could drift from what the gate
+actually enforces, so it spawns a small subprocess (`validate-runner.mts`) with
+`--experimental-strip-types` — Node 22.6+, same requirement this package's own test suite already
+has. If that subprocess can't start, `validate` says so plainly rather than failing silently;
+`install`/`version` are unaffected either way.
+
 ## Use
 
 With Readyset installed and at least one brainstorm under `.ai/brainstorms/` in a repo, run:
@@ -191,7 +213,8 @@ src/
                              working a Readyset change directly, not loaded by the extension —
                              installed to ~/.omp/agent/skills/readyset/SKILL.md (see note below)
   cli/
-    install.mjs            `readyset-review install` — copies src/lib + src/extensions + src/skill into ~/.omp/agent/
+    install.mjs            `readyset-review install`/`version`/`validate` — the CLI entry point
+    validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
 ```
 
 Installed layout, once `readyset-review install` has run (default target `~/.omp`):
