@@ -550,9 +550,12 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
  * A real persistent sidebar (native `/plan`'s clickable outline + content pane) turned out to
  * be possible after all via `ctx.ui.custom()` in Interactive mode — see `readyset-review-overlay.ts`
  * and `openSidebarOverlay` below, offered as "Sidebar view" on the gate whenever `ctx.ui.custom`
- * is present. This compiled document remains the fallback for RPC/ACP/print contexts (and for
- * "Buka untuk direview", which is deliberately a no-navigation dump), and `browseReviewSections`
- * below remains the fallback "one section at a time" menu when `ctx.ui.custom` isn't available.
+ * is present. This compiled document is pushed to the editor pane unconditionally at the top of
+ * every gate loop iteration (see `reviewAndMaybeExecute`), so it's always current whether or not
+ * the user opens the sidebar — there is deliberately no separate "just show me the full doc" gate
+ * option, since one pushed automatically on every loop turn would be a no-op by construction.
+ * `browseReviewSections` below remains the fallback "one section at a time" menu for RPC/ACP/print
+ * contexts, where `ctx.ui.custom` isn't available.
  */
 async function buildReviewDocument(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<string> {
 	const sections = await buildReviewSections(ctx, chosen, snapshot);
@@ -681,7 +684,6 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			...(hasSidebar
 				? [{ label: "Sidebar view", description: "persistent section list + content, like native /plan's review — ↑/↓ · PgUp/PgDn · Esc" }]
 				: [{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" }]),
-			{ label: "Buka untuk direview", description: "see the full compiled document in the editor pane — no changes made" },
 			{ label: "Discard", description: "leave as proposed, do nothing" },
 		]);
 
@@ -695,14 +697,6 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 		if (choice === "Jump to section") {
 			await browseReviewSections(ctx, chosen, snapshot);
 			continue; // stay in the loop; re-show the panel/gate (and full document) after they're done browsing
-		}
-
-		if (choice === "Buka untuk direview") {
-			ctx.ui.notify(
-				`Full change document (exploration/proposal/design/specs/tasks/verification/review) is in the editor pane — nothing was changed.`,
-				"info",
-			);
-			continue; // stay in the loop; re-show the panel/gate after they've looked
 		}
 
 		if (choice === "Refine") {
