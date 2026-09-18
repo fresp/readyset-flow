@@ -41,23 +41,30 @@ npm install --save-dev readyset-review
 npx readyset-review install
 ```
 
-This copies Readyset's `.ts` source into `.omp/lib/` and `.omp/extensions/`, and the skill doc
-into `.agent/skills/`, in the current directory (or pass `--target <path>` for a different repo
-root). There is no build step — omp loads extensions as `.ts` files directly, so the source is
-what gets installed. These are omp's own documented project-level discovery paths — extensions
-auto-discover from `<cwd>/.omp/extensions` (`docs/extension-loading.md`), skills from the
-canonical `.agent[s]/skills/<name>/SKILL.md` location (`docs/skills.md`) — not a guess: an
-earlier version of this installer used an undotted `agent/` convention that omp never actually
-scanned, so nothing installed with it was ever loaded. If you installed with that older version,
-re-run install and delete the stale `agent/` directory.
+Readyset installs **globally**, into `~/.omp/agent/` — not into any one repo. It's a personal
+workflow extension, like the other extensions that may already live in `~/.omp/agent/extensions/`,
+meant to be available in every repo you work in, not scoped to one. This is omp's own documented
+user-level discovery path (`~/.omp/agent/extensions`, `~/.omp/agent/lib`, confirmed against
+`docs/extension-loading.md` and against a real `~/.omp` already running other extensions, not
+guessed): `.ts` source goes to `~/.omp/agent/lib/` and `~/.omp/agent/extensions/`, the skill doc
+to `~/.omp/agent/skills/`. There's no build step — omp loads extensions as `.ts` files directly.
 
-Re-run `npx readyset-review install` after bumping the `readyset-review` version in a consuming repo to pick
-up changes. **Don't hand-edit the installed files** — they get overwritten on the next install.
-If a repo needs different behavior, change it here and re-publish, not in the copy.
+`~/.omp/agent/` is a shared namespace — other extensions' files already live there. Every file
+this package installs is prefixed `readyset-` (`readyset-brainstorm.ts`, `readyset-omp-config.ts`,
+`readyset-spec.ts`, `readyset-review.ts`) specifically so it can never collide with or silently
+overwrite something already installed there, regardless of what else you have running.
+
+Pass `--target <path>` to install somewhere else instead — a scratch directory for testing, or
+`<repo>/.omp` if you'd rather scope this to one project (omp supports that layout too; this
+installer just doesn't default to it).
+
+Re-run `npx readyset-review install` after bumping the `readyset-review` version to pick up
+changes. **Don't hand-edit the installed files** — they get overwritten on the next install. If
+you need different behavior, change it here and re-publish, not in the installed copy.
 
 ## Use
 
-Inside a repo with Readyset installed and at least one brainstorm under `.ai/brainstorms/`, run:
+With Readyset installed and at least one brainstorm under `.ai/brainstorms/` in a repo, run:
 
 ```
 /readyset-review
@@ -166,31 +173,33 @@ REVIEW.md        code-review phase findings, written after implementation, befor
 ```
 src/
   lib/
-    brainstorm.ts       shared helpers: frontmatter parsing, status reconciliation, lane detection
-    readyset-spec.ts        Readyset's own change-artifact format: scaffold/validate/progress/archive
-    omp-config.ts           reads omp's own ~/.omp/agent/config.yml for a default --model fallback
+    readyset-brainstorm.ts   shared helpers: frontmatter parsing, status reconciliation, lane detection
+    readyset-spec.ts         Readyset's own change-artifact format: scaffold/validate/progress/archive
+    readyset-omp-config.ts   reads omp's own ~/.omp/agent/config.yml for a default --model fallback
   extensions/
     readyset-review.ts      the /readyset-review command itself
   skill/
     SKILL.md                reference doc for the phase order + file formats; read by an agent
                              working a Readyset change directly, not loaded by the extension —
-                             installed to .agent/skills/readyset/SKILL.md (see note below)
+                             installed to ~/.omp/agent/skills/readyset/SKILL.md (see note below)
   cli/
-    install.mjs            `readyset-review install` — copies src/lib + src/extensions + src/skill into a target repo
+    install.mjs            `readyset-review install` — copies src/lib + src/extensions + src/skill into ~/.omp/agent/
 ```
 
-Installed layout in a target repo, once `readyset-review install` has run:
+Installed layout, once `readyset-review install` has run (default target `~/.omp`):
 
 ```
-.omp/
-  lib/brainstorm.ts, readyset-spec.ts, omp-config.ts
+~/.omp/agent/
+  lib/readyset-brainstorm.ts, readyset-spec.ts, readyset-omp-config.ts
   extensions/readyset-review.ts
-.agent/
   skills/readyset/SKILL.md
 ```
 
-Both destinations are omp's own documented project-level discovery paths, confirmed against
-`docs/extension-loading.md` (`<cwd>/.omp/extensions`, non-recursive, cwd only) and `docs/skills.md`
-(canonical `.agent[s]/skills/<name>/SKILL.md`, `.agent/` or `.agents/` both accepted) — not a
-guess, unlike an earlier version of this installer which used an undotted `agent/` convention
-that omp never actually scanned.
+This is omp's own documented user-level discovery path, confirmed against `docs/extension-loading.md`
+("User-level (global): the active agent directory's extensions/", which resolves to
+`~/.omp/agent/extensions` by default) and against a real `~/.omp` already running other
+extensions — not a guess. Every filename here is prefixed `readyset-` on purpose: `~/.omp/agent/`
+is shared with whatever else you already have installed there, and an earlier, unprefixed version
+of this installer (`brainstorm.ts`, `omp-config.ts`) would have collided with an existing,
+unrelated `~/.omp/agent/lib/brainstorm.ts` in active use by other extensions on the machine this
+was verified against, silently overwriting it and breaking them.
