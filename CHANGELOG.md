@@ -6,6 +6,14 @@ the commit that bumped it. Entries describe real commits, not a reconstructed na
 version with very few commits between it and the previous bump genuinely only had that much
 change in it.
 
+## 0.9.1
+
+- **Publish readiness**: MIT `LICENSE`, `package.json` metadata (`repository`, `homepage`,
+  `bugs`, `author`), `package-lock.json`, a `prepublishOnly` test gate, a CI workflow
+  (`npm ci && npm test && npm pack --dry-run` on push/PR), a Node compatibility table in the
+  README, and this changelog itself (backfilled from `package.json`'s real version history).
+  No runtime behavior changed — this version is release hygiene only.
+
 ## 0.9.0
 
 - **`readyset-flow configure`** — an interactive wizard for the `readyset:` section of
@@ -16,10 +24,6 @@ change in it.
   running the grilling/brainstorming step outside omp entirely (e.g. in Claude Cowork), whose
   output feeds `/readyset`'s brainstorm picker. Its session language is now a `language`
   frontmatter field (defaults to English if unset) instead of being hardcoded.
-- **Publish readiness**: MIT `LICENSE`, `package.json` metadata (`repository`, `homepage`,
-  `bugs`, `author`), `package-lock.json`, a `prepublishOnly` test gate, a CI workflow
-  (`npm ci && npm test && npm pack --dry-run` on push/PR), and a Node compatibility table in the
-  README.
 
 ## 0.8.0
 
