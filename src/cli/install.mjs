@@ -58,10 +58,11 @@
  * won't do it for you.
  */
 
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, basename } from "node:path";
 import { homedir } from "node:os";
 import { mkdir, copyFile, readFile, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { runConfigureWizard } from "./configure.mjs";
 
@@ -281,9 +282,26 @@ async function main() {
 // Guarded so this file can be `import()`ed (e.g. by test/readyset-install-link.test.mts, to call
 // `linkExtension` directly) without actually running the CLI as a side effect of importing it.
 // Still runs exactly as before when executed directly (`node install.mjs ...`, or spawned as a
-// subprocess the way test/readyset-cli-validate.test.mts already does) -- import.meta.url only
-// equals the invoked script's own path in that case.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// subprocess the way test/readyset-cli-validate.test.mts already does).
+//
+// This can't be the naive `import.meta.url === file://${process.argv[1]}` check -- that breaks
+// under npm's own real bin symlink (confirmed live: `npm install -g` from a packed tarball,
+// invoking the resulting bin/readyset-flow symlink, silently did nothing). Node resolves
+// import.meta.url to the symlink's REAL target, but leaves process.argv[1] as the symlink path
+// exactly as invoked, so the two never match once this ships as an actual global install -- the
+// one way real users are guaranteed to run this. Resolving argv[1] to its real path first makes
+// the comparison symlink-proof; process.argv[1] can be missing entirely in some embedders, so
+// this fails closed (not-main) rather than throwing.
+function isMainModule() {
+	if (!process.argv[1]) return false;
+	try {
+		return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) {
 	main().catch((err) => {
 		console.error("Readyset install failed:", err?.message ?? err);
 		process.exitCode = 1;

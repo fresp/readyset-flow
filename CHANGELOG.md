@@ -1,10 +1,23 @@
 # Changelog
 
-Only `0.9.0` has an actual git tag — every entry below `0.9.0` is reconstructed from
-`package.json`'s `version` field across git history (`git log -p -- package.json`), grouped by
-the commit that bumped it. Entries describe real commits, not a reconstructed narrative; a
-version with very few commits between it and the previous bump genuinely only had that much
-change in it.
+Every version from `0.2.0` on now has a real git tag. Entries at `0.9.0` and below were
+reconstructed from `package.json`'s `version` field across git history (`git log -p --
+package.json`), grouped by the commit that bumped it, and describe real commits rather than a
+rewritten narrative — a version with very few commits between it and the previous bump genuinely
+only had that much change in it.
+
+## 0.9.2
+
+- **Fix: the CLI silently did nothing under a real `npm install -g` / `npx` invocation.**
+  `install`/`configure`/`validate`/`version` all gate on an "is this the entry module" check
+  (`import.meta.url === file://${process.argv[1]}`), which breaks the moment this runs through
+  npm's own bin symlink: Node resolves `import.meta.url` to the symlink's real target, but leaves
+  `process.argv[1]` as the symlink path exactly as invoked, so the two never match. Confirmed
+  live — packed the tarball, `npm install -g` from it into a scratch prefix, ran the resulting
+  `bin/readyset-flow` symlink, got silent success with zero output. Fixed by resolving
+  `process.argv[1]` to its real path (`fs.realpathSync`) before comparing. Every version before
+  this one has the bug; anyone who installed `readyset-flow` the normal way (not by pointing
+  `node` at the file directly) got a CLI that did nothing.
 
 ## 0.9.1
 
