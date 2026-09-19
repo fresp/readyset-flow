@@ -111,9 +111,11 @@ function makeFakeZodNode(): any {
 const fakeZod = makeFakeZodNode();
 
 // Fake pi.sendUserMessage: each test controls what "the agent turn" does via a queue of
-// side-effect functions, invoked when waitForIdle() is awaited (mirrors the real
-// triggerTurn -> waitForIdle blocking pattern, fully under test control, same approach
-// used throughout this conversation's other extension tests).
+// side-effect functions, invoked when waitForIdle() is awaited (mirrors the real fire-and-forget
+// send -> waitForIdle() pattern, fully under test control, same approach used throughout this
+// conversation's other extension tests). Note the handler calls it with NO options: omp's
+// `sendUserMessage` accepts only `deliverAs: "steer" | "followUp" | "aside"`, and omitting it is
+// what starts a turn when the session is idle.
 function makeFakePi(cwd: string) {
   const calls: { prompt: string }[] = [];
   const pendingEffects: (() => Promise<void>)[] = [];
@@ -132,6 +134,10 @@ function makeFakePi(cwd: string) {
       zod: fakeZod,
       async setModel(spec: unknown) {
         setModelCalls.push(spec);
+        // Real omp contract is `Promise<boolean>` -- true once applied, false when there's no
+        // API key for the model. Returning a bare `undefined` here would make every test treat
+        // a failed pin as a successful one, hiding exactly the bug this suite now pins down.
+        return true;
       },
     },
     calls,
@@ -149,6 +155,7 @@ function makeFakePi(cwd: string) {
 function makeFakeUi() {
   const notifications: { message: string; level?: string }[] = [];
   const widgetHistory: string[][] = [];
+  const widgetKeys: string[] = [];
   const editorTextHistory: string[] = [];
   const selectQueue: (string | undefined)[] = [];
   const inputQueue: (string | undefined)[] = [];
@@ -167,8 +174,13 @@ function makeFakeUi() {
       setEditorText(text: string) {
         editorTextHistory.push(text);
       },
-      setWidget(lines: string[]) {
-        widgetHistory.push(lines);
+      // Real omp signature is `setWidget(key: string, content: ExtensionWidgetContent, options?)`.
+      // A fake that records the first argument as the lines array (as this one used to) cannot
+      // tell the correct call apart from `setWidget(lines)`, which the host reads as key = the
+      // array and content = undefined -- so the panel never rendered at all.
+      setWidget(key: string, content: string[]) {
+        widgetKeys.push(key);
+        widgetHistory.push(content);
       },
       notify(message: string, level?: string) {
         notifications.push({ message, level });
@@ -176,6 +188,7 @@ function makeFakeUi() {
     },
     notifications,
     widgetHistory,
+    widgetKeys,
     editorTextHistory,
     selectQueue,
     inputQueue,
@@ -187,8 +200,8 @@ async function loadHandler(fakePi: { sendUserMessage: (prompt: string, opts: unk
   const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
     default: (pi: unknown) => void;
   };
-  let captured: { handler: (args: string[], ctx: unknown) => Promise<void> } | undefined;
-  const registerCommand = (_name: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) => {
+  let captured: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  const registerCommand = (_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
     captured = def;
   };
   // registerCommand is captured, but sendUserMessage must be the real fake so the handler's
@@ -232,7 +245,7 @@ async function loadAskTool(): Promise<{
 // -- needed to test the zero-rounds gate, which depends on readyset_ask's execute() and the
 // command handler's content-check gate agreeing on the same in-memory state.
 async function loadHandlerAndAskTool(fakePi: { sendUserMessage: (prompt: string, opts: unknown) => void }): Promise<{
-  handler: (args: string[], ctx: unknown) => Promise<void>;
+  handler: (args: string, ctx: unknown) => Promise<void>;
   askExecute: (
     toolCallId: string,
     params: { questions: unknown[] },
@@ -244,11 +257,11 @@ async function loadHandlerAndAskTool(fakePi: { sendUserMessage: (prompt: string,
   const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
     default: (pi: unknown) => void;
   };
-  let capturedHandler: { handler: (args: string[], ctx: unknown) => Promise<void> } | undefined;
+  let capturedHandler: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
   let capturedAsk: { execute: (...args: unknown[]) => Promise<unknown> } | undefined;
   mod.default({
     ...fakePi,
-    registerCommand(_name: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) {
+    registerCommand(_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       capturedHandler = def;
     },
     registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
@@ -309,7 +322,7 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
   });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakePiWrap.calls.length, 4);
   assert.match(fakePiWrap.calls[0].prompt, /Explore the ground truth for the Readyset change "my-feature"/);
@@ -382,7 +395,7 @@ await test("verification gate: missing _Verified notes sends back for another ap
   });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(
     fakeUiWrap.selectPrompts.some((p) => /have no _Verified: note/.test(p)),
@@ -406,7 +419,7 @@ await test("propose fails to produce a valid change -> warns, does not enter rev
   fakePiWrap.queueEffect(async () => {});
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakePiWrap.calls.length, 2); // explore + propose fired, never apply
   assert.ok(fakeUiWrap.notifications.some((n) => /didn't produce EXPLORATION.md/.test(n.message) && n.level === "warning"));
@@ -446,7 +459,7 @@ await test("already-proposed brainstorm: goes straight to review gate, refine lo
   });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakePiWrap.calls.length, 1);
   assert.match(fakePiWrap.calls[0].prompt, /Revise the Readyset change "thing"/);
@@ -456,6 +469,7 @@ await test("already-proposed brainstorm: goes straight to review gate, refine lo
 
   // widget shown twice (once per loop iteration) and disagreement check: first pass had issues, second didn't
   assert.equal(fakeUiWrap.widgetHistory.length, 2);
+  assert.deepEqual(fakeUiWrap.widgetKeys, ["readyset", "readyset"], "the first argument must be the string key, not the lines array");
   assert.match(fakeUiWrap.widgetHistory[0].join("\n"), /issue/);
   assert.match(fakeUiWrap.widgetHistory[1].join("\n"), /pass/);
 });
@@ -485,7 +499,7 @@ await test("approve & execute pauses when tasks incomplete (agent stopped early)
   });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(fakeUiWrap.notifications.some((n) => /Paused at 1\/2 tasks/.test(n.message) && n.level === "warning"));
   // no archive prompt should have been offered
@@ -501,13 +515,13 @@ await test("--fast flag includes fast-lane brainstorms; default excludes them", 
   const fakeUiWrap = makeFakeUi();
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx); // no --fast
+  await handler("", ctx); // no --fast
   assert.ok(fakeUiWrap.notifications.some((n) => /No full-lane brainstorms found/.test(n.message)));
 
   const fakeUiWrap2 = makeFakeUi();
   fakeUiWrap2.selectQueue.push(undefined); // cancel immediately, we just want to confirm it's listed
   const ctx2 = { cwd, ui: fakeUiWrap2.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler(["--fast"], ctx2);
+  await handler("--fast", ctx2);
   assert.equal(fakeUiWrap2.notifications.filter((n) => /No full-lane/.test(n.message)).length, 0);
 });
 
@@ -520,13 +534,13 @@ await test("archived brainstorm short-circuits with a warning", async () => {
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push(undefined); // --all needed to see archived; test the "no items" path without --all first
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
   assert.ok(fakeUiWrap.notifications.some((n) => /No full-lane brainstorms found/.test(n.message)));
 
   const fakeUiWrap2 = makeFakeUi();
   fakeUiWrap2.selectQueue.push("2026-01-06 · Done");
   const ctx2 = { cwd, ui: fakeUiWrap2.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler(["--all"], ctx2);
+  await handler("--all", ctx2);
   assert.ok(fakeUiWrap2.notifications.some((n) => /already archived/.test(n.message) && n.level === "warning"));
   assert.equal(fakePiWrap.calls.length, 0);
 });
@@ -538,7 +552,7 @@ await test("fireTurnAndWait survives the observed race: waitForIdle would resolv
   const handler = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
     default: (pi: unknown) => void;
   };
-  let captured: { handler: (args: string[], ctx: unknown) => Promise<void> } | undefined;
+  let captured: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
 
   // Simulate the real omp timing bug: right after sendUserMessage fires, the session still
   // reads as idle for a beat (turn hasn't started yet) before flipping to "running", and only
@@ -566,7 +580,7 @@ await test("fireTurnAndWait survives the observed race: waitForIdle would resolv
         idle = true;
       }, 300);
     },
-    registerCommand(_name: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) {
+    registerCommand(_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       captured = def;
     },
     registerTool(_def: unknown) {},
@@ -592,7 +606,7 @@ await test("fireTurnAndWait survives the observed race: waitForIdle would resolv
     },
   };
 
-  await captured.handler([], ctx);
+  await captured.handler("", ctx);
 
   assert.ok(!fakeUiWrap.notifications.some((n) => /doesn't look finished/.test(n.message)), "should not have raced past the turn");
   assert.ok(fakeUiWrap.selectPrompts.some((p) => p.includes("Review change")), "should have reached the review gate");
@@ -628,7 +642,7 @@ await test("turn budget: caps a runaway refine loop and stops firing new turns",
   }
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   // default budget is 10 -- should have stopped well before 15 refine turns fired
   assert.ok(fakePiWrap.calls.length <= 10, `expected at most 10 turns fired, got ${fakePiWrap.calls.length}`);
@@ -673,7 +687,7 @@ await test("--model pins a model for the run's turns and restores the original m
     },
   };
 
-  await handler(["--model", "anthropic/claude-opus-5"], ctx);
+  await handler("--model anthropic/claude-opus-5", ctx);
 
   assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:anthropic/claude-opus-5", "session-default-model"]);
   assert.ok(fakeUiWrap.notifications.some((n) => /Pinned model "anthropic\/claude-opus-5"/.test(n.message)));
@@ -736,7 +750,7 @@ await test("setModel is called bound to pi, not detached -- a real terminal run 
     },
   };
 
-  await handler(["--model", "some/model"], ctx);
+  await handler("--model some/model", ctx);
 
   assert.deepEqual(
     setModelCalls,
@@ -782,7 +796,7 @@ await test("without --model, setModel is never called even though the API is ava
     waitForIdle: fakePiWrap.waitForIdle,
     models: { current: () => "whatever", resolve: (s: string) => s },
   };
-  await handler([], ctx); // no --model
+  await handler("", ctx); // no --model
 
   assert.equal(fakePiWrap.setModelCalls.length, 0);
 });
@@ -821,8 +835,8 @@ await test("--fallback-model is used when the primary --model fails to pin", asy
   const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
     default: (pi: unknown) => void;
   };
-  let captured: { handler: (args: string[], ctx: unknown) => Promise<void> } | undefined;
-  mod.default({ ...fakePi, registerCommand: (_n: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) => (captured = def) } as any);
+  let captured: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  mod.default({ ...fakePi, registerCommand: (_n: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => (captured = def) } as any);
   if (!captured) throw new Error("registerCommand was never called");
 
   const fakeUiWrap = makeFakeUi();
@@ -843,7 +857,7 @@ await test("--fallback-model is used when the primary --model fails to pin", asy
     },
   };
 
-  await captured.handler(["--model", "bad/primary-model", "--fallback-model", "good/fallback-model"], ctx);
+  await captured.handler("--model bad/primary-model --fallback-model good/fallback-model", ctx);
 
   assert.deepEqual(setModelCalls, ["resolved:bad/primary-model", "resolved:good/fallback-model", "session-default-model"]);
   assert.ok(fakeUiWrap.notifications.some((n) => /Couldn't pin model "bad\/primary-model"/.test(n.message) && n.level === "warning"));
@@ -883,8 +897,8 @@ await test("both --model and --fallback-model fail to pin -> runs unpinned rathe
   const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
     default: (pi: unknown) => void;
   };
-  let captured: { handler: (args: string[], ctx: unknown) => Promise<void> } | undefined;
-  mod.default({ ...fakePi, registerCommand: (_n: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) => (captured = def) } as any);
+  let captured: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  mod.default({ ...fakePi, registerCommand: (_n: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => (captured = def) } as any);
   if (!captured) throw new Error("registerCommand was never called");
 
   const fakeUiWrap = makeFakeUi();
@@ -898,7 +912,7 @@ await test("both --model and --fallback-model fail to pin -> runs unpinned rathe
     models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
   };
 
-  await captured.handler(["--model", "bad/primary", "--fallback-model", "also/bad"], ctx);
+  await captured.handler("--model bad/primary --fallback-model also/bad", ctx);
 
   assert.equal(setModelCalls.length, 2); // primary attempted, fallback attempted, no restore (nothing succeeded)
   assert.ok(fakeUiWrap.notifications.some((n) => /Every fallback in the chain.*failed to pin/.test(n.message) && n.level === "warning"));
@@ -987,7 +1001,7 @@ await test("review gate pushes a full compiled document (all sections) to the ed
   fakeUiWrap.selectQueue.push("Discard");
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakeUiWrap.editorTextHistory.length, 1);
   const doc = fakeUiWrap.editorTextHistory[0];
@@ -1035,7 +1049,7 @@ await test("Jump to section shows one section at a time, then restores the full 
   fakeUiWrap.selectQueue.push("Discard"); // leave the gate
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   // editor gets set: initial full doc, single-section view, full doc on Back -- "Jump to
   // section" now loops entirely inside classicGateSelect's own select() loop (no more separate
@@ -1102,7 +1116,7 @@ await test("Sidebar overlay opens automatically as the review gate when ctx.ui.c
   fakeUiWrap.selectQueue.push("2026-01-16 · Sidebar Test"); // pick -- the only select() call this whole run makes
 
   const ctx = { cwd, ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(customCalls.length, 1, "ctx.ui.custom should be called exactly once, automatically -- no 'Sidebar view' menu pick needed first");
   assert.equal((customCalls[0] as { overlay?: boolean }).overlay, true);
@@ -1120,7 +1134,7 @@ await test("--idea skips the picker entirely and fires a grill turn as the first
   // for input, select()/input() would throw on an empty queue and fail the test.
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler(["--idea", "Add", "a", "dark", "mode", "toggle", "to", "settings"], ctx);
+  await handler("--idea Add a dark mode toggle to settings", ctx);
 
   assert.equal(fakePiWrap.calls.length, 1);
   assert.match(fakePiWrap.calls[0].prompt, /Grill this raw idea into a decided Readyset brainstorm file/);
@@ -1142,7 +1156,7 @@ await test("--lang before --idea opens grilling's discussion in that language fr
   const fakeUiWrap = makeFakeUi();
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler(["--lang", "Indonesian", "--idea", "Add", "a", "dark", "mode", "toggle"], ctx);
+  await handler("--lang Indonesian --idea Add a dark mode toggle", ctx);
 
   assert.equal(fakePiWrap.calls.length, 1);
   assert.match(fakePiWrap.calls[0].prompt, /Preferred language for this discussion: Indonesian/);
@@ -1164,7 +1178,7 @@ await test("no --lang flag: grillTurnPrompt keeps its reactive default (no 'Pref
   const fakeUiWrap = makeFakeUi();
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler(["--idea", "Add", "a", "dark", "mode", "toggle"], ctx);
+  await handler("--idea Add a dark mode toggle", ctx);
 
   assert.doesNotMatch(fakePiWrap.calls[0].prompt, /Preferred language for this discussion/);
   assert.match(fakePiWrap.calls[0].prompt, /Reply in whatever language the user is using/);
@@ -1181,7 +1195,7 @@ await test("no --idea flag, brainstorms exist: 'Type a new idea' is offered, pro
   fakeUiWrap.inputQueue.push("Let users export their data as CSV");
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakePiWrap.calls.length, 1);
   assert.match(fakePiWrap.calls[0].prompt, /Let users export their data as CSV/);
@@ -1198,7 +1212,7 @@ await test("'Type a new idea' selected but input cancelled -> notifies, does not
   fakeUiWrap.inputQueue.push(undefined);
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakePiWrap.calls.length, 0);
   assert.ok(fakeUiWrap.notifications.some((n) => /No idea given/.test(n.message)));
@@ -1213,7 +1227,7 @@ await test("'No full-lane brainstorms found' warning still fires with no brainst
   // No selectQueue pushed: the handler must return via the warning path, not reach select().
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(fakeUiWrap.notifications.some((n) => /No full-lane brainstorms found/.test(n.message) && /--idea/.test(n.message)));
   assert.equal(fakePiWrap.calls.length, 0);
@@ -1233,7 +1247,7 @@ await test("content-check gate: an unresolved brainstorm (empty body) blocks Exp
   fakePiWrap.queueEffect(async () => {}); // Propose turn: does nothing either -- we only care that it fired
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(
     fakeUiWrap.selectPrompts.some((p) => /section\(s\) look unresolved \(structural check\)/.test(p)),
@@ -1253,7 +1267,7 @@ await test("content-check gate: 'Go back' stops before Explore fires at all", as
   fakeUiWrap.selectQueue.push("Go back"); // content-check gate
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(fakePiWrap.calls.length, 0, "Explore must not fire once the user picks 'Go back'");
   assert.ok(fakeUiWrap.notifications.some((n) => /Stopped before Explore/.test(n.message)));
@@ -1277,7 +1291,7 @@ await test("content-check gate: a fully-filled-in brainstorm never triggers the 
   fakePiWrap.queueEffect(async () => {});
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(
     !fakeUiWrap.selectPrompts.some((p) => /section\(s\) look unresolved \(structural check\)/.test(p)),
@@ -1295,7 +1309,7 @@ await test("zero-rounds gate: grilling started this session but readyset_ask nev
 
   // Start grilling (sets grillRoundState.active = true, rounds = 0) -- but never call
   // readyset_ask, simulating a model that skipped asking and just wrote the file itself.
-  await handler(["--idea", "Some", "risky", "feature"], ctx);
+  await handler("--idea Some risky feature", ctx);
   assert.equal(fakePiWrap.calls.length, 1, "grilling should have fired its opening message");
 
   // Simulate the model writing a perfectly well-formed brainstorm anyway (content-check alone
@@ -1304,7 +1318,7 @@ await test("zero-rounds gate: grilling started this session but readyset_ask nev
 
   fakeUiWrap.selectQueue.push("2026-01-20 · Risky"); // pick it up
   fakeUiWrap.selectQueue.push("Go back"); // decline to proceed
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(
     fakeUiWrap.selectPrompts.some((p) => /readyset_ask was never called/.test(p)),
@@ -1320,7 +1334,7 @@ await test("zero-rounds gate: does not fire once readyset_ask has actually been 
   const fakeUiWrap = makeFakeUi();
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
 
-  await handler(["--idea", "Some", "risky", "feature"], ctx);
+  await handler("--idea Some risky feature", ctx);
 
   // The model actually asked at least one real round this time.
   await askExecute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, {
@@ -1334,7 +1348,7 @@ await test("zero-rounds gate: does not fire once readyset_ask has actually been 
   fakePiWrap.queueEffect(async () => {});
   fakePiWrap.queueEffect(async () => {});
 
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(
     !fakeUiWrap.selectPrompts.some((p) => /readyset_ask was never called/.test(p)),
@@ -1476,7 +1490,7 @@ await test("Approve & Compact calls ctx.compact() with internalGuidance + suppre
       compactCalls.push(opts);
     },
   };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.equal(compactCalls.length, 1, "ctx.compact should be called exactly once");
   const opts = compactCalls[0] as { internalGuidance?: string; suppressContinuation?: boolean };
@@ -1520,7 +1534,7 @@ await test("Approve & Compact degrades to a plain Approve & Execute when ctx.com
 
   // No `compact` on this ctx at all -- an older omp build, or one that never exposed it.
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler([], ctx);
+  await handler("", ctx);
 
   assert.ok(
     fakeUiWrap.notifications.some((n) => /Compact isn't available in this context/.test(n.message)),
@@ -1528,6 +1542,120 @@ await test("Approve & Compact degrades to a plain Approve & Execute when ctx.com
   );
   assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire, same as a plain Approve & Execute");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "no-compact-test"/);
+});
+
+await test("setModel returning false (no API key) counts as a failed pin and moves on to the fallback", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-22-nokey.md", {
+    title: "No Key",
+    status: "proposed",
+    created: "2026-01-22",
+    change_id: "no-key",
+  });
+  const dir = join(cwd, "readyset", "changes", "no-key");
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** b\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const setModelCalls: unknown[] = [];
+  const fakePi = {
+    sendUserMessage(_prompt: string, _opts: unknown) {},
+    registerCommand(_name: string, _def: unknown) {},
+    // Real omp: `runExtensionSetModel` resolves the API key first and returns false -- without
+    // throwing -- when there isn't one. This is the shape that used to be read as success.
+    async setModel(spec: unknown) {
+      setModelCalls.push(spec);
+      return !String(spec).includes("no-key-model");
+    },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
+  };
+
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    default: (pi: unknown) => void;
+  };
+  let captured: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  mod.default({ ...fakePi, registerCommand: (_n: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => (captured = def) } as any);
+  if (!captured) throw new Error("registerCommand was never called");
+
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-22 · No Key"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // leave as soon as we reach the gate
+
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: async () => {},
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+  };
+
+  await captured.handler("--model no-key-model --fallback-model usable-model", ctx);
+
+  assert.deepEqual(
+    setModelCalls,
+    ["resolved:no-key-model", "resolved:usable-model", "session-default-model"],
+    "a false return must be treated as a failed pin, so the fallback is tried (and the original restored)",
+  );
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Couldn't pin model "no-key-model"/.test(n.message) && n.level === "warning"),
+    "the false return should be reported as a failure, not silently swallowed",
+  );
+  assert.ok(fakeUiWrap.notifications.some((n) => /Pinned model "usable-model"/.test(n.message)), "the fallback should actually be pinned");
+  assert.ok(
+    !fakeUiWrap.notifications.some((n) => /Pinned model "no-key-model"/.test(n.message)),
+    "must not claim the failed model was pinned",
+  );
+});
+
+await test("a raw idea arrives as one string (omp's real command contract) and starts grilling instead of throwing", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+  // Before this was fixed, `args` was treated as a pre-split array, so this exact call threw
+  // "(args ?? []).slice(...).join is not a function" and grilling never started.
+  await handler("--idea let users export their data as CSV", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 1, "grilling should fire its opening turn");
+  assert.match(fakePiWrap.calls[0].prompt, /Grill this raw idea into a decided Readyset brainstorm file/);
+  assert.match(fakePiWrap.calls[0].prompt, /let users export their data as CSV/);
+});
+
+await test("parseReadysetArgs reads the raw argument string the way omp hands it over", async () => {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    parseReadysetArgs: (raw: string) => {
+      all: boolean;
+      fast: boolean;
+      lang?: string;
+      model?: string;
+      fallbackModel?: string;
+      idea?: string;
+    };
+  };
+  const parse = mod.parseReadysetArgs;
+
+  assert.deepEqual(parse(""), { all: false, fast: false });
+  assert.deepEqual(parse("--all --fast"), { all: true, fast: true });
+
+  const lang = parse("--lang Indonesian --idea a b c");
+  assert.equal(lang.lang, "Indonesian", "the whole language must be read, not the character after '--lang'");
+  assert.equal(lang.idea, "a b c", "--idea swallows every remaining token, joined back together");
+
+  const models = parse("--model m1 --fallback-model m2");
+  assert.equal(models.model, "m1");
+  assert.equal(models.fallbackModel, "m2");
+
+  assert.equal(parse('--model "a b"').model, "a b", "a quoted value stays one token");
+  assert.equal(parse("--model").model, undefined, "a flag with no value is undefined, not a crash");
+  assert.equal(parse("just some words").idea, undefined, "plain words are not mistaken for an idea");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -17,8 +17,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: "npm"
 
       - run: npm ci
+
+      # Separate from `npm test` on purpose: the test suite needs no install at all (plain
+      # `node --experimental-strip-types` over test/*.mts), while this needs the devDependencies
+      # -- including @oh-my-pi/pi-coding-agent, whose real types are the contract src/extensions/
+      # is written against. Keeping them separate preserves the zero-install test suite.
+      - run: npm run typecheck
+
       - run: npm test
 
       # Cheap regression check for package.json's "files" allowlist -- catches a new src/

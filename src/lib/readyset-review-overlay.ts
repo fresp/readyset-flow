@@ -28,12 +28,15 @@
  * but going through them pulls in more of that package's runtime surface than this needs, and
  * `pi-intercom`'s simpler, already-proven approach is enough for a read-only section browser).
  *
- * Import surface: `Component`/`Theme`/`KeybindingsManager` are type-only (erased at
+ * Import surface: `Component`/`KeybindingsManager` are type-only (erased at
  * `--experimental-strip-types`, same as every other `@oh-my-pi/*` import in this package) — this
  * file has NO real runtime dependency on `@oh-my-pi/pi-tui` being installed or resolvable from
- * an extension's module graph. That was a genuine open question (`pi-intercom` imports
- * `truncateToWidth`/`visibleWidth` from it as real runtime code, which would have been a
- * reasonable thing to do too — real precedent, not a guess), but it's untested from here (no
+ * an extension's module graph. (The theme shape is declared locally as `OverlayTheme` rather than
+ * imported — `@oh-my-pi/pi-tui` exports no `Theme` at all; the real one lives in the host's own
+ * `modes/theme/theme.js` and only reaches this file through the `custom()` factory's arguments.)
+ * That was a genuine open question (`pi-intercom` imports `truncateToWidth`/`visibleWidth` from it
+ * as real runtime code, which would have been a reasonable thing to do too — real precedent, not a
+ * guess), but it's untested from here (no
  * live omp to actually run it in yet), so this file plays it safe and implements its own tiny
  * width helpers below instead, matching this package's existing zero-runtime-dependency stance
  * (see the YAML parser in `readyset-omp-config.ts` for the same trade-off). They're ASCII-width
@@ -56,7 +59,22 @@
  * (`OverlayOptions.width` accepts a percentage string) to actually use the terminal's width.
  */
 
-import type { Component, KeybindingsManager, Theme } from "@oh-my-pi/pi-tui";
+import type { Component, KeybindingsManager } from "@oh-my-pi/pi-tui";
+
+/**
+ * Minimal structural shape of the theme object this file actually calls.
+ *
+ * `@oh-my-pi/pi-tui` does not export a `Theme` — the real one lives in the host's own
+ * `modes/theme/theme.js` and is only ever reached through the `custom()` factory's arguments —
+ * so importing it from there was a type error that no typecheck had ever caught (this file's
+ * imports are type-only and erased at strip-time, so it never broke at runtime either).
+ * Declaring the two methods this file calls keeps the type surface honest and keeps this file
+ * free of any dependency on the host package resolving at all.
+ */
+export interface OverlayTheme {
+	fg: (name: string, text: string) => string;
+	bold: (text: string) => string;
+}
 
 /** ASCII-width string length. Not Unicode-grapheme-aware — see the module doc comment. */
 function asciiWidth(text: string): number {
@@ -262,7 +280,7 @@ function renderSideCell(
 }
 
 export class ReviewSidebarOverlay implements Component {
-	#theme: Theme;
+	#theme: OverlayTheme;
 	#keybindings: KeybindingsManager;
 	#title: string;
 	#sections: OverlaySection[];
@@ -274,7 +292,7 @@ export class ReviewSidebarOverlay implements Component {
 	#actionIndex = 0;
 
 	constructor(
-		theme: Theme,
+		theme: OverlayTheme,
 		keybindings: KeybindingsManager,
 		title: string,
 		sections: OverlaySection[],
