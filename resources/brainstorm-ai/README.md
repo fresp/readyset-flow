@@ -1,10 +1,22 @@
 # brainstorm-ai
 
-Authored by Freza (this package's maintainer), vendored here verbatim (2026-09-19) —
-`SKILL.md` in this folder is byte-identical to the original, deliberately: it's meant to be
+Authored by Freza (this package's maintainer), vendored here (originally verbatim, 2026-09-19,
+then given a cosmetic `language` frontmatter field on 2026-09-19 — see below). It's meant to be
 copied out and actually used, so its frontmatter has to stay the very first thing in the file
 for a Claude Skill parser to accept it. Any provenance/usage notes belong here, in this sibling
 file, not inside `SKILL.md` itself.
+
+If you also have this skill uploaded as an account-level Skill at claude.ai (see "How to use it"
+below), that copy won't pick up this change on its own — re-upload this `SKILL.md` there to get
+the `language` field.
+
+### `language` frontmatter field
+
+The skill's session Q&A (questions, options, trade-off discussion, confirmations) was originally
+hardcoded to Bahasa Indonesia. It now reads a `language: Indonesian` field in `SKILL.md`'s own
+frontmatter instead — change that one line to switch the session's language. The saved
+`.ai/brainstorms/*.md` file itself is unaffected either way: it's always written in English, so
+any downstream harness can pick it up without translation.
 
 ## How to use it
 
@@ -40,7 +52,7 @@ sequenceDiagram
     Note over User,Cowork: per brainstorm — entirely outside omp
     User->>Cowork: /brainstorm-ai <topic>
     Cowork->>Repo: read-only research<br/>(Read/Grep/Glob, git log/diff/status, openspec list/show)
-    loop until design settles (Bahasa Indonesia, one question per turn)
+    loop until design settles (configured session language, one question per turn)
         Cowork->>User: question + ≥2 options
         User->>Cowork: answer
     end

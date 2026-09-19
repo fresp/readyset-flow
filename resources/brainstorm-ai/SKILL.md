@@ -1,5 +1,6 @@
 ---
 name: brainstorm-ai
+language: Indonesian
 description: Read-only interactive brainstorming session (idea/option exploration, NOT detailed planning) whose output is saved as a markdown file in .ai/brainstorms/ at the project root. This file is meant to be picked up by another harness (e.g. omp) that will handle implementation planning or an OpenSpec proposal. Invoke manually via /brainstorm-ai — do not auto-trigger.
 argument-hint: [topic/problem to brainstorm]
 disable-model-invocation: true
@@ -21,8 +22,8 @@ The goal of this session is divergent thinking — exploring the solution space 
    - Explore the trade-offs of each option together with the user, not just conclude on your own.
    - Before writing the file, confirm with the user: is this enough to write, or do they want to keep exploring.
 4. **Rough/unfinished is fine.** If by the end of the session some questions are still unanswered or options haven't converged, that's normal — write it as-is under "Open questions," don't force a conclusion just to look tidy.
-5. **Session language:** every question, answer, and output shown to the user during the Q&A — options offered, trade-off discussion, confirmations — is in Bahasa Indonesia (technical terms may stay in English), so the user stays comfortable and familiar throughout the session. **The saved brainstorm file, however, is written entirely in English** — headers, prose, everything — so it reads as a standard, portable doc that any downstream AI harness (not just Indonesian-fluent ones) can pick up without translation. Treat this as a language switch at the very last step: think and converse in Indonesian the whole session, then translate/write the final `.ai/brainstorms/*.md` content in English only when actually saving it.
-6. **Close with a decision, not just a lean.** Before writing the file, don't let the session end on a soft "leaning toward X." Explicitly ask the user (in Indonesian):
+5. **Session language:** every question, answer, and output shown to the user during the Q&A — options offered, trade-off discussion, confirmations — is in the language set by this skill's `language` frontmatter field above (technical terms may stay in English), so the user stays comfortable and familiar throughout the session. Change that one field to switch languages; nothing else in this skill needs editing. **The saved brainstorm file, however, is written entirely in English** — headers, prose, everything — so it reads as a standard, portable doc that any downstream AI harness (not just ones fluent in the configured language) can pick up without translation. Treat this as a language switch at the very last step: think and converse in the configured language the whole session, then translate/write the final `.ai/brainstorms/*.md` content in English only when actually saving it.
+6. **Close with a decision, not just a lean.** Before writing the file, don't let the session end on a soft "leaning toward X." Explicitly ask the user (in the configured session language):
    - Which option is chosen — or should the planning harness decide based on the trade-offs listed?
    - Seam: which module/boundary will this change touch or be tested at — ideally just one? Prefer an existing seam over inventing a new one; if a new seam is genuinely needed, confirm that with the user too.
    - What's in-scope vs out-of-scope for this brainstorm?
@@ -130,11 +131,11 @@ Next Step wording:
 
 ## Execution steps
 1. Read the topic from `$ARGUMENTS`, and scan back through this chat session for anything already discussed that's relevant — problem context, constraints, options, technical findings, any leaning already expressed. Merge that into your working understanding of the topic before doing anything else. If needed, also do light read-only repo research for real context (not to prepare a plan). If an `openspec/` directory exists, include `openspec list` in that research per rule #9.
-2. Start the interactive brainstorming discussion with the user per the ground rules above — all questions, options, and back-and-forth in Bahasa Indonesia. Skip questions already answered by earlier conversation context; only ask about what's still open. This may take several conversation turns — don't rush to close it.
+2. Start the interactive brainstorming discussion with the user per the ground rules above — all questions, options, and back-and-forth in the language set by the `language` frontmatter field above. Skip questions already answered by earlier conversation context; only ask about what's still open. This may take several conversation turns — don't rush to close it.
 3. Before writing the file, run the closing questions from rule #6 — decision (or explicit deferral), seam, scope, acceptance criteria — and ask the per-task git flow from rule #7 (commit only vs commit + merge request). Auto-infer the branch type per rule #7 and the lane per rule #8 yourself rather than asking. Don't skip straight to writing just because the user said the exploration part is enough.
 4. Once decision/seam/scope/acceptance/git workflow are captured (or explicitly deferred):
    - Derive a slug from the title (kebab-case, short) — this same slug goes into both the filename and the `slug` frontmatter field.
    - Resolve `lane` per rule #8, and fill Spec Impact per rule #9.
    - Run `mkdir -p .ai/brainstorms`.
    - Write the result to `.ai/brainstorms/<date>-<slug>.md`, in full English, following the structure above, with `status: open` and an empty `change_id`.
-5. Report back to the user (in Indonesian, matching the session): the path of the file created, a 2-3 sentence summary of the brainstorm's content, the resolved lane and what that means for the next step (`full` → proposal first, `fast` → straight to planning), and a reminder that this file is ready to be picked up by another harness — not by this session.
+5. Report back to the user (in the configured session language, matching the session): the path of the file created, a 2-3 sentence summary of the brainstorm's content, the resolved lane and what that means for the next step (`full` → proposal first, `fast` → straight to planning), and a reminder that this file is ready to be picked up by another harness — not by this session.
