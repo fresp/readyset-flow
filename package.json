@@ -1,6 +1,6 @@
 {
   "name": "readyset-flow",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Readyset — a standalone omp extension, invoked as /readyset, that fuses /plan's grounding discipline, a structured grill/propose/review/apply workflow, and mattpocock/skills prompting hygiene into its own independent command, with no runtime dependency on any of the three.",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/readyset-brainstorm.test.mts && node --experimental-strip-types test/readyset-omp-config.test.mts && node --experimental-strip-types test/readyset-review-overlay.test.mts && node --experimental-strip-types test/readyset-review.test.mts && node --experimental-strip-types test/readyset-evidence.test.mts && node --experimental-strip-types test/readyset-cli-validate.test.mts && node --experimental-strip-types test/readyset-install-link.test.mts && node --experimental-strip-types test/readyset-configure.test.mts",
-    "prepublishOnly": "npm test"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "keywords": [
     "omp",
@@ -38,5 +39,10 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.2.6",
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3"
   }
 }

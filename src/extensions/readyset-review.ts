@@ -24,7 +24,12 @@ import {
 	validateChange,
 } from "../lib/readyset-spec.ts";
 import { readFallbackChain, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
-import { ReviewSidebarOverlay, type OverlaySection, type ReviewOverlayResult } from "../lib/readyset-review-overlay.ts";
+import {
+	ReviewSidebarOverlay,
+	type OverlaySection,
+	type OverlayTheme,
+	type ReviewOverlayResult,
+} from "../lib/readyset-review-overlay.ts";
 import {
 	checkTaskEvidence,
 	EVIDENCE_MAX_OUTPUT_BYTES,
@@ -36,14 +41,11 @@ import {
 } from "../lib/readyset-evidence.ts";
 
 /** Minimal structural shape this file actually calls — deliberately not importing the real
- *  `Theme`/`KeybindingsManager` types from `@oh-my-pi/pi-tui` even as types, so this file has
- *  zero dependency (type or runtime) on that package resolving at all. `readyset-review-overlay.ts`
- *  takes the real types as type-only imports (erased at strip-time); this is the boundary where
- *  the wider extension hands them through without needing to know their full shape. */
-interface OverlayTheme {
-	fg: (name: string, text: string) => string;
-	bold: (text: string) => string;
-}
+ *  `KeybindingsManager` type from `@oh-my-pi/pi-tui` even as a type, so this file has zero
+ *  dependency (type or runtime) on that package resolving at all. This is the boundary where the
+ *  wider extension hands those objects through without needing to know their full shape;
+ *  `OverlayTheme` itself is imported from readyset-review-overlay.ts, which owns the one
+ *  definition of what the sidebar calls. */
 interface OverlayKeybindings {
 	matches: (data: string, name: string) => boolean;
 }
@@ -411,7 +413,11 @@ interface ReviewCtx {
 		select: (prompt: string, options: ExtensionUISelectOption[], opts?: { helpText?: string }) => Promise<string | undefined>;
 		input?: (prompt: string) => Promise<string | undefined>;
 		setEditorText: (text: string) => void;
-		setWidget?: (lines: string[]) => void;
+		// Real signature is `setWidget(key: string, content: ExtensionWidgetContent, options?)` —
+		// the key is what a later call with the same key replaces. This used to be declared (and
+		// called) as `(lines: string[])`, which the host received as key = the array and
+		// content = undefined, so the summary panel never actually rendered.
+		setWidget?: (key: string, lines: string[]) => void;
 		notify: (message: string, level?: "info" | "warning" | "error") => void;
 		// Interactive-mode-only (docs/extensions.md): renders a real custom TUI component with
 		// keyboard focus — the same mechanism native /plan's own review sidebar is built from.
@@ -505,7 +511,8 @@ export async function withPinnedModel<T>(
 	// (bind on undefined would throw, so the optional chain still yields `undefined` when
 	// `pi.setModel` isn't there) while fixing every call site without touching them.
 	const setModel = (pi as unknown as { setModel?: (spec: unknown) => unknown }).setModel?.bind(pi);
-	if (!setModel || !ctx.models?.current) {
+	const models = ctx.models;
+	if (!setModel || !models?.current) {
 		ctx.ui.notify(
 			`Model "${modelSpec}" (from ${source}) was given, but this omp build doesn't expose pi.setModel/ctx.models.current — ` +
 				"running with whatever model this session already has.",
@@ -514,13 +521,34 @@ export async function withPinnedModel<T>(
 		return fn();
 	}
 
-	const original = ctx.models.current();
+	/**
+	 * Resolves a spec and applies it, throwing when it did NOT actually take effect.
+	 *
+	 * `pi.setModel` is `(model: Model) => Promise<boolean>`, and its real implementation returns
+	 * `false` — without throwing — when there's no API key for that model (`runExtensionSetModel`
+	 * in omp source: `const key = await session.modelRegistry.getApiKey(model); if (!key) return
+	 * false;`). Treating only rejections as failure, as this used to, made a failed pin look
+	 * successful: it reported "Pinned model ..." for a session model that never changed, and the
+	 * configured fallback chain was never tried. `ctx.models.resolve` returning `undefined` for an
+	 * unmatched spec is the same class of failure and is handled the same way.
+	 */
+	const applyModel = async (spec: string): Promise<void> => {
+		const resolved = models.resolve ? models.resolve(spec) : spec;
+		if (resolved === undefined || resolved === null) {
+			throw new Error(`"${spec}" didn't resolve to any available model`);
+		}
+		const applied = await setModel(resolved);
+		if (applied === false) {
+			throw new Error(`"${spec}" resolved, but couldn't be applied (usually: no API key available for it)`);
+		}
+	};
+
+	const original = models.current();
 	let activeSpec = modelSpec;
 	let activeSource = source;
 
 	try {
-		const resolved = ctx.models.resolve ? ctx.models.resolve(modelSpec) : modelSpec;
-		await setModel(resolved);
+		await applyModel(modelSpec);
 	} catch (err) {
 		const reason = err instanceof Error ? err.message : String(err);
 		if (fallbackChain.length === 0) {
@@ -541,8 +569,7 @@ export async function withPinnedModel<T>(
 				"warning",
 			);
 			try {
-				const resolvedFallback = ctx.models.resolve ? ctx.models.resolve(fallbackSpec) : fallbackSpec;
-				await setModel(resolvedFallback);
+				await applyModel(fallbackSpec);
 				activeSpec = fallbackSpec;
 				activeSource = fallbackSource;
 				pinned = true;
@@ -582,13 +609,20 @@ export async function withPinnedModel<T>(
  * Fires a triggered agent turn and waits for it to actually finish — not just for
  * `waitForIdle()` to resolve.
  *
- * Confirmed live (2026-09-18, real omp run): `pi.sendUserMessage(prompt, { deliverAs:
- * "nextTurn", triggerTurn: true })` schedules the turn, it does not start it synchronously.
- * Calling `ctx.waitForIdle()` immediately after can race it — if the session still reads as
- * idle in that instant (the turn hasn't flipped it to "running" yet), `waitForIdle()`
- * resolves immediately, before the turn has produced anything. That is exactly what
- * happened: the "doesn't look finished" warning fired, and only afterward did the turn's
- * own prompt/output actually appear.
+ * `pi.sendUserMessage(prompt)` with no `deliverAs` is the wanted behavior: the host starts a
+ * turn when the session is idle, and queues as a steer while streaming. It is also the only
+ * shape the user-message API accepts — `SendUserMessageOptions.deliverAs` is `"steer" |
+ * "followUp" | "aside"`. An earlier version of this file passed `{ deliverAs: "nextTurn",
+ * triggerTurn: true }`, which belongs to `pi.sendMessage` and is silently ignored here (the
+ * turn still started, by falling through to the host's plain prompt path, so the net effect
+ * looked right for the wrong reason).
+ *
+ * The send is still fire-and-forget from the extension's side — the host does not await it —
+ * so the turn is not guaranteed to have flipped the session out of idle by the time this
+ * returns. Calling `ctx.waitForIdle()` immediately can race it: if the session still reads as
+ * idle in that instant, `waitForIdle()` resolves at once, before the turn has produced
+ * anything. That is exactly what happened live (2026-09-18): the "doesn't look finished"
+ * warning fired, and only afterward did the turn's own prompt/output actually appear.
  *
  * Fix: poll briefly for the session to leave idle (or show a pending message) before
  * calling waitForIdle() for real. If `isIdle`/`hasPendingMessages` aren't available on this
@@ -596,7 +630,7 @@ export async function withPinnedModel<T>(
  * forever on an unknown API.
  */
 async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string): Promise<void> {
-	pi.sendUserMessage(prompt, { deliverAs: "nextTurn", triggerTurn: true });
+	pi.sendUserMessage(prompt);
 
 	if (ctx.isIdle || ctx.hasPendingMessages) {
 		const deadline = Date.now() + 5000;
@@ -628,7 +662,7 @@ function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, prefe
 			"from there.",
 		"info",
 	);
-	pi.sendUserMessage(grillTurnPrompt(ideaText, today, preferredLanguage), { deliverAs: "nextTurn", triggerTurn: true });
+	pi.sendUserMessage(grillTurnPrompt(ideaText, today, preferredLanguage));
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -965,7 +999,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
 	];
-	ctx.ui.setWidget?.(lines);
+	ctx.ui.setWidget?.("readyset", lines);
 }
 
 /**
@@ -1169,7 +1203,7 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 		);
 
 		if (reviewContent) {
-			ctx.ui.setWidget?.([`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
+			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
 		}
 
 		const archiveChoice = await ctx.ui.select(
@@ -1206,6 +1240,23 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 		}
 		return;
 	}
+}
+
+/**
+ * Shape of `readyset_ask`'s params. Declared explicitly and cast to inside `execute()` because
+ * omp's `registerTool` generic infers `Static<TSchema>` as `unknown` for a `pi.zod` schema — a
+ * Zod object doesn't map through TypeBox's `TSchema`, so inference falls back to the constraint
+ * default even though the runtime value is exactly this shape.
+ */
+interface ReadysetAskParams {
+	questions: {
+		id: string;
+		question: string;
+		header?: string;
+		options: { label: string; description?: string }[];
+		recommendedIndex?: number;
+		multi?: boolean;
+	}[];
 }
 
 /**
@@ -1257,6 +1308,7 @@ function registerAskTool(pi: ExtensionAPI): void {
 		}),
 		approval: "read",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { questions: askedQuestions } = params as ReadysetAskParams;
 			if (grillRoundState.rounds >= GRILL_ROUND_CAP) {
 				return {
 					content: [
@@ -1287,7 +1339,7 @@ function registerAskTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			const questions: ExtensionAskDialogQuestion[] = params.questions.map((q) => ({
+			const questions: ExtensionAskDialogQuestion[] = askedQuestions.map((q) => ({
 				id: q.id,
 				question: q.question,
 				header: q.header,
@@ -1364,6 +1416,13 @@ function registerAskTool(pi: ExtensionAPI): void {
  */
 let activeVerifyChangeId: string | undefined;
 
+/** Shape of `readyset_verify`'s params — see `ReadysetAskParams` for why this is declared and
+ *  cast to rather than inferred from the `pi.zod` schema passed to `registerTool`. */
+interface ReadysetVerifyParams {
+	taskId: string;
+	command: string;
+}
+
 /**
  * Registers `readyset_verify` — a runtime evidence *collector*, not a correctness judge.
  *
@@ -1430,6 +1489,7 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 		}),
 		approval: "exec",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const { taskId, command } = params as ReadysetVerifyParams;
 			const changeId = activeVerifyChangeId;
 			if (!changeId) {
 				return {
@@ -1447,13 +1507,13 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 
 			const cwd = (ctx as unknown as ReviewCtx).cwd;
 			const startedAt = new Date().toISOString();
-			const result = await runCommand(params.command, cwd, EVIDENCE_TIMEOUT_MS);
+			const result = await runCommand(command, cwd, EVIDENCE_TIMEOUT_MS);
 			const stdoutCap = truncateForCapture(result.stdout, EVIDENCE_MAX_OUTPUT_BYTES);
 			const stderrCap = truncateForCapture(result.stderr, EVIDENCE_MAX_OUTPUT_BYTES);
 
 			const record = await persistEvidence(cwd, changeId, {
-				taskId: params.taskId,
-				command: params.command,
+				taskId,
+				command,
 				cwd,
 				startedAt,
 				durationMs: result.durationMs,
@@ -1477,7 +1537,7 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 					{
 						type: "text",
 						text:
-							`Evidence ${record.id} recorded for task ${params.taskId}: \`${params.command}\` ${outcome} in ` +
+							`Evidence ${record.id} recorded for task ${taskId}: \`${command}\` ${outcome} in ` +
 							`${result.durationMs}ms. This is a runtime-captured EXECUTION RESULT ONLY -- it does not by itself ` +
 							"mean the task is done or the requirement is satisfied. You still need to update tasks.md and " +
 							`write your own _Verified: note yourself (mentioning ${record.id} there is a good idea, but this ` +
@@ -1487,6 +1547,73 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 			};
 		},
 	});
+}
+
+export interface ReadysetArgs {
+	all: boolean;
+	fast: boolean;
+	lang?: string;
+	model?: string;
+	fallbackModel?: string;
+	idea?: string;
+}
+
+/**
+ * Parses `/readyset`'s argument string into the flags it supports.
+ *
+ * omp passes a registered command's arguments as the RAW remainder of the line after the command
+ * name — `handler: (args: string, ctx)`, confirmed in real omp source (`RegisteredCommand`, and
+ * `#tryExecuteExtensionCommand`'s `text.slice(spaceIndex + 1)`) and against live behavior: an
+ * earlier version of this file treated `args` as a pre-split array, which made `--idea` throw
+ * "`.join` is not a function" on every invocation, and silently read `--lang`/`--model`/
+ * `--fallback-model` as the single character `"-"` (string indexing instead of array indexing).
+ * Only `--all`/`--fast` ever worked, by accident, because `String.includes` happens to match
+ * substrings. So this tokenizes the raw string itself.
+ *
+ * Quoting is honored the way a shell would for a single shell-style token (`--model "a b"`), and
+ * `--idea` consumes every remaining token joined back with single spaces, so a raw idea needs no
+ * quoting and can't be followed by other flags (which is why `--lang` must come before it).
+ */
+export function parseReadysetArgs(raw: string): ReadysetArgs {
+	const tokens: string[] = [];
+	let current = "";
+	let quote: '"' | "'" | undefined;
+	for (const ch of raw ?? "") {
+		if (quote !== undefined) {
+			if (ch === quote) quote = undefined;
+			else current += ch;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+			if (current !== "") {
+				tokens.push(current);
+				current = "";
+			}
+			continue;
+		}
+		current += ch;
+	}
+	if (current !== "") tokens.push(current);
+
+	const parsed: ReadysetArgs = { all: false, fast: false };
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token === "--all") parsed.all = true;
+		else if (token === "--fast") parsed.fast = true;
+		else if (token === "--lang") parsed.lang = tokens[i + 1];
+		else if (token === "--model") parsed.model = tokens[i + 1];
+		else if (token === "--fallback-model") parsed.fallbackModel = tokens[i + 1];
+		else if (token === "--idea") {
+			const rest = tokens.slice(i + 1).join(" ").trim();
+			if (rest !== "") parsed.idea = rest;
+			break;
+		}
+	}
+	return parsed;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1499,8 +1626,10 @@ export default function (pi: ExtensionAPI) {
 			"grilling's discussion in that language from round 1 (must come before --idea), --model <spec> to pin a model " +
 			"for this run's turns, --fallback-model <spec> if the pin fails to apply)",
 		handler: async (args, ctx) => {
-			const showAll = args?.includes("--all");
-			const includeFast = args?.includes("--fast");
+			// `args` is the raw string omp hands a registered command (see parseReadysetArgs).
+			const parsedArgs = parseReadysetArgs(args);
+			const showAll = parsedArgs.all;
+			const includeFast = parsedArgs.fast;
 
 			// Standalone: bootstrap readyset/{changes,specs} ourselves if missing — there is no
 			// separate init step or CLI to run first.
@@ -1515,16 +1644,14 @@ export default function (pi: ExtensionAPI) {
 			// before --idea on the command line: --idea joins everything after it into the idea
 			// text, so a --lang placed after --idea would be swallowed into that text instead of
 			// parsed as a flag.
-			const langFlagIdx = args?.indexOf("--lang") ?? -1;
-			const langFromFlag = langFlagIdx >= 0 ? args?.[langFlagIdx + 1] : undefined;
+			const langFromFlag = parsedArgs.lang;
 			const resolvedConfigLanguage = langFromFlag ? undefined : await readPreferredLanguage();
 			const preferredLanguage = langFromFlag ?? resolvedConfigLanguage?.language;
 
 			// --idea skips the picker entirely: everything after it is joined back into the raw idea
 			// text (so it need not be quoted as a single arg), and grilling starts immediately. Must
 			// come last among flags on the command line.
-			const ideaFlagIdx = args?.indexOf("--idea") ?? -1;
-			const ideaFromFlag = ideaFlagIdx >= 0 ? (args ?? []).slice(ideaFlagIdx + 1).join(" ").trim() : "";
+			const ideaFromFlag = parsedArgs.idea ?? "";
 			if (ideaFromFlag) {
 				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, preferredLanguage);
 				return;
@@ -1607,14 +1734,12 @@ export default function (pi: ExtensionAPI) {
 			// works too, as a one-element chain) is tried if pinning the resolved model above fails
 			// outright (a bad/retired spec) — see withPinnedModel's doc comment for why this is
 			// narrower than, and doesn't replace, omp's own retry.fallbackChains.
-			const modelFlagIdx = args?.indexOf("--model") ?? -1;
-			const modelFromFlag = modelFlagIdx >= 0 ? args?.[modelFlagIdx + 1] : undefined;
+			const modelFromFlag = parsedArgs.model;
 			const resolvedConfigModel = modelFromFlag ? undefined : await readPinnedModel();
 			const pinnedModel = modelFromFlag ?? resolvedConfigModel?.model;
 			const pinnedModelSource = modelFromFlag ? "--model flag" : (resolvedConfigModel?.source ?? "");
 
-			const fallbackFlagIdx = args?.indexOf("--fallback-model") ?? -1;
-			const fallbackFromFlag = fallbackFlagIdx >= 0 ? args?.[fallbackFlagIdx + 1] : undefined;
+			const fallbackFromFlag = parsedArgs.fallbackModel;
 			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
 			const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
 			const fallbackChainSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");

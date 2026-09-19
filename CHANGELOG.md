@@ -6,6 +6,46 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.11.1
+
+Host-integration fixes — all of these were invisible to the test suite as it stood, because the
+suite stubbed the same wrong API shapes the code called (see the last bullet).
+
+- **`--idea`, `--lang`, `--model` and `--fallback-model` were broken against the real command
+  API.** omp hands a registered command its arguments as the raw remainder *string*
+  (`handler: (args: string, ctx)` — `RegisteredCommand`, and `#tryExecuteExtensionCommand`'s
+  `text.slice(spaceIndex + 1)`), not a pre-split array. Treating it as one made `--idea` throw
+  `(args ?? []).slice(...).join is not a function` on every invocation, so grilling could never
+  start at all; and made `--lang`/`--model`/`--fallback-model` silently read the single character
+  `"-"` (string indexing instead of array indexing) instead of the value the user typed. Only
+  `--all`/`--fast` ever worked, by accident, because `String.includes` matches substrings. Args are
+  now tokenized by an exported `parseReadysetArgs` (quote-aware; `--idea` takes the rest).
+- **A failed model pin looked successful, so the fallback chain never ran.** `pi.setModel` is
+  `(model) => Promise<boolean>` and its real implementation returns `false` — without throwing —
+  when there is no API key for the model (`runExtensionSetModel`: `if (!key) return false;`). Only
+  rejections were treated as failure, so Readyset could report `Pinned model "..."` for a session
+  model that never changed. A `false` return and an unresolved spec now both count as a failed pin
+  and fall through to `readyset.model.fallbackChains`.
+- **`sendUserMessage` was passed options that don't belong to it.** `{ deliverAs: "nextTurn",
+  triggerTurn: true }` is `pi.sendMessage`'s shape — `SendUserMessageOptions.deliverAs` is `"steer"
+  | "followUp" | "aside"`. It was ignored and the call fell through to the host's plain prompt
+  path, so the turn still started (the documented rationale was wrong, the outcome happened to be
+  right). The call now omits options, which is exactly what starts a turn when the session is idle.
+- **The review panel's `setWidget` call used the wrong shape.** The real signature is
+  `setWidget(key: string, content, options?)`; the extension called `setWidget(lines)`, so the host
+  received key = the lines array and content = `undefined` and the summary panel never rendered.
+- **`Theme` was imported as a type from `@oh-my-pi/pi-tui`, which doesn't export one.** Harmless at
+  runtime (type-only, erased at strip-time), but it was a standing type error; the overlay now
+  declares the minimal theme shape it actually calls.
+- **`npm run typecheck` added, and wired into CI and `prepublishOnly`.** `src/` is now typechecked
+  against `@oh-my-pi/pi-coding-agent`'s real types (added as a devDependency — the contract
+  `src/extensions/` is written against, and the one area the suite could not reach). The default
+  `npm test` suite still needs no install at all, which is why the two steps stay separate. The
+  suite's own fakes were updated to the real signatures, and it grew tests pinning down the `args`
+  contract, a `false` from `setModel`, and the `setWidget` key.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.11.0...0.11.1
+
 ## 0.11.0
 
 - **New: `readyset-flow update` and `readyset-flow uninstall`.** `update` is an alias for
