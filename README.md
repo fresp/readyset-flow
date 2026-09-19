@@ -130,12 +130,21 @@ a baseline part of the omp setup it ran in. The prompt now says so explicitly: a
 search (or the repo) could actually answer doesn't belong in a round as an open question or a
 silent assumption — open questions are reserved for what only the user can decide or knows.
 
-Grilling itself is an ordinary back-and-forth in the chat, not something
-`/readyset`'s own code can wait on synchronously — it fires the opening question and
-returns; you answer normally, round by round, until the model writes the brainstorm file and
-tells you to run `/readyset` again to pick it up (Explore, then Propose). If you'd rather
-hand-write or dictate the brainstorm to a separate tool first, that path still works exactly as
-before.
+Each round of questions is a real structured picker, not raw "❓ Q1 ..." chat text you have to
+type a reply to — the model calls a `readyset_ask` tool that opens omp's own native multi-question
+dialog (`ctx.ui.askDialog`), with your recommended answer highlighted per question and room to
+type your own answer or say "let's discuss this instead" if you'd rather talk it through in plain
+chat. Because that dialog blocks for real input, the model keeps calling it round after round
+inside one continuous turn — you don't wait for it to "end its turn" between rounds the way an
+ordinary back-and-forth would. The round cap (4 rounds by default) is enforced in code now, not
+just a prompt convention: once hit, the tool stops opening the dialog and the model checks in via
+plain text instead — summarizes what's decided, names what's open, asks whether to keep going.
+This structured picker is Interactive-mode only (the same surface native `/plan`'s own dialogs use);
+in RPC/ACP/print modes, or any omp build without it, grilling falls back to the previous plain-chat
+back-and-forth automatically, same rules, same content. Either way it ends once the model writes the
+brainstorm file and tells you to run `/readyset` again to pick it up (Explore, then Propose). If
+you'd rather hand-write or dictate the brainstorm to a separate tool first, that path still works
+exactly as before.
 
 By default, grilling's own reactive rule kicks in: reply in whatever language you use, once you
 use it — so round 1 itself still arrives in English, since there's no signal yet of what
@@ -250,16 +259,19 @@ It picks a brainstorm, and depending on its status:
 - `archiveChange` merges delta specs into the main spec **append-only** — never a real
   ADDED/MODIFIED/REMOVED diff-merge. Safe (nothing is deleted or silently rewritten), but cruder
   than a proper schema-aware archiver; review the merged spec afterward.
-- Grilling's round cap is **prompt-level only** — the prompt tells the model to check in after 4
-  rounds rather than interrogate forever, but nothing in the extension's own code enforces that
-  the way `TurnBudget` enforces the 10-turn ceiling on Explore/Propose/Refine/Apply/Code-review.
-  It can't be: those are each one `spendTurn` call the extension fires and synchronously waits
-  on, while grilling's rounds are ordinary chat turns the user answers directly — the extension
-  only ever sees the opening message. What *is* enforced in code is `validateBrainstormContent`
-  (readyset-brainstorm.ts): before Explore spends a single turn on whatever grilling (or anyone
-  else) wrote, it checks Decision/Seam/Scope/Acceptance Criteria actually got filled in, not left
-  as the brainstorm-ai skill's own template placeholders — "Continue anyway" is always available
-  if the gaps are acceptable, but it's a deliberate extra step, not silently skipped.
+- Grilling's round cap (4 by default) **is enforced in code**, via the `readyset_ask` tool's own
+  `execute()` — once the cap is hit it simply refuses to open the dialog again and tells the model
+  to check in via plain text instead, a real ceiling rather than a prompt-followed convention.
+  This only covers rounds asked through `readyset_ask`, though: in the plain-chat fallback (no
+  `ctx.ui.askDialog` on this omp build/mode), rounds go back to being ordinary chat turns the
+  extension never sees, so the cap there is prompt-level only again, same as grilling always was
+  before this tool existed — there's no `TurnBudget`-style code ceiling possible on a chat turn
+  the extension isn't driving. What's always enforced in code, either way, is
+  `validateBrainstormContent` (readyset-brainstorm.ts): before Explore spends a single turn on
+  whatever grilling (or anyone else) wrote, it checks Decision/Seam/Scope/Acceptance Criteria
+  actually got filled in, not left as the brainstorm-ai skill's own template placeholders —
+  "Continue anyway" is always available if the gaps are acceptable, but it's a deliberate extra
+  step, not silently skipped.
 - The review screen has two tiers, chosen automatically by feature-detecting `ctx.ui.custom` at
   gate time. Where it's available (an interactive terminal session — the normal way `omp` is
   actually run), **Sidebar view** renders a real persistent two-pane overlay via `ctx.ui.custom()`

@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionUISelectOption } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionAskDialogQuestion, ExtensionAskDialogResult, ExtensionUISelectOption } from "@oh-my-pi/pi-coding-agent";
 import {
 	BRAINSTORM_DIR,
 	type BrainstormMeta,
@@ -230,32 +230,44 @@ function codeReviewTurnPrompt(changeId: string): string {
 }
 
 /**
- * Grill turn — fires the FIRST message of what will become a real multi-turn conversation,
- * unlike Explore/Propose/Apply/Refine/Code-review (which are each a single fire-and-wait turn
- * driven by `spendTurn`/`fireTurnAndWait`). A genuine "grill until the design tree resolves,
- * never accept a passive answer" loop — mattpocock/skills style, matching the existing
- * upstream `brainstorm-ai` skill's own rules 3 and 6 — means asking the user real questions and
- * getting real replies across ordinary chat turns. There is nothing for extension code to
- * synchronously wait on: `startGrilling` below fires this prompt and returns immediately; the
- * rest of the back-and-forth happens as normal chat turns the user answers directly, ending
- * once the model writes the brainstorm file itself and the user re-invokes /readyset to
- * pick it up.
+ * Grill turn — fires the FIRST message of the grilling conversation, unlike
+ * Explore/Propose/Apply/Refine/Code-review (which are each a single fire-and-wait turn driven
+ * by `spendTurn`/`fireTurnAndWait`). A genuine "grill until the design tree resolves, never
+ * accept a passive answer" loop — mattpocock/skills style, matching the existing upstream
+ * `brainstorm-ai` skill's own rules 3 and 6 — means asking the user real questions and getting
+ * real replies.
+ *
+ * As of the `readyset_ask` tool (registered below, in the default export), each round of
+ * questions is a real structured picker — `ctx.ui.askDialog()`, omp's own native multi-question
+ * dialog surface, the same mechanism this session's own AskUserQuestion-equivalent uses — not
+ * plain "❓ Q1 ... ➡️ <recommendation>" chat text the user has to type a reply to. Because
+ * `askDialog()` blocks synchronously on real user input, the model can call `readyset_ask`
+ * repeatedly, round after round, inside the SAME fired turn — it does not need to end its turn
+ * between rounds the way it used to. `startGrilling` below still just fires this prompt and
+ * returns; everything after that (every round, and the eventual file write) happens inside that
+ * one turn now, driven entirely by the model's own tool calls.
  *
  * The file this writes must match `loadBrainstorms()`/`parseBranch()`'s expected shape exactly
  * (same frontmatter keys, a "- Branch: <type>/<slug>" line under Git Workflow) so once written
  * it is indistinguishable from a brainstorm the separate upstream `brainstorm-ai` skill
  * produced — /readyset's own picker, and reconcileStatuses, treat either identically.
  *
- * Round cap is prompt-level only, deliberately — there is no `TurnBudget`-style hard stop on
- * grilling the way there is on Explore/Propose/Apply/Refine/Code-review, because those are each
- * one `spendTurn` call extension code fires and waits on; grilling's rounds are ordinary chat
- * turns the user answers directly, which this extension's code never sees or counts (it only
- * fires the opening message). GRILL_ROUND_CAP below is the number of question-rounds after
- * which the prompt itself is told to check in rather than keep going indefinitely — a soft,
- * model-followed convention, not something `startGrilling`/the handler can enforce. The other
- * half of the mitigation is structural and does run in code: `validateBrainstormContent`
- * (readyset-brainstorm.ts), checked before Explore ever spends a turn on whatever grilling
- * actually produced — see its call site in the command handler.
+ * Round cap is enforced in code now, not just prompt-level: `readyset_ask`'s own `execute()`
+ * tracks how many rounds have run for the current grilling session (`grillRoundState`, reset by
+ * `startGrilling`) and, once `GRILL_ROUND_CAP` is reached, refuses to open the dialog again and
+ * instead returns a tool result telling the model to check in via plain text — summarize what's
+ * decided, name what's open, ask whether to keep going. This is a real ceiling (the tool simply
+ * won't present another dialog), not a soft, model-followed convention the way it was before
+ * `readyset_ask` existed. The other half of the mitigation is unchanged and still runs in code:
+ * `validateBrainstormContent` (readyset-brainstorm.ts), checked before Explore ever spends a
+ * turn on whatever grilling actually produced — see its call site in the command handler.
+ *
+ * `askDialog` is only available in Interactive mode (confirmed in extensions.md — RPC/ACP/print
+ * modes leave it undefined). `readyset_ask`'s `execute()` feature-detects it the same way this
+ * file's other `ctx.ui.custom`-gated code does (see `openSidebarOverlay`): when it's missing,
+ * the tool returns a result telling the model to ask that round in plain chat text instead,
+ * same content, same rules — grilling still works everywhere, just without the structured UI
+ * where the surface for it doesn't exist.
  *
  * The rules below are adapted from mattpocock/skills' actual `grilling` skill, vendored verbatim
  * (MIT-licensed) at `src/skill/mattpocock-grilling.md` in this package -- check that file, not
@@ -267,30 +279,40 @@ function codeReviewTurnPrompt(changeId: string): string {
  * search tool is a baseline part of this omp setup's toolset. See the corresponding bullet below.
  */
 const GRILL_ROUND_CAP = 4;
+
+/** How many `readyset_ask` rounds have fired for the CURRENT grilling session. Reset by
+ *  `startGrilling`. Module-level (not per-invocation state threaded through the tool call) is a
+ *  deliberate trade-off: `registerTool`'s `execute()` has no way to receive extension-local
+ *  state per grilling run, only `ctx` (the ExtensionContext) — this is the same reason
+ *  `TurnBudget` is a plain object rather than something passed through the tool API. Good enough
+ *  for a single-user, single-session tool like this one; a concurrent second grilling session in
+ *  the same omp process would share (and reset) this counter, which is an accepted limitation,
+ *  not a real scenario Readyset needs to guard against. */
+const grillRoundState = { rounds: 0 };
 function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: string): string {
 	return (
 		"Grill this raw idea into a decided Readyset brainstorm file, mattpocock/skills style — interrogate it, " +
 		`don't just accept it. Raw idea from the user: "${ideaText}"\n\n` +
-		"This is the first message of a real conversation, not a one-shot task: ask your first round of " +
-		"questions now, in this reply, and then stop — end your turn there. The user will answer in their next " +
-		"message, in the same chat. Keep going, round by round, until the design is genuinely settled. Rules:\n" +
-		// Trimmed (2026-09-18) to roughly half its original wording after an audit flagged this
-		// prompt's real, recurring token cost against its unenforceable, soft-only nature -- same
-		// instruction, fewer words. See GRILL_ROUND_CAP's own doc comment for why this can only ever
-		// be a soft, prompt-level check rather than something the extension's code enforces.
-		`- Track your round count. At round ${GRILL_ROUND_CAP} without the design tree resolved, stop and check in: ` +
-		"summarize what's decided, name what's still open, and ask whether to keep grilling or write the " +
-		"brainstorm now with the rest under Open Questions. Pace check only — not permission to accept a passive answer.\n" +
+		"Use the `readyset_ask` tool for EVERY round of questions — do not write '❓ Q1 ...' as plain chat text. " +
+		"Give it 2 or more real options per question and mark your own recommended one via recommendedIndex, so " +
+		"the user picks or overrides rather than starting from a blank page. You can keep calling `readyset_ask` " +
+		"round after round in this same turn — you don't need to end your turn between rounds. Keep going until " +
+		"the design is genuinely settled, or until the tool tells you the round cap was hit (then check in: " +
+		"summarize what's decided, name what's still open, ask in plain chat whether to keep grilling or write " +
+		"the brainstorm now with the rest under Open Questions — pace check only, not permission to accept a " +
+		"passive answer). If the tool reports the user chose to discuss instead of picking, or that the " +
+		"structured picker isn't available this session, continue that round in plain chat text instead, then go " +
+		"back to `readyset_ask` for the next round once it's resolved. Rules:\n" +
 		"- Map out the decision branches this idea implies before asking anything (what's actually unresolved: " +
 		"approach, scope boundary, the seam/module it touches, how success is observed), then ask only the " +
-		"questions answerable right now, all in one numbered round, each with your own recommended answer so " +
-		"the user can confirm or override rather than starting from a blank page.\n" +
-		"- Never accept a passive reply ('okay', 'terserah', 'up to you', 'looks good') as a real decision on " +
+		"questions answerable right now, all in one round.\n" +
+		"- Never accept a passive answer ('okay', 'terserah', 'up to you', 'looks good' — whether typed as a " +
+		"custom answer or implied by picking your own recommended option without engaging) as a real decision on " +
 		"anything load-bearing — if the user brushes past a question, restate it as a concrete pick with your " +
 		"recommendation and ask again. Only an explicit 'defer this to the planning harness' counts as a " +
 		"resolved answer for something the user genuinely doesn't want to decide yet.\n" +
-		"- Offer at least two real options/approaches when there's more than one reasonable way in, and discuss " +
-		"the trade-off — don't just assert a pick.\n" +
+		"- Offer at least two real options/approaches when there's more than one reasonable way in, with a short " +
+		"description of the trade-off on each option — don't just assert a pick.\n" +
 		"- Do real read-only repo research (Read/Grep/Glob, read-only git/shell commands) before or between " +
 		"rounds wherever it would sharpen a question or firm up a recommendation — don't ask the user something " +
 		"the repo already answers.\n" +
@@ -300,10 +322,11 @@ function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: st
 		"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
 		"real thing. Reserve open questions for what only the user can decide or knows.\n" +
 		(preferredLanguage
-			? `- Preferred language for this discussion: ${preferredLanguage}. Write your FIRST round of questions, ` +
-				"and every reply after, in that language -- don't wait for the user to reply in it first before " +
-				"switching. The brainstorm FILE you write at the end must still be entirely in English regardless, " +
-				"exactly like the structure below.\n\n"
+			? `- Preferred language for this discussion: ${preferredLanguage}. Write every question/header/option ` +
+				"text you pass to `readyset_ask`, and any plain-chat fallback text, in that language from the very " +
+				"first round -- don't wait for the user to reply in it first before switching. The brainstorm FILE " +
+				"you write at the end must still be entirely in English regardless, exactly like the structure " +
+				"below.\n\n"
 			: "- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
 				"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
 		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
@@ -527,10 +550,12 @@ async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string)
 function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, preferredLanguage?: string): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
+	grillRoundState.rounds = 0; // fresh cap for this grilling session — see readyset_ask's doc comment
 	ctx.ui.notify(
 		`Grilling started for: "${preview}"${preferredLanguage ? ` in ${preferredLanguage}` : ""} — Readyset will ask questions ` +
-			"right here in the chat; answer them, and it'll write the brainstorm file once the design is genuinely " +
-			"resolved. Run /readyset again afterward to pick it up from there.",
+			"right here in the chat (a structured picker where available); answer them, and it'll write the " +
+			"brainstorm file once the design is genuinely resolved. Run /readyset again afterward to pick it up " +
+			"from there.",
 		"info",
 	);
 	pi.sendUserMessage(grillTurnPrompt(ideaText, today, preferredLanguage), { deliverAs: "nextTurn", triggerTurn: true });
@@ -963,7 +988,151 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 	}
 }
 
+/**
+ * Registers `readyset_ask` — the tool `grillTurnPrompt` tells the model to call for every round
+ * of grilling questions, instead of writing "❓ Q1 ..." as plain chat text. Presents
+ * `ctx.ui.askDialog()`, omp's own native multi-question picker dialog (Interactive mode only —
+ * see `grillTurnPrompt`'s doc comment for the plain-chat-text fallback when it's unavailable),
+ * and returns the user's picks (or their own typed answer, or "let's discuss instead") back to
+ * the model as the tool result so it can decide whether the design tree is settled yet.
+ *
+ * Enforces `GRILL_ROUND_CAP` in code (see `grillRoundState`'s doc comment) — once the cap is
+ * hit, this refuses to open another dialog and tells the model to check in via plain text
+ * instead, a real ceiling rather than the prompt-level-only convention grilling used before this
+ * tool existed.
+ */
+function registerAskTool(pi: ExtensionAPI): void {
+	pi.registerTool({
+		name: "readyset_ask",
+		label: "Readyset: Ask",
+		description:
+			"Ask the user one round of grilling questions as a real structured picker instead of plain chat text -- " +
+			"use this for EVERY round while grilling a Readyset brainstorm. 1-4 questions per call, each with 2+ " +
+			"real options (mark your own recommended one via recommendedIndex) plus room for the user to type " +
+			"their own answer or ask to discuss instead of picking. Only meaningful during a /readyset grilling " +
+			"conversation.",
+		parameters: pi.zod.object({
+			questions: pi.zod
+				.array(
+					pi.zod.object({
+						id: pi.zod.string().describe("short stable id for this question within the round, e.g. 'q1'"),
+						question: pi.zod.string().describe("the question text"),
+						header: pi.zod.string().optional().describe("short label shown as a chip, e.g. 'Approach'"),
+						options: pi.zod
+							.array(
+								pi.zod.object({
+									label: pi.zod.string(),
+									description: pi.zod.string().optional().describe("brief trade-off/context for this option"),
+								}),
+							)
+							.min(2)
+							.describe("2 or more real options"),
+						recommendedIndex: pi.zod.number().int().min(0).optional().describe("index of your recommended option, if any"),
+						multi: pi.zod.boolean().optional().describe("true if more than one option can be selected"),
+					}),
+				)
+				.min(1)
+				.max(4)
+				.describe("1-4 questions for this round"),
+		}),
+		approval: "read",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (grillRoundState.rounds >= GRILL_ROUND_CAP) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Round cap (${GRILL_ROUND_CAP}) reached for this grilling session -- not opening another dialog. ` +
+								"Check in with the user in plain chat text instead: summarize what's decided, name what's still " +
+								"open, and ask whether to keep grilling or write the brainstorm now with the rest under Open " +
+								"Questions.",
+						},
+					],
+				};
+			}
+			grillRoundState.rounds++;
+
+			if (!ctx.ui.askDialog) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"The structured picker isn't available in this session (non-interactive mode) -- ask this " +
+								"round's questions as plain chat text instead, same content and same rules (real options, your " +
+								"own recommendation, never accept a passive answer), then wait for the user's next message.",
+						},
+					],
+				};
+			}
+
+			const questions: ExtensionAskDialogQuestion[] = params.questions.map((q) => ({
+				id: q.id,
+				question: q.question,
+				header: q.header,
+				options: q.options,
+				multi: q.multi,
+				recommended: q.recommendedIndex,
+			}));
+
+			let result: ExtensionAskDialogResult | undefined;
+			try {
+				result = await ctx.ui.askDialog(questions);
+			} catch (err) {
+				const reason = err instanceof Error ? err.message : String(err);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `The structured picker failed to open (${reason}) -- ask this round's questions as plain chat text instead.`,
+						},
+					],
+				};
+			}
+
+			if (!result) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"The user closed the picker without answering. Ask them directly in plain chat what they'd " +
+								"like to do -- keep grilling, or stop here.",
+						},
+					],
+				};
+			}
+
+			if (result.kind === "chat") {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"The user chose to discuss this round in plain chat instead of picking from the options -- " +
+								"continue the conversation normally and wait for their next message before calling " +
+								"readyset_ask again.",
+						},
+					],
+				};
+			}
+
+			const lines = result.results.map((r) => {
+				const picked = r.customInput
+					? `their own answer: "${r.customInput}"`
+					: r.selectedOptions.length > 0
+						? r.selectedOptions.join(", ")
+						: "(no option picked)";
+				return `- ${r.question} -> ${picked}${r.note ? ` (note: ${r.note})` : ""}${r.timedOut ? " [timed out]" : ""}`;
+			});
+			return { content: [{ type: "text", text: `User's answers this round:\n${lines.join("\n")}` }] };
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI) {
+	registerAskTool(pi);
 	pi.registerCommand("readyset", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +

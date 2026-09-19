@@ -84,6 +84,21 @@ async function writeBrainstorm(cwd: string, filename: string, frontmatter: Recor
   await writeFile(join(cwd, ".ai", "brainstorms", filename), raw, "utf8");
 }
 
+// Fake pi.zod: `registerAskTool` (readyset-review.ts) builds its schema via a chain of
+// pi.zod.object/.array/.string/.number/.boolean/.optional/.describe/.min/.max/.int calls at
+// module-load time (export default calls it unconditionally), and nothing in these tests
+// inspects the resulting schema shape -- only that registration itself doesn't throw. A
+// self-referential Proxy absorbs any property access or call and returns itself, so the whole
+// chain resolves to one object regardless of which zod methods get called or in what order.
+function makeFakeZodNode(): any {
+  const node: any = new Proxy(() => node, {
+    get: () => node,
+    apply: () => node,
+  });
+  return node;
+}
+const fakeZod = makeFakeZodNode();
+
 // Fake pi.sendUserMessage: each test controls what "the agent turn" does via a queue of
 // side-effect functions, invoked when waitForIdle() is awaited (mirrors the real
 // triggerTurn -> waitForIdle blocking pattern, fully under test control, same approach
@@ -100,6 +115,10 @@ function makeFakePi(cwd: string) {
       registerCommand(_name: string, _def: unknown) {
         /* not used directly in these tests; we call the handler ourselves */
       },
+      registerTool(_def: unknown) {
+        /* readyset_ask registration -- not exercised directly by these tests */
+      },
+      zod: fakeZod,
       async setModel(spec: unknown) {
         setModelCalls.push(spec);
       },
@@ -166,6 +185,35 @@ async function loadHandler(fakePi: { sendUserMessage: (prompt: string, opts: unk
   mod.default({ ...fakePi, registerCommand } as any);
   if (!captured) throw new Error("registerCommand was never called");
   return captured.handler;
+}
+
+// Loads a fresh module instance and captures the readyset_ask tool definition registerAskTool
+// registers via pi.registerTool -- for tests that exercise the tool's execute() directly rather
+// than going through the /readyset command handler.
+async function loadAskTool(): Promise<{
+  execute: (
+    toolCallId: string,
+    params: { questions: unknown[] },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<{ content: { type: string; text: string }[] }>;
+}> {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    default: (pi: unknown) => void;
+  };
+  let captured: { execute: (...args: unknown[]) => Promise<unknown> } | undefined;
+  const fakePi = {
+    sendUserMessage(_prompt: string, _opts: unknown) {},
+    registerCommand(_name: string, _def: unknown) {},
+    registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+      if (def.name === "readyset_ask") captured = def;
+    },
+    zod: fakeZod,
+  };
+  mod.default(fakePi as any);
+  if (!captured) throw new Error("readyset_ask was never registered");
+  return captured as any;
 }
 
 await test("full happy path: open -> explore -> propose -> approve & execute -> code review -> archive", async () => {
@@ -476,6 +524,8 @@ await test("fireTurnAndWait survives the observed race: waitForIdle would resolv
     registerCommand(_name: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) {
       captured = def;
     },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
   };
   handler.default(fakePi as any);
   if (!captured) throw new Error("registerCommand was never called");
@@ -623,6 +673,8 @@ await test("setModel is called bound to pi, not detached -- a real terminal run 
       }
       setModelCalls.push(spec);
     },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
   };
   const handler = await loadHandler(fakePi as any);
   const fakeUiWrap = makeFakeUi();
@@ -717,6 +769,8 @@ await test("--fallback-model is used when the primary --model fails to pin", asy
       setModelCalls.push(spec);
       if (spec === "resolved:bad/primary-model") throw new Error("model not found: bad/primary-model");
     },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
   };
 
   const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
@@ -777,6 +831,8 @@ await test("both --model and --fallback-model fail to pin -> runs unpinned rathe
       setModelCalls.push(spec);
       throw new Error(`model not found: ${spec}`);
     },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
   };
 
   const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
@@ -1171,6 +1227,100 @@ await test("content-check gate: a fully-filled-in brainstorm never triggers the 
     "content-check gate should not have fired for a fully-filled-in brainstorm",
   );
   assert.ok(fakePiWrap.calls.length >= 1, "Explore should have fired directly");
+});
+
+await test("readyset_ask: presents askDialog and returns the user's picks back to the model", async () => {
+  const tool = await loadAskTool();
+  const askDialogCalls: unknown[] = [];
+  const ctx = {
+    ui: {
+      askDialog: async (questions: unknown) => {
+        askDialogCalls.push(questions);
+        return {
+          kind: "submit",
+          results: [{ id: "q1", question: "Which approach?", options: ["A", "B"], multi: false, selectedOptions: ["B"] }],
+        };
+      },
+    },
+  };
+
+  const result = await tool.execute(
+    "call1",
+    { questions: [{ id: "q1", question: "Which approach?", options: [{ label: "A" }, { label: "B" }], recommendedIndex: 0 }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+
+  assert.equal(askDialogCalls.length, 1);
+  assert.match(result.content[0]?.text ?? "", /Which approach\? -> B/);
+});
+
+await test("readyset_ask: a custom typed answer is reported back verbatim", async () => {
+  const tool = await loadAskTool();
+  const ctx = {
+    ui: {
+      askDialog: async () => ({
+        kind: "submit",
+        results: [{ id: "q1", question: "Name it?", options: ["X"], multi: false, selectedOptions: [], customInput: "my own answer" }],
+      }),
+    },
+  };
+
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Name it?", options: [{ label: "X" }] }] }, undefined, undefined, ctx);
+  assert.match(result.content[0]?.text ?? "", /their own answer: "my own answer"/);
+});
+
+await test("readyset_ask: kind 'chat' tells the model to continue the round in plain chat", async () => {
+  const tool = await loadAskTool();
+  const ctx = { ui: { askDialog: async () => ({ kind: "chat" }) } };
+
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, ctx);
+  assert.match(result.content[0]?.text ?? "", /chose to discuss this round in plain chat/);
+});
+
+await test("readyset_ask: dialog cancelled (undefined result) -> tells the model to ask the user directly", async () => {
+  const tool = await loadAskTool();
+  const ctx = { ui: { askDialog: async () => undefined } };
+
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, ctx);
+  assert.match(result.content[0]?.text ?? "", /closed the picker without answering/);
+});
+
+await test("readyset_ask: askDialog unavailable (non-interactive mode) -> falls back to plain-chat instruction", async () => {
+  const tool = await loadAskTool();
+  const ctx = { ui: {} }; // no askDialog on this ctx shape -- RPC/print/ACP modes
+
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, ctx);
+  assert.match(result.content[0]?.text ?? "", /structured picker isn't available/);
+});
+
+await test("readyset_ask: round cap is enforced in code -- stops opening the dialog once hit", async () => {
+  const tool = await loadAskTool();
+  let askDialogCallCount = 0;
+  const ctx = {
+    ui: {
+      askDialog: async () => {
+        askDialogCallCount++;
+        return { kind: "submit", results: [] };
+      },
+    },
+  };
+  const oneQuestion = { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] };
+
+  let cappedText: string | undefined;
+  for (let i = 0; i < 20 && !cappedText; i++) {
+    const result = await tool.execute("call", oneQuestion, undefined, undefined, ctx);
+    const text = result.content[0]?.text ?? "";
+    if (/Round cap/.test(text)) cappedText = text;
+  }
+
+  assert.ok(cappedText, "expected the round cap to trip within 20 calls");
+  assert.match(cappedText!, /check in with the user in plain chat text/i);
+  const callsAtCap = askDialogCallCount;
+  // one more call past the cap must not open the dialog again
+  await tool.execute("call", oneQuestion, undefined, undefined, ctx);
+  assert.equal(askDialogCallCount, callsAtCap, "askDialog should not be called again once the cap is hit");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
