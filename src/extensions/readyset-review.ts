@@ -24,7 +24,7 @@ import {
 	validateChange,
 } from "../lib/readyset-spec.ts";
 import { readFallbackChain, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
-import { ReviewSidebarOverlay, type OverlaySection } from "../lib/readyset-review-overlay.ts";
+import { ReviewSidebarOverlay, type OverlaySection, type ReviewOverlayResult } from "../lib/readyset-review-overlay.ts";
 import {
 	checkTaskEvidence,
 	EVIDENCE_MAX_OUTPUT_BYTES,
@@ -791,13 +791,16 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
  *
  * A real persistent sidebar (native `/plan`'s clickable outline + content pane) turned out to
  * be possible after all via `ctx.ui.custom()` in Interactive mode — see `readyset-review-overlay.ts`
- * and `openSidebarOverlay` below, offered as "Sidebar view" on the gate whenever `ctx.ui.custom`
- * is present. This compiled document is pushed to the editor pane unconditionally at the top of
- * every gate loop iteration (see `reviewAndMaybeExecute`), so it's always current whether or not
- * the user opens the sidebar — there is deliberately no separate "just show me the full doc" gate
- * option, since one pushed automatically on every loop turn would be a no-op by construction.
- * `browseReviewSections` below remains the fallback "one section at a time" menu for RPC/ACP/print
- * contexts, where `ctx.ui.custom` isn't available.
+ * and `openSidebarOverlay` below. It opens automatically, as the review gate itself, whenever
+ * `ctx.ui.custom` is present — not offered as a "Sidebar view" choice on a separate menu; Approve
+ * & Execute / Refine / Discard are CTAs baked into the overlay (see
+ * `readyset-review-overlay.ts`'s `ReviewOverlayResult`), so there's no menu step before it either.
+ * This compiled document is pushed to the editor pane unconditionally at the top of every gate
+ * loop iteration (see `reviewAndMaybeExecute`), so it's always current alongside the sidebar —
+ * there is deliberately no separate "just show me the full doc" gate option, since one pushed
+ * automatically on every loop turn would be a no-op by construction. `classicGateSelect` /
+ * `browseReviewSections` below remain the fallback menu-driven gate for RPC/ACP/print contexts,
+ * where `ctx.ui.custom` isn't available.
  */
 async function buildReviewDocument(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<string> {
 	const sections = await buildReviewSections(ctx, chosen, snapshot);
@@ -828,13 +831,23 @@ async function buildSingleSectionDocument(ctx: ReviewCtx, chosen: BrainstormMeta
  * document", pushing just the picked section's content to the editor each time.
  */
 /**
- * "Sidebar view" — a real persistent section list + content pane, via `ctx.ui.custom()`
- * (Interactive mode only; see `readyset-review-overlay.ts`'s module doc comment for how this
- * was confirmed against `@oh-my-pi/pi-tui`'s own real source, not assumed). Up/Down moves the
- * section cursor, PgUp/PgDn scrolls the body, Esc returns to the gate. `ctx.ui.custom` is
- * feature-detected by the caller, not here — this function assumes it exists.
+ * The review gate itself, whenever a real TUI is available — a persistent section list +
+ * content pane via `ctx.ui.custom()` (Interactive mode only; see `readyset-review-overlay.ts`'s
+ * module doc comment for how this was confirmed against `@oh-my-pi/pi-tui`'s own real source,
+ * not assumed), with Approve & Execute / Refine / Discard as CTAs inside it (the `[A]`/`[R]`/`[D]`
+ * keys `ReviewSidebarOverlay.handleInput` binds). Up/Down moves the section cursor, PgUp/PgDn
+ * scrolls the body, Esc cancels (treated the same as an explicit Discard by the caller). Errors
+ * opening the overlay are NOT swallowed here — the caller (`reviewAndMaybeExecute`) catches them
+ * and falls back to `classicGateSelect`'s menu, since a failed overlay open means there's no CTA
+ * surface for the user to act on at all. `ctx.ui.custom` is feature-detected by the caller, not
+ * here — this function assumes it exists.
  */
-async function openSidebarOverlay(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<void> {
+async function openSidebarOverlay(
+	ctx: ReviewCtx,
+	chosen: BrainstormMeta,
+	snapshot: ReviewSnapshot,
+	taskSummary: string,
+): Promise<ReviewOverlayResult> {
 	const sections = await buildReviewSections(ctx, chosen, snapshot);
 	const overlaySections: OverlaySection[] = [];
 	for (const s of sections) {
@@ -842,19 +855,17 @@ async function openSidebarOverlay(ctx: ReviewCtx, chosen: BrainstormMeta, snapsh
 	}
 
 	type OverlayCtorArgs = ConstructorParameters<typeof ReviewSidebarOverlay>;
-	await ctx.ui.custom!<undefined>((_tui, theme, keybindings, done) =>
+	return await ctx.ui.custom!<ReviewOverlayResult>((_tui, theme, keybindings, done) =>
 		new ReviewSidebarOverlay(
 			theme as unknown as OverlayCtorArgs[0],
 			keybindings as unknown as OverlayCtorArgs[1],
 			`Readyset review — ${chosen.title} (${chosen.changeId})`,
 			overlaySections,
+			taskSummary,
 			done,
 		),
 	{ overlay: true, overlayOptions: { fullscreen: true } },
-	).catch((err) => {
-		ctx.ui.notify(`Sidebar view failed to open: ${err instanceof Error ? err.message : String(err)}. Falling back to Jump to section.`, "warning");
-		return browseReviewSections(ctx, chosen, snapshot);
-	});
+	);
 }
 
 async function browseReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<void> {
@@ -906,9 +917,46 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 }
 
 /**
- * The fused review+refine loop. Runs after propose-equivalent artifacts exist for
- * `chosen`. Loops on "Refine" until the user picks Approve or Discard, so refinement
- * doesn't require re-invoking the command either.
+ * The classic, menu-driven gate — used only when the sidebar overlay isn't available
+ * (`ctx.ui.custom` missing: RPC/ACP/print-headless contexts, or the overlay threw on open).
+ * Loops internally on "Jump to section" so the caller always gets back a real gate decision
+ * (approve/refine/discard/cancel), never an intermediate browsing state.
+ */
+async function classicGateSelect(
+	ctx: ReviewCtx,
+	chosen: BrainstormMeta,
+	snapshot: ReviewSnapshot,
+	taskSummary: string,
+): Promise<ReviewOverlayResult> {
+	for (;;) {
+		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
+			{ label: "Approve & Execute", description: `implement per tasks.md, then report progress — ${taskSummary}` },
+			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
+			{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" },
+			{ label: "Discard", description: "leave as proposed, do nothing" },
+		]);
+
+		if (choice === "Jump to section") {
+			await browseReviewSections(ctx, chosen, snapshot);
+			continue; // stay in the loop; re-show this same menu after they're done browsing
+		}
+		if (choice === "Approve & Execute") return "approve";
+		if (choice === "Refine") return "refine";
+		if (choice === "Discard") return "discard";
+		return undefined; // cancelled (no choice)
+	}
+}
+
+/**
+ * The fused review+refine loop. Runs after propose-equivalent artifacts exist for `chosen`.
+ * Loops on "Refine" until the user picks Approve or Discard, so refinement doesn't require
+ * re-invoking the command either.
+ *
+ * Whenever `ctx.ui.custom` is available, the sidebar overlay opens automatically at the top of
+ * every loop iteration — it IS the review gate, with Approve & Execute / Refine / Discard as
+ * CTAs baked into it, not a "Sidebar view" choice offered on a separate menu the user had to
+ * pick first. `classicGateSelect` is the fallback for contexts without a real TUI, and also
+ * covers the (rare) case where the overlay itself throws on open.
  */
 async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: BrainstormMeta, budget: TurnBudget): Promise<void> {
 	let chosen = initial;
@@ -923,28 +971,21 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			: "tasks.md not found yet";
 
 		const hasSidebar = typeof ctx.ui.custom === "function";
-		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
-			{ label: "Approve & Execute", description: `implement per tasks.md, then report progress — ${taskSummary}` },
-			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
-			...(hasSidebar
-				? [{ label: "Sidebar view", description: "persistent section list + content, like native /plan's review — ↑/↓ · PgUp/PgDn · Esc" }]
-				: [{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" }]),
-			{ label: "Discard", description: "leave as proposed, do nothing" },
-		]);
-
-		if (!choice || choice === "Discard") return;
-
-		if (choice === "Sidebar view") {
-			await openSidebarOverlay(ctx, chosen, snapshot);
-			continue; // stay in the loop; re-show the panel/gate (and full document) after they close the overlay
+		let choice: ReviewOverlayResult;
+		if (hasSidebar) {
+			try {
+				choice = await openSidebarOverlay(ctx, chosen, snapshot, taskSummary);
+			} catch (err) {
+				ctx.ui.notify(`Sidebar view failed to open: ${err instanceof Error ? err.message : String(err)}. Falling back to the classic menu.`, "warning");
+				choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary);
+			}
+		} else {
+			choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary);
 		}
 
-		if (choice === "Jump to section") {
-			await browseReviewSections(ctx, chosen, snapshot);
-			continue; // stay in the loop; re-show the panel/gate (and full document) after they're done browsing
-		}
+		if (!choice || choice === "discard") return;
 
-		if (choice === "Refine") {
+		if (choice === "refine") {
 			const feedback = ctx.ui.input ? await ctx.ui.input("What should change?") : undefined;
 			if (!feedback) {
 				ctx.ui.notify("No feedback given — nothing changed.", "info");
@@ -963,7 +1004,7 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			continue; // loop back: re-validate and show the panel/gate again
 		}
 
-		// "Approve & Execute". Runs its own inner loop around Apply so a missing-verification
+		// "approve". Runs its own inner loop around Apply so a missing-verification
 		// re-run just fires Apply again — it does not send the user back through the main gate
 		// (Approve & Execute / Refine / Discard) to re-approve something already approved.
 		await markApproved(chosen);

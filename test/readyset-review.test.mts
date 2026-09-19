@@ -1037,9 +1037,11 @@ await test("Jump to section shows one section at a time, then restores the full 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler([], ctx);
 
-  // editor gets set: initial full doc, single-section view, full doc on Back, then the outer
-  // loop's own redraw on its next iteration (it always re-renders regardless of how it looped)
-  assert.equal(fakeUiWrap.editorTextHistory.length, 4);
+  // editor gets set: initial full doc, single-section view, full doc on Back -- "Jump to
+  // section" now loops entirely inside classicGateSelect's own select() loop (no more separate
+  // "Sidebar view" branch in the outer gate loop to bounce back through), so there's no extra
+  // redundant redraw of the same full document once the gate re-asks after Back.
+  assert.equal(fakeUiWrap.editorTextHistory.length, 3);
   const singleSectionDoc = fakeUiWrap.editorTextHistory[1];
   assert.match(singleSectionDoc, /PROPOSAL/);
   assert.match(singleSectionDoc, /some unique proposal text here/);
@@ -1051,7 +1053,7 @@ await test("Jump to section shows one section at a time, then restores the full 
   assert.match(restoredDoc, /DESIGN/);
 });
 
-await test("Sidebar view: offered instead of Jump to section when ctx.ui.custom exists, and wires sections through to the factory", async () => {
+await test("Sidebar overlay opens automatically as the review gate when ctx.ui.custom exists -- no menu step first, CTAs live in the overlay", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-16-sidebar.md", {
     title: "Sidebar Test",
@@ -1074,7 +1076,9 @@ await test("Sidebar view: offered instead of Jump to section when ctx.ui.custom 
     async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (r: unknown) => void) => unknown, options: unknown) {
       customCalls.push(options);
       // Exercise the factory the way real Interactive mode would: build the overlay, confirm it
-      // renders without throwing, then immediately close it (as if the user pressed Esc).
+      // renders without throwing (including its Approve/Refine/Discard CTA bar), then close it
+      // as if the user pressed Esc -- our keybindings stub always says no, so nothing calls
+      // done() and it just resolves undefined (== cancel, same as an explicit Discard).
       let resolved: unknown;
       const overlay = factory(
         {},
@@ -1085,21 +1089,21 @@ await test("Sidebar view: offered instead of Jump to section when ctx.ui.custom 
       const rendered = overlay.render(100);
       assert.ok(Array.isArray(rendered) && rendered.length > 0, "overlay factory should produce a real Component with render()");
       assert.ok(rendered.some(l => l.includes("Proposal")), "overlay should include the Proposal section heading");
-      overlay.handleInput?.("\x1b"); // simulate Esc via the real keybindings.matches("tui.select.cancel") path would normally fire; our stub always returns false, so call done() directly instead
+      assert.ok(rendered.some(l => l.includes("Approve & Execute") && l.includes("Refine") && l.includes("Discard")), "overlay should render its own Approve/Refine/Discard CTA bar");
+      overlay.handleInput?.("\x1b");
       return resolved;
     },
   };
 
-  fakeUiWrap.selectQueue.push("2026-01-16 · Sidebar Test"); // pick
-  fakeUiWrap.selectQueue.push("Sidebar view"); // offered because ui.custom exists
-  fakeUiWrap.selectQueue.push("Discard"); // leave the gate after the overlay closes
+  fakeUiWrap.selectQueue.push("2026-01-16 · Sidebar Test"); // pick -- the only select() call this whole run makes
 
   const ctx = { cwd, ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler([], ctx);
 
-  assert.equal(customCalls.length, 1, "ctx.ui.custom should be called exactly once for Sidebar view");
+  assert.equal(customCalls.length, 1, "ctx.ui.custom should be called exactly once, automatically -- no 'Sidebar view' menu pick needed first");
   assert.equal((customCalls[0] as { overlay?: boolean }).overlay, true);
-  assert.ok(!fakeUiWrap.selectPrompts.some(p => p === "Jump to a section — \"sidebar-test\""), "Jump to section's menu should not appear when Sidebar view is available");
+  assert.equal(fakeUiWrap.selectPrompts.length, 1, "the review gate should never call ctx.ui.select() at all when the sidebar overlay is available");
+  assert.equal(fakeUiWrap.selectQueue.length, 0, "nothing left unconsumed in the queue -- the run ended on the overlay's own cancel, not a follow-up Discard pick");
 });
 
 await test("--idea skips the picker entirely and fires a grill turn as the first message (not fire-and-wait)", async () => {

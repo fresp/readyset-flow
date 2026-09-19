@@ -26,16 +26,16 @@ function sections(): OverlaySection[] {
 }
 
 await test("renders a title line and one row per section header, plus a footer hint", () => {
-	const lines = renderSidebarLayout("Review — my-change", sections(), 0, 0, 100, 20, identity, identity, identity);
+	const lines = renderSidebarLayout("Review — my-change", sections(), 0, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity);
 	assert.match(lines[0], /Review — my-change/);
 	assert.ok(lines.some(l => l.includes("Exploration") && l.includes("done")));
 	assert.ok(lines.some(l => l.includes("Proposal") && l.includes("proposal.md")));
 	assert.ok(lines.some(l => l.includes("Tasks") && l.includes("2/3 ticked")));
-	assert.ok(lines.at(-1)?.includes("Esc back to review"));
+	assert.ok(lines.at(-1)?.includes("Esc cancel"));
 });
 
 await test("selected section's body appears in the body column, unselected sections' bodies do not", () => {
-	const lines = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, identity, identity, identity);
+	const lines = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity);
 	const joined = lines.join("\n");
 	assert.match(joined, /proposal line 0/);
 	assert.ok(!joined.includes("line one"), "Exploration's body should not leak in when Proposal is selected");
@@ -43,8 +43,8 @@ await test("selected section's body appears in the body column, unselected secti
 });
 
 await test("scrollOffset shifts which body lines are visible", () => {
-	const atTop = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, identity, identity, identity).join("\n");
-	const scrolled = renderSidebarLayout("Title", sections(), 1, 10, 100, 20, identity, identity, identity).join("\n");
+	const atTop = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity).join("\n");
+	const scrolled = renderSidebarLayout("Title", sections(), 1, 10, 100, 20, "3/5 tasks ticked", identity, identity, identity).join("\n");
 	assert.match(atTop, /proposal line 0\b/);
 	assert.ok(!scrolled.includes("proposal line 0 "), "scrolled view should no longer show the first line at the top");
 	assert.match(scrolled, /proposal line 10\b/);
@@ -52,25 +52,25 @@ await test("scrollOffset shifts which body lines are visible", () => {
 
 await test("overflow hint only appears when the section's body is taller than the visible body rows", () => {
 	const shortSection: OverlaySection[] = [{ id: "a", heading: "Short", status: "ok", bodyLines: ["one line"] }];
-	const noOverflow = renderSidebarLayout("Title", shortSection, 0, 0, 100, 20, identity, identity, identity).join("\n");
+	const noOverflow = renderSidebarLayout("Title", shortSection, 0, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity).join("\n");
 	assert.ok(!noOverflow.includes("PgUp/PgDn"));
 
-	const withOverflow = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, identity, identity, identity).join("\n");
+	const withOverflow = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity).join("\n");
 	assert.match(withOverflow, /PgUp\/PgDn to scroll/);
 });
 
 await test("every line fits within the requested width (no ragged/overflowing rows)", () => {
 	const width = 60;
-	const lines = renderSidebarLayout("A reasonably long review title that could overflow", sections(), 0, 0, width, 20, identity, identity, identity);
+	const lines = renderSidebarLayout("A reasonably long review title that could overflow", sections(), 0, 0, width, 20, "3/5 tasks ticked", identity, identity, identity);
 	for (const line of lines) {
 		assert.ok(line.length <= width + 2, `line too wide: "${line}" (${line.length} chars, width ${width})`);
 	}
 });
 
 await test("empty sections list does not throw and still renders a footer", () => {
-	const lines = renderSidebarLayout("Empty", [], 0, 0, 80, 20, identity, identity, identity);
+	const lines = renderSidebarLayout("Empty", [], 0, 0, 80, 20, "3/5 tasks ticked", identity, identity, identity);
 	assert.ok(lines.length > 0);
-	assert.ok(lines.at(-1)?.includes("Esc back to review"));
+	assert.ok(lines.at(-1)?.includes("Esc cancel"));
 });
 
 await test("sidebar drops a status that just repeats a count already baked into the heading", () => {
@@ -78,7 +78,7 @@ await test("sidebar drops a status that just repeats a count already baked into 
 		{ id: "specs", heading: "Specs (1)", status: "1 file(s)", bodyLines: [] },
 		{ id: "tasks", heading: "Tasks (0/30)", status: "0/30 ticked", bodyLines: [] },
 	];
-	const joined = renderSidebarLayout("Title", withCounts, 0, 0, 100, 20, identity, identity, identity).join("\n");
+	const joined = renderSidebarLayout("Title", withCounts, 0, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity).join("\n");
 	assert.match(joined, /Specs \(1\)/);
 	assert.ok(!joined.includes("(1) (1 file(s))"), "should not double-show the same count");
 	assert.match(joined, /Tasks \(0\/30\)/);
@@ -86,7 +86,7 @@ await test("sidebar drops a status that just repeats a count already baked into 
 });
 
 await test("sidebar keeps a status that adds real information (not just a repeated count)", () => {
-	const lines = renderSidebarLayout("Title", sections(), 0, 0, 100, 20, identity, identity, identity);
+	const lines = renderSidebarLayout("Title", sections(), 0, 0, 100, 20, "3/5 tasks ticked", identity, identity, identity);
 	const joined = lines.join("\n");
 	assert.match(joined, /Exploration \(done\)/);
 	assert.match(joined, /Proposal \(proposal\.md\)/);
@@ -94,7 +94,7 @@ await test("sidebar keeps a status that adds real information (not just a repeat
 
 await test("long titles and footer hints are ellipsized, not chopped off with no indicator", () => {
 	const longTitle = "Readyset review — Complete Embedded Signup Onboarding (System User, Phone Registration, WABA Sync, and a very long tail of extra detail that will not fit)";
-	const lines = renderSidebarLayout(longTitle, sections(), 1, 0, 60, 20, identity, identity, identity);
+	const lines = renderSidebarLayout(longTitle, sections(), 1, 0, 60, 20, "3/5 tasks ticked", identity, identity, identity);
 	assert.match(lines[0], /…$/, "truncated title should end with an ellipsis marker, not a hard cut");
 });
 
@@ -108,7 +108,7 @@ const fakeTheme = { fg: (_name: string, text: string) => text, bold: (text: stri
 const matchesEverything = { matches: () => true } as any;
 
 await test("PageUp/PageDown always scroll the body, even when keybindings.matches also says yes to tui.select.up/down for them", () => {
-	const overlay = new ReviewSidebarOverlay(fakeTheme, matchesEverything, "Title", sections(), () => {});
+	const overlay = new ReviewSidebarOverlay(fakeTheme, matchesEverything, "Title", sections(), "3/5 tasks ticked", () => {});
 	// Only the sidebar half of each row (left of the " │ " divider) — the body half is expected
 	// to change when scrolling, so comparing whole lines would conflate "selection moved" with
 	// "body content changed at the same row".
@@ -128,11 +128,45 @@ await test("PageUp/PageDown always scroll the body, even when keybindings.matche
 await test("cancel (Esc) still works even though PageUp/PageDown are checked first", () => {
 	let cancelled = false;
 	const cancelOnly = { matches: (_data: string, name: string) => name === "tui.select.cancel" } as any;
-	const overlay = new ReviewSidebarOverlay(fakeTheme, cancelOnly, "Title", sections(), () => {
+	const overlay = new ReviewSidebarOverlay(fakeTheme, cancelOnly, "Title", sections(), "3/5 tasks ticked", () => {
 		cancelled = true;
 	});
 	overlay.handleInput("\x1b");
 	assert.ok(cancelled, "Esc should still close the overlay");
+});
+
+await test("renders a CTA bar with Approve/Refine/Discard and the task summary, above the nav hint", () => {
+	const lines = renderSidebarLayout("Title", sections(), 0, 0, 100, 20, "7/9 tasks ticked", identity, identity, identity);
+	const ctaLine = lines.at(-2);
+	assert.ok(ctaLine?.includes("Approve & Execute"), "CTA bar should show Approve & Execute");
+	assert.ok(ctaLine?.includes("7/9 tasks ticked"), "CTA bar should include the live task summary");
+	assert.ok(ctaLine?.includes("Refine"), "CTA bar should show Refine");
+	assert.ok(ctaLine?.includes("Discard"), "CTA bar should show Discard");
+	assert.ok(lines.at(-1)?.includes("Esc cancel"), "nav hint stays on its own line below the CTA bar");
+});
+
+await test("A/R/D keystrokes act as the sidebar's own CTAs -- approve/refine/discard -- without going through a select() menu", () => {
+	const noKeybindings = { matches: () => false } as any;
+
+	let resultA: unknown;
+	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultA = r)).handleInput("a");
+	assert.equal(resultA, "approve");
+
+	let resultR: unknown;
+	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultR = r)).handleInput("R");
+	assert.equal(resultR, "refine");
+
+	let resultD: unknown;
+	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultD = r)).handleInput("D");
+	assert.equal(resultD, "discard");
+});
+
+await test("A/R/D CTAs still work with zero sections, even though section-nav keys are inert there", () => {
+	const noKeybindings = { matches: () => false } as any;
+	let result: unknown;
+	const overlay = new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", [], "0/0 tasks ticked", (r) => (result = r));
+	overlay.handleInput("a");
+	assert.equal(result, "approve", "Approve should fire even when there are no sections to browse");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

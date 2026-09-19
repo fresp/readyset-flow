@@ -79,7 +79,14 @@ export interface OverlaySection {
 	bodyLines: string[];
 }
 
-export type ReviewOverlayResult = undefined;
+/**
+ * "approve"/"refine"/"discard" when the user picks one of the CTAs baked into the sidebar
+ * footer (see `handleInput` below); `undefined` when they cancel with Esc instead -- the
+ * caller (`reviewAndMaybeExecute` in readyset-review.ts) treats a cancel exactly like an
+ * explicit "discard" (both just leave the change as proposed and return), so this is a
+ * distinction the overlay preserves for clarity/logging, not one the gate logic depends on.
+ */
+export type ReviewOverlayResult = "approve" | "refine" | "discard" | undefined;
 
 const MIN_SIDEBAR_WIDTH = 22;
 const MAX_SIDEBAR_WIDTH = 36;
@@ -121,6 +128,7 @@ export function renderSidebarLayout(
 	scrollOffset: number,
 	width: number,
 	height: number,
+	taskSummary: string,
 	fg: (text: string) => string,
 	bold: (text: string) => string,
 	dim: (text: string) => string,
@@ -128,7 +136,7 @@ export function renderSidebarLayout(
 	const innerWidth = Math.max(20, width);
 	const sidebarWidth = Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, Math.floor(innerWidth * 0.3)));
 	const bodyWidth = Math.max(10, innerWidth - sidebarWidth - 3); // 3 = " │ "
-	const bodyRows = Math.max(3, height - 4); // minus title, header rule, footer, footer rule
+	const bodyRows = Math.max(3, height - 5); // minus title, header rule, footer rule, CTA bar, nav hint
 
 	const lines: string[] = [];
 	lines.push(bold(fitLine(` ${title}`, innerWidth)));
@@ -149,8 +157,14 @@ export function renderSidebarLayout(
 	}
 
 	lines.push(fg("─".repeat(innerWidth)));
+	// The CTA bar: this overlay IS the review gate now (opened automatically as soon as the
+	// artifacts are ready -- see readyset-review.ts's reviewAndMaybeExecute), not an optional
+	// read-only "Sidebar view" a separate ctx.ui.select() menu offered alongside Approve/Refine/
+	// Discard. So those three actions live here as CTAs instead, bold/undimmed to read as the
+	// primary controls; the quieter nav hint stays dim below it.
+	lines.push(bold(fitLine(` [A] Approve & Execute — ${taskSummary}   [R] Refine   [D] Discard`, innerWidth)));
 	const scrollHint = bodyOverflow > 0 ? ` · PgUp/PgDn to scroll (${scrollOffset}/${section?.bodyLines.length ?? 0})` : "";
-	lines.push(dim(fitLine(` ↑/↓ section${scrollHint} · Esc back to review`, innerWidth)));
+	lines.push(dim(fitLine(` ↑/↓ section${scrollHint} · Esc cancel`, innerWidth)));
 
 	return lines;
 }
@@ -197,15 +211,24 @@ export class ReviewSidebarOverlay implements Component {
 	#keybindings: KeybindingsManager;
 	#title: string;
 	#sections: OverlaySection[];
+	#taskSummary: string;
 	#done: (result: ReviewOverlayResult) => void;
 	#selectedIndex = 0;
 	#scrollOffset = 0;
 
-	constructor(theme: Theme, keybindings: KeybindingsManager, title: string, sections: OverlaySection[], done: (result: ReviewOverlayResult) => void) {
+	constructor(
+		theme: Theme,
+		keybindings: KeybindingsManager,
+		title: string,
+		sections: OverlaySection[],
+		taskSummary: string,
+		done: (result: ReviewOverlayResult) => void,
+	) {
 		this.#theme = theme;
 		this.#keybindings = keybindings;
 		this.#title = title;
 		this.#sections = sections;
+		this.#taskSummary = taskSummary;
 		this.#done = done;
 	}
 
@@ -237,6 +260,25 @@ export class ReviewSidebarOverlay implements Component {
 			this.#done(undefined);
 			return;
 		}
+
+		// CTAs -- Approve & Execute / Refine / Discard live in the sidebar itself now (see the
+		// module doc comment and `ReviewOverlayResult`), so they're plain keystrokes rather than
+		// a separate ctx.ui.select() menu shown after this overlay closes. Checked before the
+		// section-nav early return below so they still work even with zero sections -- a change
+		// with no renderable sections shouldn't make Approve/Discard unreachable.
+		if (data === "a" || data === "A") {
+			this.#done("approve");
+			return;
+		}
+		if (data === "r" || data === "R") {
+			this.#done("refine");
+			return;
+		}
+		if (data === "d" || data === "D") {
+			this.#done("discard");
+			return;
+		}
+
 		if (this.#sections.length === 0) return;
 
 		if (this.#keybindings.matches(data, "tui.select.up")) {
@@ -260,6 +302,7 @@ export class ReviewSidebarOverlay implements Component {
 			this.#scrollOffset,
 			width,
 			height,
+			this.#taskSummary,
 			(text: string) => this.#theme.fg("accent", text),
 			(text: string) => this.#theme.bold(text),
 			(text: string) => this.#theme.fg("dim", text),
