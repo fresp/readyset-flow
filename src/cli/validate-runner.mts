@@ -1,9 +1,9 @@
 /**
- * A tiny, separate entry point for `readyset-review validate` — invoked as a child process by
+ * A tiny, separate entry point for `readyset-flow validate` — invoked as a child process by
  * `install.mjs` with `--experimental-strip-types`, never imported directly.
  *
  * `install.mjs` itself is careful to stay plain `.mjs` with no TypeScript imports, on purpose:
- * `readyset-review install`/`version` only need to exist on whatever Node the user has
+ * `readyset-flow install`/`version` only need to exist on whatever Node the user has
  * (`package.json`'s `engines` says `>=18`), and importing a `.ts` file from plain `.mjs` needs
  * `--experimental-strip-types` (Node 22.6+) or a build step this package deliberately has
  * neither of. `validate` is the one CLI command that genuinely needs to run `readyset-spec.ts`'s

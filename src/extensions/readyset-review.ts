@@ -40,7 +40,7 @@ interface OverlayKeybindings {
 }
 
 /**
- * /readyset-review — Readyset's core command: propose, review, and execute a brainstorm
+ * /readyset — Readyset's core command: propose, review, and execute a brainstorm
  * against real repo state, standing entirely on its own.
  *
  * "Readyset" names what this fuses from three sources, each enforced structurally below (not
@@ -238,13 +238,13 @@ function codeReviewTurnPrompt(changeId: string): string {
  * getting real replies across ordinary chat turns. There is nothing for extension code to
  * synchronously wait on: `startGrilling` below fires this prompt and returns immediately; the
  * rest of the back-and-forth happens as normal chat turns the user answers directly, ending
- * once the model writes the brainstorm file itself and the user re-invokes /readyset-review to
+ * once the model writes the brainstorm file itself and the user re-invokes /readyset to
  * pick it up.
  *
  * The file this writes must match `loadBrainstorms()`/`parseBranch()`'s expected shape exactly
  * (same frontmatter keys, a "- Branch: <type>/<slug>" line under Git Workflow) so once written
  * it is indistinguishable from a brainstorm the separate upstream `brainstorm-ai` skill
- * produced — /readyset-review's own picker, and reconcileStatuses, treat either identically.
+ * produced — /readyset's own picker, and reconcileStatuses, treat either identically.
  *
  * Round cap is prompt-level only, deliberately — there is no `TurnBudget`-style hard stop on
  * grilling the way there is on Explore/Propose/Apply/Refine/Code-review, because those are each
@@ -323,7 +323,7 @@ function grillTurnPrompt(ideaText: string, today: string): string {
 		"## Git Workflow\n- Branch: <type>/<slug>\n- Inference reason: <one line>\n" +
 		"- Lane: <full | fast> — <one line>\n- Per-task flow: <\"commit only\" | \"commit + merge request per task\">\n" +
 		"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +
-		"Once the file is written, tell the user its path and that running /readyset-review again picks it up " +
+		"Once the file is written, tell the user its path and that running /readyset again picks it up " +
 		"from here (Explore, then Propose) — do not fire off Explore or Propose yourself in this turn."
 	);
 }
@@ -447,7 +447,7 @@ async function withPinnedModel<T>(
 		}
 	}
 
-	ctx.ui.notify(`Pinned model "${activeSpec}" (from ${activeSource}) for this /readyset-review run.`, "info");
+	ctx.ui.notify(`Pinned model "${activeSpec}" (from ${activeSource}) for this /readyset run.`, "info");
 
 	try {
 		return await fn();
@@ -506,7 +506,7 @@ function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string): void
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
 	ctx.ui.notify(
 		`Grilling started for: "${preview}" — Readyset will ask questions right here in the chat; answer them, ` +
-			"and it'll write the brainstorm file once the design is genuinely resolved. Run /readyset-review " +
+			"and it'll write the brainstorm file once the design is genuinely resolved. Run /readyset " +
 			"again afterward to pick it up from there.",
 		"info",
 	);
@@ -521,7 +521,7 @@ const MAX_VERIFICATION_SENDBACKS = 2;
  * several of them sit inside loops a user could drive indefinitely (repeated Refine, repeated
  * "Send back for verification"). This is a hard per-invocation ceiling on total turns fired —
  * a guardrail against an unbounded loop burning cost with no natural stopping point, not a
- * precise cost estimate. It resets on every `/readyset-review` invocation; there is no
+ * precise cost estimate. It resets on every `/readyset` invocation; there is no
  * cross-session budget store yet, so a determined user can still re-run the command for a
  * fresh budget — this catches an accidental loop, not a deliberate one.
  */
@@ -539,8 +539,8 @@ function createTurnBudget(max: number = MAX_TURNS_PER_RUN): TurnBudget {
 async function spendTurn(pi: ExtensionAPI, ctx: ReviewCtx, budget: TurnBudget, label: string, prompt: string): Promise<boolean> {
 	if (budget.spent >= budget.max) {
 		ctx.ui.notify(
-			`Turn budget (${budget.max} agent turns) reached for this /readyset-review run — stopping before ${label} to avoid an ` +
-				"unbounded loop. Check readyset/changes/<id>/CONTEXT.md for what ran, then re-run /readyset-review to continue with a fresh budget.",
+			`Turn budget (${budget.max} agent turns) reached for this /readyset run — stopping before ${label} to avoid an ` +
+				"unbounded loop. Check readyset/changes/<id>/CONTEXT.md for what ran, then re-run /readyset to continue with a fresh budget.",
 			"warning",
 		);
 		return false;
@@ -924,7 +924,7 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			`Code review done for "${chosen.changeId}"${reviewContent ? " — see readyset/changes/" + chosen.changeId + "/REVIEW.md" : ""}. Archive now?`,
 			[
 				{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
-				{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset-review" },
+				{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
 				{ label: "Not yet", description: "leave it in readyset/changes/ for now" },
 			],
 		);
@@ -941,7 +941,7 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerCommand("readyset-review", {
+	pi.registerCommand("readyset", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +
 			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --model <spec> to pin a model " +
@@ -981,7 +981,7 @@ export default function (pi: ExtensionAPI) {
 			if (items.length === 0) {
 				ctx.ui.notify(
 					`No full-lane brainstorms found in ${BRAINSTORM_DIR}/ (--fast includes fast-lane, --all includes archived)` +
-						(canGrillFromScratch ? ` -- or run /readyset-review --idea "<your raw idea>" to grill a new one into existence.` : ""),
+						(canGrillFromScratch ? ` -- or run /readyset --idea "<your raw idea>" to grill a new one into existence.` : ""),
 					"warning",
 				);
 				return;
@@ -1074,11 +1074,11 @@ export default function (pi: ExtensionAPI) {
 						`${contentCheck.summary}: ${gapList}.`,
 						[
 							{ label: "Continue anyway", description: "proceed to Explore/Propose despite the gaps above" },
-							{ label: "Go back", description: "cancel -- fill in (or keep grilling) the brainstorm first, then run /readyset-review again" },
+							{ label: "Go back", description: "cancel -- fill in (or keep grilling) the brainstorm first, then run /readyset again" },
 						],
 					);
 					if (proceed !== "Continue anyway") {
-						ctx.ui.notify(`Stopped before Explore -- resolve the gaps in "${chosen.title}" and run /readyset-review again.`, "info");
+						ctx.ui.notify(`Stopped before Explore -- resolve the gaps in "${chosen.title}" and run /readyset again.`, "info");
 						return;
 					}
 				}
@@ -1125,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
 				if (!after || !isProposed(after.status) || !wroteProposal) {
 					ctx.ui.notify(
 						`Propose for "${chosen.changeId}" doesn't look finished (readyset/changes/${chosen.changeId}/proposal.md ` +
-							"not found or empty) — check the transcript above for errors, then run /readyset-review again.",
+							"not found or empty) — check the transcript above for errors, then run /readyset again.",
 						"warning",
 					);
 					return;

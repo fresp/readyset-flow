@@ -1,5 +1,5 @@
 /**
- * End-to-end test for `readyset-review validate` -- deliberately runs `install.mjs` as a real
+ * End-to-end test for `readyset-flow validate` -- deliberately runs `install.mjs` as a real
  * child process (not imported and called in-process) rather than a unit test, because the
  * thing actually being verified is the subprocess boundary itself: install.mjs staying
  * flag-free while spawning validate-runner.mts with `--experimental-strip-types`, and the
@@ -41,7 +41,7 @@ async function freshCwd(): Promise<string> {
 	return await mkdtemp(join(tmpdir(), "readyset-cli-"));
 }
 
-await test("readyset-review validate: passes (exit 0) for a structurally valid change", async () => {
+await test("readyset-flow validate: passes (exit 0) for a structurally valid change", async () => {
 	const cwd = await freshCwd();
 	const dir = join(cwd, "readyset", "changes", "good-cli-change");
 	await mkdir(join(dir, "specs", "cap"), { recursive: true });
@@ -58,7 +58,7 @@ await test("readyset-review validate: passes (exit 0) for a structurally valid c
 	assert.match(result.stdout, /validate: pass/);
 });
 
-await test("readyset-review validate: fails (exit 1) and lists issues for a broken change", async () => {
+await test("readyset-flow validate: fails (exit 1) and lists issues for a broken change", async () => {
 	const cwd = await freshCwd();
 	const dir = join(cwd, "readyset", "changes", "bad-cli-change");
 	await mkdir(join(dir, "specs", "cap"), { recursive: true });
@@ -74,14 +74,14 @@ await test("readyset-review validate: fails (exit 1) and lists issues for a brok
 	assert.match(result.stdout, /- tasks\.md: no checkbox items found/);
 });
 
-await test("readyset-review validate: missing change-id prints usage and exits 1, doesn't crash", async () => {
+await test("readyset-flow validate: missing change-id prints usage and exits 1, doesn't crash", async () => {
 	const cwd = await freshCwd();
 	const result = runValidateCli(undefined, cwd);
 	assert.equal(result.status, 1);
-	assert.match(result.stderr, /Usage: readyset-review validate/);
+	assert.match(result.stderr, /Usage: readyset-flow validate/);
 });
 
-await test("readyset-review validate: a change that doesn't exist reports as missing artifacts, not a crash", async () => {
+await test("readyset-flow validate: a change that doesn't exist reports as missing artifacts, not a crash", async () => {
 	const cwd = await freshCwd();
 	const result = runValidateCli("does-not-exist", cwd);
 	assert.equal(result.status, 1);

@@ -3,8 +3,8 @@
  * Readyset's install CLI.
  *
  * Usage:
- *   npx readyset-review install
- *   npx readyset-review install --target /path/to/.omp   (defaults to ~/.omp)
+ *   npx readyset-flow install
+ *   npx readyset-flow install --target /path/to/.omp   (defaults to ~/.omp)
  *
  * Readyset installs GLOBALLY, into the user's own omp home directory (`~/.omp`), not into a
  * per-project repo. It's a personal workflow extension — like the other extensions already
@@ -17,7 +17,7 @@
  * Deliberately NOT wired to npm's `postinstall` lifecycle. postinstall runs with cwd set to
  * this package's own directory inside node_modules, not `~/.omp` — using it would mean an
  * install nobody explicitly asked for, writing outside node_modules. An explicit
- * `readyset-review install` command (the same pattern tools like husky use) is predictable: it
+ * `readyset-flow install` command (the same pattern tools like husky use) is predictable: it
  * only touches files when you run it.
  *
  * What it does: REFERENCES this package's own `.ts` source in place -- it does not copy it.
@@ -33,7 +33,7 @@
  * that's ordinary Node module resolution, unaffected by how omp found the entry file. So every
  * other `.ts` file in this package (`src/lib/**`) needs no install step at all: it's read
  * straight out of wherever this package itself lives (a git clone, or `node_modules/readyset-
- * review/` after `npm install`), and picking up an update is just updating the package -- no
+ * flow/` after `npm install`), and picking up an update is just updating the package -- no
  * re-run needed, since nothing was copied to go stale.
  *
  * The one thing this still copies is `src/skill/SKILL.md` -- a reference doc, not a runtime
@@ -42,7 +42,7 @@
  * referencing it in place isn't an option the way it is for the extension module. Being a
  * doc with no import graph of its own, a stale copy after an update is a much smaller problem
  * than a stale copy of runtime code would have been -- and `install` still re-copies it every
- * run, so `readyset-review install` after a version bump keeps it current either way.
+ * run, so `readyset-flow install` after a version bump keeps it current either way.
  *
  * Earlier versions of this installer copied every `.ts` file into `<target>/agent/lib/` and
  * `<target>/agent/extensions/`. That meant re-running `install` after every code change just to
@@ -143,10 +143,10 @@ async function install(targetRoot) {
 	void settingsPath;
 
 	console.log(`\nReadyset: installed into ${targetRoot} (extension referenced in place, not copied)`);
-	console.log("Run `/readyset-review` in omp (in any repo) to use it.");
+	console.log("Run `/readyset` in omp (in any repo) to use it.");
 	console.log(
 		"The extension module is read straight from this package, so code updates need no re-install -- " +
-			"only re-run `readyset-review install` after moving the package itself, or to refresh the skill doc.",
+			"only re-run `readyset-flow install` after moving the package itself, or to refresh the skill doc.",
 	);
 }
 
@@ -172,7 +172,7 @@ function parseArgs(argv) {
 }
 
 /**
- * `readyset-review validate <change-id> [--cwd <path>]` — the same structural check the omp
+ * `readyset-flow validate <change-id> [--cwd <path>]` — the same structural check the omp
  * gate runs before every "Approve & Execute"/Refine/Sidebar view, exposed here so it can run
  * outside an omp session (CI, a pre-commit hook, a plain terminal) without needing omp
  * installed at all. Runs `validate-runner.mts` (which does the real `validateChange` call) as
@@ -180,12 +180,12 @@ function parseArgs(argv) {
  * (see the module doc comment and `validate-runner.mts`'s own for why).
  *
  * Exit code mirrors `validateChange`'s `ok`: 0 = pass, 1 = structural issues found -- so this
- * composes directly into a CI step (`readyset-review validate my-change || exit 1`) or a
+ * composes directly into a CI step (`readyset-flow validate my-change || exit 1`) or a
  * pre-commit hook without any extra parsing.
  */
 async function validate(changeId, targetCwd) {
 	if (!changeId) {
-		console.error("Usage: readyset-review validate <change-id> [--cwd <path>]");
+		console.error("Usage: readyset-flow validate <change-id> [--cwd <path>]");
 		process.exitCode = 1;
 		return;
 	}
@@ -197,7 +197,7 @@ async function validate(changeId, targetCwd) {
 	if (result.error) {
 		console.error(`Couldn't run the validator: ${result.error.message}`);
 		console.error(
-			"`readyset-review validate` needs Node 22.6+ (it runs readyset-spec.ts's real check via " +
+			"`readyset-flow validate` needs Node 22.6+ (it runs readyset-spec.ts's real check via " +
 				"--experimental-strip-types, the same way this package's own test suite does) -- " +
 				"`install`/`version` have no such requirement.",
 		);
@@ -248,12 +248,12 @@ async function main() {
 
 	console.log("Readyset CLI\n");
 	console.log("Usage:");
-	console.log("  readyset-review install [--target <path>]        Reference this package's extension in <target>/agent/settings.json");
+	console.log("  readyset-flow install [--target <path>]        Reference this package's extension in <target>/agent/settings.json");
 	console.log("                                                    (defaults to ~/.omp) and refresh the installed skill doc");
-	console.log("  readyset-review validate <change-id> [--cwd <path>]");
+	console.log("  readyset-flow validate <change-id> [--cwd <path>]");
 	console.log("                                                    Run the same structural check the omp gate runs, outside omp");
 	console.log("                                                    (CI, pre-commit) -- exit code 0 on pass, 1 on issues found");
-	console.log("  readyset-review version                          Print the installed Readyset package version");
+	console.log("  readyset-flow version                          Print the installed Readyset package version");
 	process.exitCode = args.command ? 1 : 0;
 }
 

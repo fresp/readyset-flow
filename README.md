@@ -37,8 +37,8 @@ request; a gate is a requirement.
 ## Install
 
 ```
-npm install --save-dev readyset-review
-npx readyset-review install
+npm install --save-dev readyset-flow
+npx readyset-flow install
 ```
 
 Readyset installs **globally**, tied to `~/.omp/` — not into any one repo. It's a personal
@@ -70,7 +70,7 @@ Pass `--target <path>` to install somewhere else instead — a scratch directory
 installer just doesn't default to it).
 
 Since nothing runtime is copied, code changes need no re-install to take effect. Re-run
-`npx readyset-review install` only after moving the package itself (the settings.json entry
+`npx readyset-flow install` only after moving the package itself (the settings.json entry
 would otherwise point at a path that no longer exists) or to refresh the installed skill doc.
 If you have leftover files from an older, copy-based version of this installer under
 `~/.omp/agent/lib/readyset-*.ts` / `~/.omp/agent/extensions/readyset-review.ts`, they're inert
@@ -79,7 +79,7 @@ once `settings.json` points at the package directly — safe to delete by hand.
 ## Validate from the CLI
 
 ```
-readyset-review validate <change-id> [--cwd <path>]
+readyset-flow validate <change-id> [--cwd <path>]
 ```
 
 Runs the exact same structural check (`validateChange`) the omp gate runs before every Approve &
@@ -87,7 +87,7 @@ Execute / Refine / Sidebar view — but from a plain terminal, no omp session ne
 `0` on pass, `1` on structural issues found, so it composes directly into CI or a pre-commit hook:
 
 ```
-readyset-review validate complete-embedded-signup-onboarding || exit 1
+readyset-flow validate complete-embedded-signup-onboarding || exit 1
 ```
 
 `install`/`version` only need whatever Node the `engines` field promises (`>=18`) — `install.mjs`
@@ -103,9 +103,9 @@ has. If that subprocess can't start, `validate` says so plainly rather than fail
 With Readyset installed, run:
 
 ```
-/readyset-review
-/readyset-review --idea "let users export their data as CSV"   # grill a new brainstorm from a raw idea
-/readyset-review --model anthropic/claude-opus-5   # pin a model for this run's turns (optional)
+/readyset
+/readyset --idea "let users export their data as CSV"   # grill a new brainstorm from a raw idea
+/readyset --model anthropic/claude-opus-5   # pin a model for this run's turns (optional)
 ```
 
 A brainstorm under `.ai/brainstorms/` is no longer a hard prerequisite. `--idea <text>` (or
@@ -131,9 +131,9 @@ search (or the repo) could actually answer doesn't belong in a round as an open 
 silent assumption — open questions are reserved for what only the user can decide or knows.
 
 Grilling itself is an ordinary back-and-forth in the chat, not something
-`/readyset-review`'s own code can wait on synchronously — it fires the opening question and
+`/readyset`'s own code can wait on synchronously — it fires the opening question and
 returns; you answer normally, round by round, until the model writes the brainstorm file and
-tells you to run `/readyset-review` again to pick it up (Explore, then Propose). If you'd rather
+tells you to run `/readyset` again to pick it up (Explore, then Propose). If you'd rather
 hand-write or dictate the brainstorm to a separate tool first, that path still works exactly as
 before.
 
@@ -154,7 +154,7 @@ modelRoles:         # omp's own general default (confirmed against omp's docs), 
   default: spark/minimax-m3            # fallback if readyset.model isn't set
 ```
 
-`readyset.model` wins if both are set — it lets you pin a model for `/readyset-review` specifically
+`readyset.model` wins if both are set — it lets you pin a model for `/readyset` specifically
 without changing what everything else in omp defaults to. If neither is set, Readyset just runs
 with whatever model the session already has (no pinning at all).
 
@@ -171,7 +171,7 @@ or not, and this package doesn't try to duplicate it.
 Every run also has a hard turn budget (10 agent turns by default) — a guardrail against an
 unbounded Refine or verification-retry loop burning cost with no natural stopping point, not a
 precise cost estimate. The review panel shows `agent turns this run: N/10`; hitting the ceiling
-stops the run with a warning rather than firing another turn, and `/readyset-review` can simply be
+stops the run with a warning rather than firing another turn, and `/readyset` can simply be
 re-run for a fresh budget.
 
 It picks a brainstorm, and depending on its status:
@@ -207,7 +207,7 @@ It picks a brainstorm, and depending on its status:
   semantically wrong one. A "validate: pass" in the review panel is not a claim the plan is
   correct, only that every requirement is structurally complete — which is why its summary text
   always carries the literal suffix `(structural check)`, everywhere it's shown (review panel,
-  the gate prompt, `readyset-review validate`'s CLI output). `validateBrainstormContent`
+  the gate prompt, `readyset-flow validate`'s CLI output). `validateBrainstormContent`
   (checked before Explore ever runs — see below) uses the exact same wording for the exact same
   reason: neither check should read as a stronger guarantee than it actually gives just because
   of how it happens to be phrased — enforced by construction now, via a shared
@@ -273,7 +273,7 @@ src/
     readyset-structural-check.ts  the shared "(structural check)" summary wording validateChange
                              and validateBrainstormContent both use
   extensions/
-    readyset-review.ts      the /readyset-review command itself
+    readyset-review.ts      the /readyset command itself
   skill/
     SKILL.md                reference doc for the phase order + file formats; read by an agent
                              working a Readyset change directly, not loaded by the extension —
@@ -283,11 +283,11 @@ src/
                              kept here to check wording against rather than a paraphrase of a
                              paraphrase. Repo-internal reference only, not installed.
   cli/
-    install.mjs            `readyset-review install`/`version`/`validate` — the CLI entry point
+    install.mjs            `readyset-flow install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
 ```
 
-What `readyset-review install` actually touches on disk (default target `~/.omp`):
+What `readyset-flow install` actually touches on disk (default target `~/.omp`):
 
 ```
 ~/.omp/agent/
@@ -297,7 +297,7 @@ What `readyset-review install` actually touches on disk (default target `~/.omp`
 ```
 
 Everything under `src/lib/` and `src/extensions/` stays exactly where the package itself lives
-(a git clone, or `node_modules/readyset-review/` after `npm install`) and is read from there —
+(a git clone, or `node_modules/readyset-flow/` after `npm install`) and is read from there —
 confirmed against omp's own native discovery provider (`loadExtensionModules`), which resolves a
 `settings.json` `"extensions"` array entry that points at a file, not a directory, and loads it
 in place; not a guess. Skills have no such array in omp (only a fixed

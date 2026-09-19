@@ -1,13 +1,13 @@
 ---
 name: readyset
-description: Use when working with Readyset changes (readyset/changes/<id>/) — writing or reading EXPLORATION.md, proposal.md, design.md, specs/**/spec.md, tasks.md, CONTEXT.md, or REVIEW.md, whether inside /readyset-review or in a manual turn (e.g. "check readyset/changes/foo", "why did the propose turn skip X").
+description: Use when working with Readyset changes (readyset/changes/<id>/) — writing or reading EXPLORATION.md, proposal.md, design.md, specs/**/spec.md, tasks.md, CONTEXT.md, or REVIEW.md, whether inside /readyset or in a manual turn (e.g. "check readyset/changes/foo", "why did the propose turn skip X").
 ---
 
 # Readyset
 
 Readyset turns a brainstorm into a grounded, reviewable, executable change under
 `readyset/changes/<id>/`. This skill is the reference for the file formats and phase
-discipline `/readyset-review` enforces in code — read it whenever you're working with a Readyset
+discipline `/readyset` enforces in code — read it whenever you're working with a Readyset
 change directly (reading one to answer a question, hand-editing an artifact, or picking up a
 change that got interrupted mid-phase) rather than only through the command's own triggered
 turns.
@@ -106,7 +106,7 @@ why rather than leaving the box unexplained:
 
 A checked box with no `_Verified:` note under it means the task was marked done without
 anything that actually checked it — `checkTaskVerification()` in `readyset-spec.ts` counts
-these, and the review gate in `/readyset-review` will stop and offer to send the change back
+these, and the review gate in `/readyset` will stop and offer to send the change back
 for another pass if any are missing. Don't check a box you haven't verified just to look
 further along.
 
