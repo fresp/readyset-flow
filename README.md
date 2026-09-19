@@ -6,16 +6,14 @@
   <a href="#install"><b>Install</b></a> ·
   <a href="#use"><b>Use</b></a> ·
   <a href="#how-it-works"><b>How it works</b></a> ·
-  <a href="#configure-a-model"><b>Configure a model</b></a> ·
+  <a href="#grilling-from-outside-omp"><b>Brainstorm outside omp</b></a> ·
   <a href="#what-it-deliberately-does-not-do"><b>Limitations</b></a>
 </p>
 
 Readyset is a standalone [omp](https://github.com/oh-my-pi) extension, invoked as `/readyset`.
 It turns a rough idea — or a brainstorm already sitting in `.ai/brainstorms/*.md` — into a
-grounded, reviewable, executable change under its own `readyset/changes/<id>/` directory. It
-doesn't depend on omp's native `/plan`, or any external spec-driven-development CLI, at runtime.
-The proposal/design/spec/tasks split is a well-established shape, but Readyset's directory
-layout, file format, and validation are its own.
+grounded, reviewable, executable change under its own `readyset/changes/<id>/` directory, with no
+runtime dependency on omp's native `/plan` or any external spec-driven-development CLI.
 
 **In one sentence:** `/readyset` asks the questions a plan needs answered *before* it writes
 anything (grilling), grounds what it writes in the real repo instead of assumptions (Explore),
@@ -23,25 +21,10 @@ and won't let you execute a change that's structurally incomplete or skipped rev
 those is a code-enforced gate, not a prompt asking nicely.
 
 ```text
-Rough idea
-    │
-    ▼
-  GRILL ──────── resolve ambiguity
-    │
-    ▼
- EXPLORE ─────── ground in the real repository
-    │
-    ▼
- PROPOSE ─────── write change artifacts
-    │
-    ▼
- REVIEW ──────── human approval / refine / discard
-    │
-    ▼
- EXECUTE ─────── implement + capture evidence + code review
-    │
-    ▼
- ARCHIVE ─────── preserve the change
+Rough idea → GRILL → EXPLORE → PROPOSE → REVIEW → EXECUTE → ARCHIVE
+             resolve   ground in  write     human    implement +   preserve
+             ambiguity the repo   artifacts approve   evidence +    the change
+                                            /refine   code review
 ```
 
 ## Table of contents
@@ -64,87 +47,68 @@ Rough idea
 
 ## Why "Readyset"
 
-The name is the point: a plan you can trust is one anchored to the real state of the repo — real
-file contents, real commit hashes, real test runs — not assumptions. Readyset fuses three
-sources, each filling a gap the others leave:
+The name is the point: a plan you can trust is anchored to the real state of the repo — real file
+contents, real commit hashes, real test runs — not assumptions. Readyset fuses three sources:
 
 - **omp `/plan`'s grounding discipline** — cite real files/line numbers/commit hashes, catch
-  actual drift (a stale config default, a submodule pinned to the wrong commit), leave behind a
-  procedure an engineer can literally run. The harshest habit of the three, and the easiest for a
-  model to skip under pressure — so it's enforced by a dedicated **Explore** phase, not just a
-  prompt.
+  actual drift. The harshest habit of the three, and the easiest to skip under pressure — so it's
+  a dedicated **Explore** phase, not just a prompt.
 - **The structured-spec workflow** popularized by spec-driven-development tooling — a
   proposal/design/spec/tasks split, requirements as WHEN/THEN scenarios, open questions carried
-  forward rather than silently resolved, and a review gate between "written" and "executing".
-- **mattpocock/skills' prompting hygiene** — interrogate ambiguity before writing anything down,
-  never mark work done without something that actually verifies it, review a diff critically in a
-  separate pass rather than trusting the turn that wrote it. Enforced by the **`_Verified:` note
-  requirement** and a separate **code-review** phase.
+  forward, a review gate between "written" and "executing".
+- **mattpocock/skills' prompting hygiene** — interrogate ambiguity before writing, never mark work
+  done without verification, review a diff separately from the turn that wrote it. Enforced by
+  the **`_Verified:` note requirement** and a separate **code-review** phase.
 
-Each is a structural gate — a phase that has to run, a machine-checkable condition that has to
-hold — not just prose in a prompt. Prose already proved insufficient once: an earlier propose
-turn was told to check `.gitmodules` and still silently dropped a submodule. Prose is a request;
-a gate is a requirement.
+Each is a structural gate, not prose in a prompt — prose already proved insufficient once: an
+earlier propose turn was told to check `.gitmodules` and still silently dropped a submodule.
+Prose is a request; a gate is a requirement.
 
 ## What Readyset adds to omp
-
-Readyset doesn't replace anything omp already does — it adds a workflow discipline around it:
 
 | Without a dedicated workflow | With Readyset |
 |---|---|
 | An idea can jump straight into implementation | Idea passes through Grill → Explore → Propose → Review → Execute |
-| Repo grounding depends on whatever the current turn happens to check | Explore is a dedicated phase, logged to `EXPLORATION.md` |
+| Repo grounding depends on whatever the current turn checks | Explore is a dedicated phase, logged to `EXPLORATION.md` |
 | Planning artifacts scatter across a chat | Each change gets its own `readyset/changes/<id>/` directory |
-| Review can be informal, or skipped under time pressure | A review gate structurally separates proposal from execution |
-| "Done" is whatever the model claims | Verification is a required `_Verified:` note, optionally backed by captured runtime evidence |
-| Implementation and review happen in the same context | A fresh-context code-review pass runs after execution |
-| Change history is hard to reconstruct later | Proposal, design, specs, tasks, exploration, review, and evidence all accumulate as files |
+| Review can be informal, or skipped under pressure | A review gate structurally separates proposal from execution |
+| "Done" is whatever the model claims | A required `_Verified:` note, optionally backed by captured runtime evidence |
+| Implementation and review share the same context | A fresh-context code-review pass runs after execution |
+| Change history is hard to reconstruct | Proposal, design, specs, tasks, exploration, review, and evidence accumulate as files |
 
 ## Design philosophy
 
-Four rules that shape which features Readyset gets, and how they're built:
-
 - **Finding facts is your job, never the user's.** A question the repo or a web search could
-  answer doesn't belong to the user as an open question, and it doesn't belong in a brainstorm as
-  a silent assumption either. This came from a real failure: an early grilling run left a
-  checkable fact (a WhatsApp Business Platform tier requirement) as an open question instead of
-  looking it up, even with a search tool available. Grilling's prompt now says so explicitly —
+  answer doesn't belong as an open question, or a silent assumption. An early grilling run left a
+  lookupable fact (a WhatsApp Business Platform tier requirement) as an open question instead —
   see [Grilling](#grilling--turning-an-idea-into-a-brainstorm).
-- **Runtime evidence is not proof of correctness.** `readyset_verify` runs a command and records
-  exactly what happened — exit code, stdout/stderr, whether it timed out. `exitCode: 0` means
-  "the command ran and exited clean," never "the requirement is satisfied" — judging that stays
-  the separate code-review turn's job. Blurring this would let a model self-certify by running
-  something trivially true (`echo ok`) and pointing at the green exit code, so the two are kept
-  structurally apart: `readyset_verify` never marks a task done and never touches `_Verified:`.
+- **Runtime evidence is not proof of correctness.** `readyset_verify` records what a command did
+  — exit code, stdout/stderr, timeout — nothing more. `exitCode: 0` means the command ran clean,
+  never that the requirement is satisfied; that judgment stays the code-review turn's. It never
+  marks a task done or touches `_Verified:`.
 - **Smallest useful primitive, not the cleanest architecture.** Evidence Capture could have
-  shipped bigger — structured review findings, an explicit state machine, a `ReadysetChange`
-  domain object. All deferred. What shipped is one tool that runs a command and writes down what
-  happened, wired into the review panel just enough to be visible: the smallest thing that's
-  actually observable, with regression tests around it, so the next iteration is informed by real
-  usage instead of a guess.
+  shipped with structured findings, a state machine, a `ReadysetChange` domain object — all
+  deferred. What shipped is one tool, observable, with tests, so the next iteration is informed by
+  real usage rather than a guess.
 - **Trust and blast-radius beat cleanliness when they conflict.** The archive step still merges
-  delta specs append-only, not a real diff-merge, because "never silently deletes or rewrites a
-  requirement" matters more than "the archive is a proper merge" — it just now also discloses
-  when that merge couldn't apply a MODIFIED/REMOVED requirement, instead of dropping it quietly.
-  Same logic elsewhere: `_Verified:` notes are a human-readable self-report, not a schema, and the
-  review gate would rather over-trust a well-formed note than force a rigid format.
+  delta specs append-only, not a real diff-merge, because never silently rewriting a requirement
+  matters more than a tidy merge — it just now discloses what it couldn't apply, instead of
+  dropping it quietly.
 
 ## How it works
 
-A `/readyset` change moves through five stages. You only ever see the ones that still apply —
-running `/readyset` again on an already-proposed change skips straight to review.
+A `/readyset` change moves through five stages — you only see the ones that still apply.
 
 | Stage | What happens | Who can skip it |
 |---|---|---|
-| **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity in a structured Q&A picker until Decision/Seam/Scope/Acceptance Criteria actually resolve. | Skipped if you already hand-wrote a brainstorm in `.ai/brainstorms/`. |
-| **2. Explore** | Reads the real repo — file contents, `.gitmodules`, commit hashes — and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm. |
-| **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in what Explore found. | Never skipped. |
-| **4. Review gate** | Approve, **Refine**, or **Discard**. Nothing executes without you looking at it first. | Never skipped — the one gate Readyset exists to enforce. |
-| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note, optionally backed by a `readyset_verify` evidence record (see [Design philosophy](#design-philosophy)), or the gate sends it back. A fresh-context **code-review** pass runs after, before archiving. | Never skipped. |
+| **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity until Decision/Seam/Scope/Acceptance Criteria resolve. | Skipped if a brainstorm already exists in `.ai/brainstorms/`. |
+| **2. Explore** | Reads the real repo and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm. |
+| **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in Explore's findings. | Never skipped. |
+| **4. Review gate** | Approve, **Refine**, or **Discard**. Nothing executes without a look first. | Never skipped — the gate Readyset exists to enforce. |
+| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note, optionally backed by `readyset_verify` evidence. A fresh-context **code-review** pass runs before archiving. | Never skipped. |
 
-The one loop: **Refine** sends you back to Propose, and a failed verification at Execute sends
-you back to the review gate — either way you land on a stage above, never off into an
-unrecoverable branch.
+**Refine** sends you back to Propose; a failed verification at Execute sends you back to the
+review gate — either way you land on a stage above, never off into an unrecoverable branch.
 
 ## Install
 
@@ -153,37 +117,25 @@ npm install --save-dev readyset-flow
 npx readyset-flow install
 ```
 
-Readyset installs **globally**, tied to `~/.omp/` — a personal workflow extension meant to be
-available in every repo, not scoped to one.
+Installs **globally**, tied to `~/.omp/` — a personal workflow extension available in every repo.
 
 It does **not** copy `.ts` files into `~/.omp/agent/`. omp's native config provider reads
-`~/.omp/agent/settings.json`'s `"extensions"` array, and when an entry resolves to a *file* (not
-a directory), it loads that file as a full extension module wherever it actually sits on disk —
-no requirement that it live under `~/.omp/agent/extensions/`. This is real, source-verified omp
-behavior (`loadExtensionModules`), not a convention this package invented. So `install` merges
-one absolute path — `<this package>/src/extensions/readyset-review.ts` — into that array. Its own
-imports (`../lib/readyset-*.ts`) resolve against its real location on disk, so no other file in
-this package needs an install step: updating the package is enough, since nothing was copied to
-go stale.
+`~/.omp/agent/settings.json`'s `"extensions"` array, and when an entry resolves to a *file*, it
+loads it in place wherever it sits on disk — real, source-verified omp behavior
+(`loadExtensionModules`), not a convention this package invented. So `install` merges one
+absolute path into that array; every other file in this package resolves relative to it, so
+updating the package needs no reinstall.
 
-The one thing `install` does still copy is the skill doc, to `~/.omp/agent/skills/readyset/` —
-skills have no array equivalent in omp (only a fixed directory scan), and a stale copy of a
-reference doc is a much smaller problem than stale runtime code would be. It's re-copied every
-run.
+The one thing `install` does copy is the skill doc, to `~/.omp/agent/skills/readyset/` — skills
+have no array equivalent in omp, only a fixed directory scan, and a stale copy of a reference doc
+is a much smaller problem than stale runtime code. It's re-copied every run.
 
-Existing `settings.json` entries belonging to another extension are left untouched; `install`
-only ever touches the one entry resolving to `readyset-review.ts`, and re-running it is a no-op
-once that entry is already correct.
+Existing `settings.json` entries belonging to another extension are left untouched; re-running
+`install` is a no-op once its own entry is already correct. Pass `--target <path>` to install
+elsewhere — a scratch directory, or `<repo>/.omp` to scope this to one project.
 
-Pass `--target <path>` to install somewhere else — a scratch directory for testing, or
-`<repo>/.omp` to scope this to one project instead (omp supports that layout; this installer just
-doesn't default to it).
-
-Since nothing runtime is copied, code changes need no re-install. Re-run
-`npx readyset-flow install` only after moving the package itself, or to refresh the installed
-skill doc. Leftover files from an older, copy-based installer under
-`~/.omp/agent/lib/readyset-*.ts` / `~/.omp/agent/extensions/readyset-review.ts` are inert once
-`settings.json` points at the package directly — safe to delete by hand.
+Since nothing runtime is copied, code changes need no re-install. Re-run only after moving the
+package, or to refresh the installed skill doc.
 
 ## Validate from the CLI
 
@@ -192,23 +144,19 @@ readyset-flow validate <change-id> [--cwd <path>]
 ```
 
 Runs the same structural check (`validateChange`) the omp gate runs before every Approve &
-Execute / Refine / Sidebar view — from a plain terminal, no omp session needed. Exit code `0` on
-pass, `1` on structural issues, so it composes into CI or a pre-commit hook:
+Execute / Refine / Sidebar view — from a plain terminal, no omp session needed. Exit `0` on pass,
+`1` on structural issues, so it composes into CI or a pre-commit hook:
 
 ```
 readyset-flow validate complete-embedded-signup-onboarding || exit 1
 ```
 
-`install`/`version` only need whatever Node `engines` promises (`>=18`) — `install.mjs`
-deliberately never imports a `.ts` file. `validate` is the exception: it needs `readyset-spec.ts`'s
-real check, not a re-implementation that could drift, so it spawns a small subprocess
-(`validate-runner.mts`) with `--experimental-strip-types` — Node 22.6+, same requirement this
-package's own test suite has. If that subprocess can't start, `validate` says so plainly;
-`install`/`version` are unaffected.
+`install`/`version` only need Node `>=18` and never import a `.ts` file. `validate` is the
+exception: it spawns a small subprocess (`validate-runner.mts`) with `--experimental-strip-types`
+(Node 22.6+) to run `readyset-spec.ts`'s real check rather than a re-implementation that could
+drift.
 
 ## Use
-
-With Readyset installed, run:
 
 ```
 /readyset
@@ -219,205 +167,137 @@ With Readyset installed, run:
 ### Grilling — turning an idea into a brainstorm
 
 A brainstorm under `.ai/brainstorms/` is no longer a hard prerequisite. `--idea <text>` (or
-picking **"Type a new idea"** at the top of the normal picker) starts a **grilling** turn
-instead: mattpocock/skills-style interrogation — map the open decision branches, ask one numbered
-round of frontier questions with a recommended answer each, never accept a passive "okay" as a
-real decision on anything load-bearing, repeat until the design tree resolves. This matches the
-closing discipline of the standalone `brainstorm-ai` skill (Decision, Seam, Scope, Acceptance
-Criteria) rather than inventing a second format: whichever tool wrote a given
-`.ai/brainstorms/*.md` file, Readyset treats it identically.
+picking **"Type a new idea"** in the normal picker) starts a **grilling** turn instead:
+mattpocock/skills-style interrogation — map the open decision branches, ask a round of frontier
+questions with a recommended answer each, never accept a passive "okay" on anything load-bearing,
+repeat until the design tree resolves.
 
-The driving prompt (`grillTurnPrompt`) is adapted from mattpocock/skills' actual `grilling`
-skill, vendored verbatim (MIT-licensed) at `src/skill/mattpocock-grilling.md` to check wording
-against. One of its rules — "finding facts is your job, never the user's" (see
-[Design philosophy](#design-philosophy)) — is carried over close to verbatim: a question the repo
-or a web search could actually answer doesn't belong in a round as an open question.
+The driving prompt is adapted from mattpocock/skills' actual `grilling` skill, vendored verbatim
+(MIT-licensed) at `src/skill/mattpocock-grilling.md`. One of its rules — "finding facts is your
+job, never the user's" (see [Design philosophy](#design-philosophy)) — carries over close to
+verbatim.
 
-Each round is a real structured picker, not raw chat text you have to type a reply to — the model
-calls a `readyset_ask` tool that opens omp's own native multi-question dialog
-(`ctx.ui.askDialog`), your recommended answer highlighted per question, with room to type your
-own or say "let's discuss this instead." Because that dialog blocks for real input, the model
-keeps calling it round after round inside one continuous turn. The round cap (4 by default) is
-enforced in code: once hit, the tool stops opening the dialog and the model checks in via plain
-text instead. This picker is Interactive-mode only (the surface native `/plan`'s dialogs use); in
-RPC/ACP/print modes, or any omp build without it, grilling falls back to the previous plain-chat
-back-and-forth automatically, same rules and content. Either way it ends once the model writes the
-brainstorm file and tells you to run `/readyset` again to pick it up. Hand-writing or dictating
-the brainstorm to a separate tool first still works exactly as before.
+Each round is a real structured picker — the model calls a `readyset_ask` tool that opens omp's
+own native multi-question dialog, your recommended answer highlighted, with room to type your own
+or discuss instead. The round cap (4 by default) is enforced in code: once hit, the tool stops
+opening the dialog and the model checks in via plain text. Interactive-mode only; in RPC/ACP/print
+modes, or an omp build without it, grilling falls back to a plain-chat back-and-forth, same rules.
+Either way it ends once the model writes the brainstorm file and tells you to run `/readyset`
+again to pick it up.
 
 ### Grilling from outside omp
 
-`/readyset --idea` isn't the only way to arrive at a `.ai/brainstorms/*.md` file — the grilling
-turn above deliberately writes the same shape the standalone `brainstorm-ai` skill does, so
-Readyset's picker can't tell which one produced a given file, and doesn't try to. A common
-workaround for that skill's own read-only, no-repo-write, interactive-discussion discipline
-before you ever open `omp`: run the brainstorming session in **Claude Cowork**, then bring the
-resulting file into the repo.
+A brainstorm doesn't have to come from `--idea` — grilling deliberately writes the same shape a
+separate, standalone **`brainstorm-ai`** skill does, so Readyset's picker can't tell which one
+produced a file, and doesn't try to. That skill runs its own read-only, interactive session
+entirely outside omp — commonly in **Claude Cowork** — before you ever open `omp`.
 
-A byte-identical copy of that skill ships in this package at `resources/brainstorm-ai/SKILL.md`
-— outside `src/`, deliberately: nothing in this package's code loads, installs, or adapts from
-it, unlike `src/skill/mattpocock-grilling.md`'s direct provenance relationship to `grillTurnPrompt`
-(see [Package layout](#package-layout)). To actually use it: go to **claude.ai → Settings →
-Skills** and create/upload a skill from that file's content — this is an account-level Skill, so
-once it's there it syncs down to every surface that reads your synced skills (Claude Cowork, and
-Claude Code sessions too — confirmed, not assumed: this package's own vendored copy was found by
-grepping a live Claude Code session's `~/.claude/skills/synced/` directory, which is exactly
-where an account-level Skill lands once synced). There's no per-repo copy step and no install
-flag for this — `readyset-flow install` doesn't touch it at all, deliberately, since it's not
-something omp reads; it's Claude account plumbing, orthogonal to omp.
+A byte-identical copy ships at **[`resources/brainstorm-ai/`](resources/brainstorm-ai/README.md)**,
+with the full setup steps, a sequence diagram of the Cowork → `/readyset` handoff, and its
+portability boundary outside Claude surfaces — worth reading if you want that path.
 
-Its frontmatter (`allowed-tools`, `disable-model-invocation`) is real Claude Skill plumbing on
-that surface — it's actually held to read-only repo research plus writes scoped to
-`.ai/brainstorms/*.md`, the same way `readyset_ask`'s structured picker is real UI in omp, not
-just a prompt convention.
-
-Using it on a non-Claude assistant (ChatGPT desktop, say) hasn't actually been tried with this
-skill — the frontmatter above the `---` fence is Claude Skill-specific and wouldn't mean anything
-there, so in principle only the body below it would carry over, as plain instructions with no
-tool restriction enforced. Take that as an untested theory, not a documented path.
-
-Either way, the session runs entirely outside `omp` — a separate assistant, a separate context,
-often a separate language (the skill's own discussion happens in Bahasa Indonesia by design; the
-saved file is always English, same reasoning as [Language](#language) below). Once it writes
-`.ai/brainstorms/<date>-<slug>.md`, bring that file into the repo and run `/readyset`: it shows
-up in the normal picker alongside anything grilled in-session, **Grill is skipped entirely**
-(the file already carries a resolved Decision/Seam/Scope/Acceptance Criteria), and picking it
-goes straight to Explore, then Propose — the same content-check gate that catches an
-under-filled grilling result (see [What it deliberately does not do](#what-it-deliberately-does-not-do))
-applies here too, so a thin or template-only import still gets flagged before Explore spends a
-turn on it.
+The short version: once it writes `.ai/brainstorms/<date>-<slug>.md`, bring that file into the
+repo and run `/readyset`. It shows up in the normal picker, **Grill is skipped entirely** (Decision/
+Seam/Scope/Acceptance Criteria are already resolved), and picking it goes straight to Explore,
+then Propose — the same content-check gate that catches an under-filled grilling result (see
+[What it deliberately does not do](#what-it-deliberately-does-not-do)) applies here too.
 
 ### Language
 
 By default, grilling's reactive rule kicks in: reply in whatever language you use, once you use
-it — so round 1 arrives in English, since there's no signal yet. `--lang <language>` (placed
-*before* `--idea`, which joins everything after it into the idea text) opens the discussion in
-that language from round 1:
+it — round 1 itself arrives in English. `--lang <language>` (before `--idea`) opens the discussion
+in that language from round 1:
 
 ```
 /readyset --lang Indonesian --idea "let users export their data as CSV"
 ```
 
-Or set a default once in `~/.omp/agent/config.yml` (`--lang` still wins if given).
-`readyset.lang` works as an alias for `readyset.language`:
+Or set a default once (`--lang` still wins if given); `readyset.lang` works as an alias:
 
 ```yaml
 readyset:
   language: Indonesian   # or: lang: Indonesian
 ```
 
-Only the *discussion* changes language — the brainstorm file `--idea` eventually writes is always
-in English, since that's what the rest of Readyset expects. Each `readyset_ask` question's
-`header` (the short chip label above it) also stays in English on purpose — it reads like fixed
-UI chrome, and a picker with some tabs translated and some not is more jarring than keeping all of
-them consistent.
+Only the *discussion* changes language — the brainstorm file is always English. Each
+`readyset_ask` question's `header` also stays English on purpose, since it reads like fixed UI
+chrome rather than conversation.
 
 ### Configure a model
 
-`--model` pins one model for every turn this run fires (Explore through Code-review), so a run is
-reproducible independent of whatever model was active in the invoking session. The original model
-is restored once the run finishes, however it ends.
+`--model` pins one model for every turn this run fires, reproducible regardless of whatever model
+was active in the invoking session. The original model is restored once the run finishes.
 
-Without `--model`, Readyset reads a default from omp's own `~/.omp/agent/config.yml`, in order:
+Without `--model`, Readyset reads a default from omp's own `~/.omp/agent/config.yml`:
 
 ```yaml
-readyset:                    # Readyset's own section, nested the same shape as omp's own
-  model:                     # retry.fallbackChains (a default plus an ordered list of
-    default: anthropic/claude-opus-5     # fallbacks) — omp itself doesn't read this section,
-    fallbackChains:                      # it's meaningful only to Readyset. See "if the pin
-      - anthropic/claude-sonnet-5        # itself fails" below.
+readyset:
+  model:
+    default: anthropic/claude-opus-5
+    fallbackChains:                      # tried in order if the default fails to pin
+      - anthropic/claude-sonnet-5
       - spark/minimax-m3
 
-modelRoles:         # omp's own general default (confirmed against omp's docs), used as the
-  default: spark/minimax-m3            # fallback if readyset.model.default isn't set
+modelRoles:                    # omp's own general default, used if readyset.model isn't set
+  default: spark/minimax-m3
 ```
 
-`readyset.model.default` wins if both are set, letting you pin a model for `/readyset` without
-changing omp's overall default. If neither is set, Readyset runs with whatever model the session
-already has. A bare `readyset.model: <spec>` (no nested shape) still works for older configs.
+`readyset.model.default` wins if both are set. If the pin itself fails (bad/retired spec),
+Readyset tries `readyset.model.fallbackChains` in order before giving up and running unpinned.
+`--fallback-model <spec>` is a single spec that wins over the config chain. This only covers the
+pin failing before a turn starts, not a model going down mid-turn — for that, configure omp's own
+`retry.fallbackChains`.
 
-**If the pin itself fails** — the named spec is wrong, retired, or rejected — Readyset tries
-every entry in `readyset.model.fallbackChains` in order, and only once all fail does it run
-unpinned rather than aborting. `--fallback-model <spec>` is a single spec that wins over the
-config chain entirely. A bare `readyset.fallbackModel: <spec>` (legacy, single fallback) still
-works too. This only covers the pin failing before any turn starts, not a model going down
-mid-turn — for that, configure omp's own `retry.fallbackChains`, which already applies regardless
-of whether Readyset pinned anything.
-
-Every run also has a hard turn budget (10 by default) — a guardrail against an unbounded Refine
-or verification-retry loop, not a precise cost estimate. The review panel shows
-`agent turns this run: N/10`; hitting it stops the run with a warning, and `/readyset` can simply
-be re-run for a fresh budget.
+Every run also has a hard turn budget (10 by default), shown as `agent turns this run: N/10` in
+the review panel — a guardrail against an unbounded Refine loop, not a cost estimate.
 
 ### The review gate
 
-Picks a brainstorm, and depending on its status:
+Picks a brainstorm, then depending on its status:
 
-- **Not proposed yet** — fires **Explore** first: writes `EXPLORATION.md`, with every submodule
-  from `.gitmodules` listed explicitly so none is silently skipped. Then **Propose** runs, told to
-  ground its output in what Explore found. Both phases log to `CONTEXT.md`, then drop straight
+- **Not proposed yet** — fires **Explore** first (writes `EXPLORATION.md`, every `.gitmodules`
+  submodule listed explicitly), then **Propose**, grounded in what Explore found. Drops straight
   into the review gate below.
-- **Already proposed** — goes straight to the gate: **Approve & Execute** / **Refine** (describe
-  what to change, loops into another revision) / **Sidebar view** (a persistent section list +
-  content pane, like native `/plan`'s review) or **Jump to section** as a fallback / **Discard**.
-  The full compiled document is always pushed into the editor pane too, on every pass.
-- **Approve & Execute** implements the tasks. Each completed task needs an indented
-  `_Verified: <what was checked, and the result>` note, or the gate sends it back. It can
-  optionally call `readyset_verify({taskId, command})` to back that note with more than a
-  self-report: the command runs for real (via a real shell, so `&&`/pipes work), and an immutable
-  record of its exit code, stdout/stderr, and duration is persisted to
-  `readyset/changes/<id>/evidence/`. The panel's **Runtime evidence** section lists those records
-  and flags a **conflict** when a task is checked `[x]` but its latest evidence exited non-zero —
-  surfaced passively, never auto-blocking, since a captured exit code is evidence for the next
-  review to weigh, not a verdict Readyset hands down itself. Once every task is verifiably done, a
-  separate **code review** turn runs (fresh context, told to find problems, not confirm the work)
-  and writes `REVIEW.md`. Only then does Readyset offer to archive — moving the change under
-  `readyset/changes/archive/`, merging its delta specs into `readyset/specs/` append-only, now
-  warning explicitly if that delta contained a MODIFIED/REMOVED requirement the merge can't apply.
+- **Already proposed** — goes straight to the gate: **Approve & Execute** / **Refine** (loops into
+  another revision) / **Sidebar view** (a persistent section list + content pane) or **Jump to
+  section** as a fallback / **Discard**.
+- **Approve & Execute** implements the tasks. Each completed task needs an indented `_Verified:`
+  note, or the gate sends it back. It can optionally call `readyset_verify({taskId, command})` to
+  back that note with more than a self-report — the command runs for real, and an immutable record
+  of its exit code, stdout/stderr, and duration is persisted to `readyset/changes/<id>/evidence/`.
+  The panel's **Runtime evidence** section lists those records and flags a **conflict** when a
+  task is checked `[x]` but its latest evidence exited non-zero — surfaced passively, never
+  auto-blocking. Once every task is verifiably done, a separate **code review** turn runs (fresh
+  context, told to find problems) and writes `REVIEW.md`. Only then does Readyset offer to
+  archive — merging delta specs into `readyset/specs/` append-only, now warning explicitly if a
+  delta held a MODIFIED/REMOVED requirement the merge couldn't apply.
 
 ## What it deliberately does not do
 
-- `validateChange` is a **structural check** (required sections exist, every requirement carries
-  an ADDED/MODIFIED/REMOVED header and its own WHEN/THEN, at least one task) — not a schema
-  validator, and scoped per requirement, not per file. It catches an empty or malformed artifact,
-  never a semantically wrong one — which is why its summary always carries the literal suffix
-  `(structural check)`, everywhere it's shown. `validateBrainstormContent` (checked before Explore
-  runs) uses the same wording for the same reason, enforced by a shared `structuralCheckSummary`
-  helper rather than two files independently hoping to stay in sync. The one check that *is*
-  semantic is the code-review turn (`REVIEW.md`) — its panel line says "done" or "not run yet,"
-  deliberately not sharing the `(structural check)` wording, since a real judgment call happened
-  there.
-- `archiveChange` merges delta specs append-only — never a real diff-merge. Safe (nothing deleted
-  or silently rewritten), but cruder than a schema-aware archiver; review the merged spec
-  afterward.
-- Grilling's round cap is enforced in code via `readyset_ask`'s own `execute()` — but only for
-  rounds asked through that tool. In the plain-chat fallback (no `ctx.ui.askDialog` available),
-  rounds are ordinary chat turns the extension never sees, so the cap there is prompt-level only —
-  there's no code ceiling possible on a turn the extension isn't driving. Always enforced either
-  way: `validateBrainstormContent`, which checks Decision/Seam/Scope/Acceptance Criteria actually
-  got filled in (not left as template placeholders) before Explore spends a turn on it —
-  "Continue anyway" is always available, but it's a deliberate extra step.
-- Nothing forces the model to actually call `readyset_ask` — that's prompt-level, not something
-  extension code can require. `tools.approvalMode: yolo` doesn't change this: it only
-  auto-approves tool-call permission prompts, not `ctx.ui.select`/`ctx.ui.askDialog`, which always
-  block for real input in Interactive mode. The real risk is a model that races ahead and writes a
-  brainstorm from its own assumptions — a failure mode seen with native `/plan` before. The
-  content-check gate catches this partially (a plausible-sounding but invented Decision/Seam/Scope
-  still passes `validateBrainstormContent`); what actually catches "the model never asked" is a
-  zero-rounds check — if grilling started this session and `readyset_ask` was never called, the
-  gate flags it and still requires "Continue anyway." Scoped tight on purpose: it only fires for a
-  grilling run that started and finished in the same omp process without ever asking — a
-  hand-written brainstorm, or one grilled in an earlier session, triggers nothing.
-- The review screen has two tiers, chosen by feature-detecting `ctx.ui.custom` at gate time. Where
-  available (a normal interactive `omp` session), **Sidebar view** renders a real persistent
-  two-pane overlay via `ctx.ui.custom()` — the same mechanism native `/plan`'s review sidebar uses,
-  not a simulation: a section list on the left, content on the right, `PgUp`/`PgDn` to scroll,
-  `Esc` to close. Where it isn't (RPC/ACP/print, or an older omp), the gate falls back to
-  **Jump to section** — a `select` menu swapping the editor pane one section at a time, with
-  "◂ Back to full document" to restore the compiled view. Either way, the full change is also
-  always pushed into the editor pane as one compiled document — a numbered table of contents with
-  a status tag per section, then every section body below, separated by `═`/`─` rules instead of
-  markdown headers (the editor pane doesn't render markdown).
+- `validateChange` is a **structural check** — required sections exist, every requirement carries
+  an ADDED/MODIFIED/REMOVED header and its own WHEN/THEN — not a schema validator, and it catches
+  an empty or malformed artifact, never a semantically wrong one. Its summary always carries the
+  literal suffix `(structural check)`, everywhere it's shown, so it never reads as a stronger
+  guarantee than it is. `validateBrainstormContent` (checked before Explore runs) uses the same
+  wording for the same reason. The one check that *is* semantic is the code-review turn
+  (`REVIEW.md`) — its panel line deliberately doesn't share that suffix.
+- `archiveChange` merges delta specs append-only — never a real diff-merge. Safe, but cruder than
+  a schema-aware archiver; review the merged spec afterward.
+- Grilling's round cap is enforced in code only for rounds asked through `readyset_ask`. In the
+  plain-chat fallback, rounds are ordinary chat turns the extension never sees, so the cap there
+  is prompt-level only. Always enforced either way: `validateBrainstormContent`, which checks
+  Decision/Seam/Scope/Acceptance Criteria actually got filled in before Explore spends a turn on
+  it — "Continue anyway" is always available, but it's a deliberate extra step.
+- Nothing forces the model to actually call `readyset_ask` — that's prompt-level. The real risk is
+  a model racing ahead and writing a brainstorm from its own assumptions. A zero-rounds check
+  catches "the model never asked" specifically: if grilling started this session and `readyset_ask`
+  was never called, the gate flags it and still requires "Continue anyway" — scoped tight, so a
+  hand-written or previously-grilled brainstorm triggers nothing.
+- The review screen has two tiers, chosen by feature-detecting `ctx.ui.custom`. Where available,
+  **Sidebar view** renders a real persistent two-pane overlay — the same mechanism native
+  `/plan`'s review sidebar uses. Where it isn't, the gate falls back to **Jump to section** — a
+  menu swapping the editor pane one section at a time. Either way, the full change is always also
+  pushed into the editor pane as one compiled document.
 
 ## Files a change accumulates
 
@@ -458,39 +338,22 @@ src/
                              copied to ~/.omp/agent/skills/readyset/SKILL.md (see note below)
     mattpocock-grilling.md  mattpocock/skills' actual `grilling` skill, vendored verbatim
                              (MIT-licensed) — the real source grillTurnPrompt is adapted from,
-                             kept here to check wording against rather than a paraphrase of a
-                             paraphrase. Repo-internal reference only, not installed.
+                             kept here to check wording against. Repo-internal reference only.
   cli/
     install.mjs            `readyset-flow install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
 
 resources/
-  brainstorm-ai/
-    SKILL.md                the /brainstorm-ai Claude Skill (see "Grilling from outside omp")
-                             — byte-identical to the original; deliberately outside src/, since
-                             unlike mattpocock-grilling.md above, nothing in this package's code
-                             is loaded from, installed from, or adapted from it. Kept here purely
-                             for discoverability, for a workflow this package's grilling matches
-                             the shape of but doesn't depend on.
-    README.md                provenance, how to actually attach it (claude.ai -> Settings ->
-                             Skills), and its portability boundary outside Claude surfaces
+  brainstorm-ai/           a companion Claude Skill for brainstorming outside omp entirely (see
+                             "Grilling from outside omp") — deliberately outside src/, since
+                             nothing in this package's code loads or depends on it
 ```
 
-What `readyset-flow install` actually touches on disk (default target `~/.omp`):
-
-```
-~/.omp/agent/
-  settings.json     "extensions" array gets one entry merged in: the absolute path to this
-                     package's own src/extensions/readyset-review.ts -- not a copy of it
-  skills/readyset/SKILL.md   copied (see note below; this one file has no reference-in-place option)
-```
-
-Everything under `src/lib/` and `src/extensions/` stays exactly where the package itself lives
-(a git clone, or `node_modules/readyset-flow/` after `npm install`) and is read from there —
-confirmed against omp's own native discovery provider (`loadExtensionModules`), which resolves a
-`settings.json` `"extensions"` array entry that points at a file, not a directory, and loads it
-in place; not a guess. Skills have no such array in omp (only a fixed
-`~/.omp/agent/skills/` directory scan), so the skill doc is still copied rather than referenced.
+`readyset-flow install` only touches `~/.omp/agent/settings.json` (merges one absolute path into
+its `"extensions"` array) and `~/.omp/agent/skills/readyset/SKILL.md` (copied — skills have no
+array equivalent in omp). Everything under `src/lib/` and `src/extensions/` stays exactly where
+the package lives and is read from there in place — confirmed against omp's own native discovery
+provider (`loadExtensionModules`), not a guess.
 
 ---
 
