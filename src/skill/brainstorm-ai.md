@@ -1,9 +1,11 @@
 <!--
 Authored by Freza (this package's maintainer), vendored here 2026-09-19. Unlike
 mattpocock-grilling.md, this one isn't repo-internal reference material -- it's meant to be
-copied out and actually used: attach it as a Claude Skill in Claude Cowork (or Claude Code, any
-`.claude/skills/` directory), or paste its body into a ChatGPT desktop project/custom-instructions
-field as plain behavioral instructions.
+copied out and actually used: create/upload it as an account-level Skill at
+claude.ai -> Settings -> Skills. It then syncs down to every surface that reads your synced
+skills (Claude Cowork, and Claude Code sessions too) -- there's no per-repo copy step, and
+`readyset-flow install` deliberately doesn't touch this file at all, since it's Claude account
+plumbing, not something omp reads.
 
 Readyset's own grilling turn (`grillTurnPrompt` in src/extensions/readyset-review.ts) matches
 this skill's closing discipline and file shape deliberately -- see "Grilling from outside omp"
@@ -13,11 +15,10 @@ writes are indistinguishable to Readyset's picker; either is a legitimate way to
 
 Portability note: the YAML frontmatter below (`allowed-tools`, `disable-model-invocation`,
 `argument-hint`, and the `$ARGUMENTS`/`!`command`` substitution syntax) is Claude Skill plumbing
--- it's understood as-is by Claude Cowork and Claude Code, where it actually restricts which
-tools the skill can call. Outside a Claude surface (ChatGPT desktop, another assistant), none of
-that frontmatter does anything: paste just the body below the `---` closing fence in as plain
-instructions, and the "read-only, only writes to .ai/brainstorms/*.md" constraint becomes a
-convention that assistant has to be trusted to follow, not something enforced.
+-- on a Claude surface it actually restricts which tools the skill can call. Using this on a
+non-Claude assistant (ChatGPT desktop, say) hasn't actually been tried: in principle only the
+body below the `---` closing fence would carry over, as plain instructions with no tool
+restriction enforced -- untested theory, not a documented path.
 -->
 
 ---

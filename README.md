@@ -255,20 +255,24 @@ before you ever open `omp`: run the brainstorming session in **Claude Cowork**, 
 resulting file into the repo.
 
 A copy of that skill ships in this package at `src/skill/brainstorm-ai.md`, so you don't have to
-reconstruct the format by hand:
+reconstruct the format by hand. To actually use it: go to **claude.ai → Settings → Skills** and
+create/upload a skill from that file's content — this is an account-level Skill, so once it's
+there it syncs down to every surface that reads your synced skills (Claude Cowork, and Claude
+Code sessions too — confirmed, not assumed: this package's own vendored copy was found by
+grepping a live Claude Code session's `~/.claude/skills/synced/` directory, which is exactly
+where an account-level Skill lands once synced). There's no per-repo copy step and no install
+flag for this — `readyset-flow install` doesn't touch it at all, deliberately, since it's not
+something omp reads; it's Claude account plumbing, orthogonal to omp.
 
-- **Claude Cowork or Claude Code** — copy it into your `.claude/skills/brainstorm-ai/SKILL.md`
-  (any `.claude/skills/` directory Claude reads skills from), then invoke it as
-  `/brainstorm-ai <topic>`. Its frontmatter (`allowed-tools`, `disable-model-invocation`) is real
-  Claude Skill plumbing there — it's actually held to read-only repo research plus writes scoped
-  to `.ai/brainstorms/*.md`, same as `readyset_ask`'s structured picker is real UI in omp.
-- **ChatGPT desktop, or any other assistant** — the frontmatter above the `---` fence is
-  Claude-specific and does nothing outside a Claude surface; paste the body below it into a
-  project's custom instructions instead. The read-only/scoped-write constraint becomes a
-  convention you're trusting that assistant to follow, not something enforced — the same
-  trade-off `readyset_verify`'s `shell:true` makes for a different reason (see
-  [Design philosophy](#design-philosophy)): no sandbox, the discipline lives in the prompt, not
-  the runtime.
+Its frontmatter (`allowed-tools`, `disable-model-invocation`) is real Claude Skill plumbing on
+that surface — it's actually held to read-only repo research plus writes scoped to
+`.ai/brainstorms/*.md`, the same way `readyset_ask`'s structured picker is real UI in omp, not
+just a prompt convention.
+
+Using it on a non-Claude assistant (ChatGPT desktop, say) hasn't actually been tried with this
+skill — the frontmatter above the `---` fence is Claude Skill-specific and wouldn't mean anything
+there, so in principle only the body below it would carry over, as plain instructions with no
+tool restriction enforced. Take that as an untested theory, not a documented path.
 
 Either way, the session runs entirely outside `omp` — a separate assistant, a separate context,
 often a separate language (the skill's own discussion happens in Bahasa Indonesia by design; the
@@ -456,9 +460,10 @@ src/
                              paraphrase. Repo-internal reference only, not installed.
     brainstorm-ai.md        the /brainstorm-ai Claude Skill (see "Grilling from outside omp")
                              — unlike the file above, this one is meant to be copied out and
-                             used: attach it in Claude Cowork/Claude Code, or paste its body into
-                             another assistant's custom instructions. Not installed by this
-                             package either; you place it yourself.
+                             used: create/upload it as an account-level Skill at claude.ai ->
+                             Settings -> Skills, which syncs it to Claude Cowork and Claude Code
+                             alike. `readyset-flow install` deliberately doesn't touch this file
+                             — it's Claude account plumbing, not something omp reads.
   cli/
     install.mjs            `readyset-flow install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
