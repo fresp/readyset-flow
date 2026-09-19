@@ -864,7 +864,12 @@ async function openSidebarOverlay(
 			taskSummary,
 			done,
 		),
-	{ overlay: true, overlayOptions: { fullscreen: true } },
+	// `width: "90%"` is load-bearing, not decoration: `OverlayOptions.fullscreen` (confirmed
+	// against pi-tui's real source -- see readyset-review-overlay.ts's module doc comment) only
+	// controls the alt-screen buffer, not sizing. Without an explicit width the overlay defaults
+	// to `min(80, terminalWidth)`, which is why an earlier version rendered as a narrow box even
+	// on a wide terminal.
+	{ overlay: true, overlayOptions: { fullscreen: true, width: "90%" } },
 	);
 }
 

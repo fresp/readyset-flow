@@ -46,6 +46,14 @@
  * TUI-only UI — was never actually populated. This package doesn't guard on `ctx.mode` at all;
  * `readyset-review.ts` instead feature-detects `typeof ctx.ui.custom === "function"` before
  * offering the sidebar, and falls back to the older per-section menu view when it's absent.
+ *
+ * Width caveat (confirmed against `@oh-my-pi/pi-tui@18.2.6`'s real published source,
+ * `src/tui.ts`'s `OverlayOptions`/`#resolveOverlayLayout`): `overlayOptions.fullscreen` only
+ * controls whether the overlay borrows the terminal's alt-screen buffer -- it does NOT affect
+ * width. Width defaults to `Math.min(80, availableWidth)` when `overlayOptions.width` isn't set,
+ * which is why an early version of this overlay rendered as a narrow ~80-column box even on a
+ * wide terminal. `readyset-review.ts`'s `openSidebarOverlay` now passes `width: "90%"` explicitly
+ * (`OverlayOptions.width` accepts a percentage string) to actually use the terminal's width.
  */
 
 import type { Component, KeybindingsManager, Theme } from "@oh-my-pi/pi-tui";
@@ -88,6 +96,13 @@ export interface OverlaySection {
  */
 export type ReviewOverlayResult = "approve" | "refine" | "discard" | undefined;
 
+/** The three CTAs, in on-screen left-to-right / Left-Right-cycling order. Shared between
+ *  `renderCtaBar` (display) and `ReviewSidebarOverlay.handleInput` (Left/Right cycling, Enter
+ *  confirming `CTA_ACTIONS[actionIndex]`) so the two can never drift out of sync. */
+const CTA_ACTIONS = ["approve", "refine", "discard"] as const;
+type CtaAction = (typeof CTA_ACTIONS)[number];
+const CTA_KEYS: Record<CtaAction, string> = { approve: "A", refine: "R", discard: "D" };
+
 const MIN_SIDEBAR_WIDTH = 22;
 const MAX_SIDEBAR_WIDTH = 36;
 const BODY_SCROLL_STEP = 10;
@@ -119,6 +134,26 @@ function sidebarParts(heading: string, status: string): { heading: string; statu
 	return { heading, status };
 }
 
+/**
+ * Renders the CTA bar's plain text (no ANSI yet -- the caller wraps the whole line in one style
+ * call, same as every other footer line here). `focus` and `actionIndex` come from
+ * `ReviewSidebarOverlay`'s own state: Tab moves `focus` onto this bar, Left/Right cycle
+ * `actionIndex` through `CTA_ACTIONS`, and Enter confirms whichever one is marked with `›` --
+ * i.e. this bar behaves like a real (if compact) select() list, not just three static hints.
+ */
+function renderCtaBar(taskSummary: string, focus: "sections" | "actions", actionIndex: number, width: number): string {
+	const labels: Record<CtaAction, string> = {
+		approve: `Approve & Execute — ${taskSummary}`,
+		refine: "Refine",
+		discard: "Discard",
+	};
+	const parts = CTA_ACTIONS.map((action, i) => {
+		const marker = focus === "actions" && i === actionIndex ? "› " : "  ";
+		return `${marker}[${CTA_KEYS[action]}] ${labels[action]}`;
+	});
+	return fitLine(` ${parts.join("   ")}`, width);
+}
+
 /** Pure layout function, separated from the Component class so it can be unit tested without a
  *  real TUI/theme/keybindings — it takes plain strings in, plain strings out. */
 export function renderSidebarLayout(
@@ -129,6 +164,8 @@ export function renderSidebarLayout(
 	width: number,
 	height: number,
 	taskSummary: string,
+	focus: "sections" | "actions",
+	actionIndex: number,
 	fg: (text: string) => string,
 	bold: (text: string) => string,
 	dim: (text: string) => string,
@@ -161,10 +198,12 @@ export function renderSidebarLayout(
 	// artifacts are ready -- see readyset-review.ts's reviewAndMaybeExecute), not an optional
 	// read-only "Sidebar view" a separate ctx.ui.select() menu offered alongside Approve/Refine/
 	// Discard. So those three actions live here as CTAs instead, bold/undimmed to read as the
-	// primary controls; the quieter nav hint stays dim below it.
-	lines.push(bold(fitLine(` [A] Approve & Execute — ${taskSummary}   [R] Refine   [D] Discard`, innerWidth)));
+	// primary controls; the quieter nav hint stays dim below it. They also behave like a select()
+	// (see renderCtaBar) once Tab moves focus onto them, not just direct A/R/D keystrokes.
+	lines.push(bold(renderCtaBar(taskSummary, focus, actionIndex, innerWidth)));
 	const scrollHint = bodyOverflow > 0 ? ` · PgUp/PgDn to scroll (${scrollOffset}/${section?.bodyLines.length ?? 0})` : "";
-	lines.push(dim(fitLine(` ↑/↓ section${scrollHint} · Esc cancel`, innerWidth)));
+	const focusHint = focus === "actions" ? "←/→ move · Enter confirm · Tab: sections" : "Tab: actions";
+	lines.push(dim(fitLine(` ↑/↓ section${scrollHint} · ${focusHint} · Esc cancel`, innerWidth)));
 
 	return lines;
 }
@@ -215,6 +254,8 @@ export class ReviewSidebarOverlay implements Component {
 	#done: (result: ReviewOverlayResult) => void;
 	#selectedIndex = 0;
 	#scrollOffset = 0;
+	#focus: "sections" | "actions" = "sections";
+	#actionIndex = 0;
 
 	constructor(
 		theme: Theme,
@@ -261,11 +302,12 @@ export class ReviewSidebarOverlay implements Component {
 			return;
 		}
 
-		// CTAs -- Approve & Execute / Refine / Discard live in the sidebar itself now (see the
-		// module doc comment and `ReviewOverlayResult`), so they're plain keystrokes rather than
-		// a separate ctx.ui.select() menu shown after this overlay closes. Checked before the
-		// section-nav early return below so they still work even with zero sections -- a change
-		// with no renderable sections shouldn't make Approve/Discard unreachable.
+		// Direct-execute CTA shortcuts -- Approve & Execute / Refine / Discard live in the
+		// sidebar itself now (see the module doc comment and `ReviewOverlayResult`), so a/r/d
+		// fire immediately regardless of `#focus`, no need to Tab onto the CTA bar first.
+		// Checked before the section-nav early return below so they still work even with zero
+		// sections -- a change with no renderable sections shouldn't make Approve/Discard
+		// unreachable.
 		if (data === "a" || data === "A") {
 			this.#done("approve");
 			return;
@@ -277,6 +319,30 @@ export class ReviewSidebarOverlay implements Component {
 		if (data === "d" || data === "D") {
 			this.#done("discard");
 			return;
+		}
+
+		// Tab moves focus onto the CTA bar (and back) -- once there, it behaves like a real
+		// select() list: Left/Right cycle the highlighted action, Enter (`tui.select.confirm`)
+		// confirms it. This is in addition to, not instead of, the a/r/d shortcuts above.
+		if (data === "\t") {
+			this.#focus = this.#focus === "sections" ? "actions" : "sections";
+			return;
+		}
+
+		if (this.#focus === "actions") {
+			if (data === "\x1b[D") {
+				this.#actionIndex = (this.#actionIndex + CTA_ACTIONS.length - 1) % CTA_ACTIONS.length;
+				return;
+			}
+			if (data === "\x1b[C") {
+				this.#actionIndex = (this.#actionIndex + 1) % CTA_ACTIONS.length;
+				return;
+			}
+			if (this.#keybindings.matches(data, "tui.select.confirm") || data === "\n" || data === "\r") {
+				this.#done(CTA_ACTIONS[this.#actionIndex]);
+				return;
+			}
+			return; // section-nav keys are inert while focus is on the CTA bar
 		}
 
 		if (this.#sections.length === 0) return;
@@ -303,6 +369,8 @@ export class ReviewSidebarOverlay implements Component {
 			width,
 			height,
 			this.#taskSummary,
+			this.#focus,
+			this.#actionIndex,
 			(text: string) => this.#theme.fg("accent", text),
 			(text: string) => this.#theme.bold(text),
 			(text: string) => this.#theme.fg("dim", text),
