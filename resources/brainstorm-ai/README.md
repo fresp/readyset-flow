@@ -25,6 +25,43 @@ installed, or adapted from it at runtime. It's a companion artifact for a differ
 (a Claude Skill, not an omp extension), kept here purely for discoverability, so it lives
 outside `src/` on purpose.
 
+## Sequence: Claude Cowork → `/readyset`
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Cowork as Claude Cowork<br/>(/brainstorm-ai)
+    participant Repo as Repo<br/>.ai/brainstorms/*.md
+    participant Omp as omp (/readyset)
+
+    Note over User,Cowork: one-time setup
+    User->>Cowork: create/upload SKILL.md at<br/>claude.ai → Settings → Skills
+
+    Note over User,Cowork: per brainstorm — entirely outside omp
+    User->>Cowork: /brainstorm-ai <topic>
+    Cowork->>Repo: read-only research<br/>(Read/Grep/Glob, git log/diff/status, openspec list/show)
+    loop until design settles (Bahasa Indonesia, one question per turn)
+        Cowork->>User: question + ≥2 options
+        User->>Cowork: answer
+    end
+    Cowork->>User: closing checklist —<br/>Decision, Seam, Scope, Acceptance Criteria,<br/>commit-only vs. commit+MR per task
+    User->>Cowork: confirms / decides
+    Cowork->>Cowork: auto-derive branch type + lane<br/>(not asked — stated inference)
+    Cowork->>Repo: write .ai/brainstorms/<date>-<slug>.md<br/>(English, status: open, change_id: empty)
+    Cowork->>User: path + summary + lane +<br/>"ready for another harness to pick up"
+
+    Note over User,Omp: back inside omp, a separate session
+    User->>Omp: /readyset
+    Omp->>Repo: list brainstorms
+    Omp->>User: picker — the new file appears<br/>alongside anything grilled in-session
+    User->>Omp: pick it
+    Note over Omp: Grill is skipped entirely —<br/>Decision/Seam/Scope/AC already resolved
+    Omp->>Omp: content-check gate<br/>(same one that catches a thin in-session grill)
+    Omp->>Repo: Explore → EXPLORATION.md
+    Omp->>Repo: Propose → proposal.md / design.md / specs / tasks.md
+    Omp->>User: review gate
+```
+
 ## Relationship to Readyset's own grilling
 
 Readyset's own grilling turn (`/readyset --idea`, see the README's "Grilling from outside omp")
