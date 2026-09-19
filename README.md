@@ -26,6 +26,7 @@ pass — each of those is a code-enforced gate, not just a prompt asking nicely.
 ## Table of contents
 
 - [Why "Readyset"](#why-readyset)
+- [Design philosophy](#design-philosophy)
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Validate from the CLI](#validate-from-the-cli)
@@ -65,6 +66,36 @@ proved insufficient once: an earlier version of the propose turn was told in pro
 `.gitmodules`, and still silently dropped one of two submodules from its output. Prose is a
 request; a gate is a requirement.
 
+## Design philosophy
+
+Three rules that shape which features Readyset actually gets, and how they're built, once they
+do:
+
+- **Runtime evidence is not proof of correctness.** `readyset_verify` (see [Execute](#how-it-works)
+  below) runs a command and records exactly what happened — an exit code, stdout/stderr, whether
+  it timed out. That's it. `exitCode: 0` means "the command ran and exited clean," never "the
+  requirement is satisfied" — judging *that* stays the separate code-review turn's job, on
+  purpose. A tool that quietly blurred this line would let a model self-certify its own work by
+  running something trivially true (`echo ok`) and pointing at the green exit code — so the two
+  are kept structurally apart: `readyset_verify` never marks a task done, never touches
+  `_Verified:`, and a passing evidence record next to a task still marked incomplete changes
+  nothing on its own.
+- **Smallest useful primitive, not the cleanest architecture.** When Evidence Capture was scoped,
+  the tempting version was bigger: structured review findings, an explicit state machine, a
+  proper `ReadysetChange` domain object. All of that was deliberately deferred. What shipped
+  instead is a single tool that runs a command and writes down what happened, wired into the
+  review panel just enough to be visible. The reasoning: ship the smallest thing that's actually
+  observable, get regression tests around it, learn from how it's really used, then decide what
+  the next iteration needs — rather than build the elegant version of a feature nobody's used yet.
+- **Trust and blast-radius beat cleanliness when they conflict.** Readyset's archive step, for
+  instance, still merges delta specs append-only — not a real diff-merge — because "never
+  silently deletes or rewrites a requirement" matters more here than "an archive is a proper
+  merge." (Left it, though, without ever *disclosing* a merge that silently dropped a
+  MODIFIED/REMOVED requirement from the archived spec — that gap got fixed alongside Evidence
+  Capture, once found.) Same logic elsewhere: `_Verified:` notes are a human-readable self-report,
+  not a schema-validated claim, and the review gate would rather over-trust a well-formed note
+  than force a rigid format that breaks on real-world phrasing.
+
 ## How it works
 
 A `/readyset` change moves through five stages. You only ever see the ones that still apply —
@@ -76,7 +107,7 @@ running `/readyset` again on an already-proposed change skips straight to review
 | **2. Explore** | Reads the real repo — file contents, `.gitmodules`, commit hashes — and writes down what it actually found in `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm. |
 | **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in what Explore found — not re-derived from scratch. | Never skipped. |
 | **4. Review gate** | You approve, ask for a revision (**Refine**), or **Discard**. Nothing executes without you looking at it first. | Never skipped — this is the one gate Readyset exists to enforce. |
-| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note (what was checked, what the result was) or the gate sends it back. A separate, fresh-context **code-review** pass runs after, before the change can be archived. | Never skipped. |
+| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note (what was checked, what the result was) or the gate sends it back. Optionally backs that note with a `readyset_verify` runtime-evidence record (see [Design philosophy](#design-philosophy)). A separate, fresh-context **code-review** pass runs after, before the change can be archived. | Never skipped. |
 
 The one loop in this: **Refine** at the review gate sends you back into another Propose pass,
 and a run that fails verification at Execute sends you back to the review gate — either way you
@@ -291,11 +322,19 @@ It picks a brainstorm, and depending on its status:
 - **Approve & Execute** implements the tasks. Each completed task must carry an indented
   `_Verified: <what was checked, and the result>` note under it — if the implementation checks a
   box without one, the review gate stops and offers to send it back for another pass rather than
-  silently trusting the self-report. Once every task is verifiably done, a separate **code
-  review** turn runs (fresh context, told explicitly that its job is to find problems, not
-  confirm the work) and writes `REVIEW.md`. Only then does Readyset offer to archive (moves the
-  change under `readyset/changes/archive/`, merges its delta specs into `readyset/specs/`
-  append-only).
+  silently trusting the self-report. It can optionally call `readyset_verify({taskId, command})`
+  to back that note with something more than a self-report: the command actually runs (via a real
+  shell, so `&&`/pipes work), and an immutable record of its exit code, stdout/stderr, and
+  duration is persisted to `readyset/changes/<id>/evidence/`. The review panel surfaces a
+  **Runtime evidence** section listing those records, and flags a **conflict** when a task is
+  already checked `[x]` but its latest evidence exited non-zero — surfaced passively, never
+  auto-blocking, since (per Design philosophy above) a captured exit code is evidence for the
+  next review to weigh, not a verdict Readyset hands down itself. Once every task is verifiably
+  done, a separate **code review** turn runs (fresh context, told explicitly that its job is to
+  find problems, not confirm the work) and writes `REVIEW.md`. Only then does Readyset offer to
+  archive (moves the change under `readyset/changes/archive/`, merges its delta specs into
+  `readyset/specs/` append-only — and now warns explicitly, itemized, if that delta contained a
+  MODIFIED/REMOVED requirement the append-only merge can't actually apply).
 
 ## What it deliberately does not do
 
@@ -375,6 +414,8 @@ proposal.md      Why / What Changes
 design.md        Context / Goals-Non-Goals / Decisions / Risks
 specs/**/spec.md ADDED/MODIFIED/REMOVED Requirements as WHEN/THEN scenarios
 tasks.md         checkbox tasks; each `- [x]` carries an indented `_Verified:` note
+evidence/E*.md   optional runtime-evidence records from `readyset_verify` — one per call,
+                 numbered E001, E002, ...; never auto-created, never mutated once written
 CONTEXT.md       append-only audit trail — one entry per phase transition, written by the
                  extension itself (not the model), so it can't be skipped or misremembered
 REVIEW.md        code-review phase findings, written after implementation, before archive
@@ -392,6 +433,8 @@ src/
                              ctx.ui.custom()-driven overlay, zero runtime dependency on @oh-my-pi/pi-tui
     readyset-structural-check.ts  the shared "(structural check)" summary wording validateChange
                              and validateBrainstormContent both use
+    readyset-evidence.ts    readyset_verify's runtime — spawns the command, persists the
+                             immutable evidence record, correlates it back to tasks.md
   extensions/
     readyset-review.ts      the /readyset command itself
   skill/
