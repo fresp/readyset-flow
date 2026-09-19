@@ -14,9 +14,10 @@ the `language` field.
 
 The skill's session Q&A (questions, options, trade-off discussion, confirmations) was originally
 hardcoded to Bahasa Indonesia. It now reads a `language: Indonesian` field in `SKILL.md`'s own
-frontmatter instead — change that one line to switch the session's language. The saved
-`.ai/brainstorms/*.md` file itself is unaffected either way: it's always written in English, so
-any downstream harness can pick it up without translation.
+frontmatter instead — change that one line to switch the session's language, or remove the field
+entirely to fall back to English. The saved `.ai/brainstorms/*.md` file itself is unaffected
+either way: it's always written in English, so any downstream harness can pick it up without
+translation.
 
 ## How to use it
 
