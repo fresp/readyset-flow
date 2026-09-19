@@ -3,6 +3,12 @@
 </p>
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/readyset-flow"><img src="https://img.shields.io/npm/v/readyset-flow.svg" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/readyset-flow"><img src="https://img.shields.io/npm/dm/readyset-flow.svg" alt="npm downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/npm/l/readyset-flow.svg" alt="license"></a>
+</p>
+
+<p align="center">
   <a href="#install"><b>Install</b></a> ·
   <a href="#use"><b>Use</b></a> ·
   <a href="#how-it-works"><b>How it works</b></a> ·
