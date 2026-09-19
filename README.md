@@ -45,6 +45,7 @@ Rough idea → GRILL → EXPLORE → PROPOSE → REVIEW → EXECUTE → ARCHIVE
 - [What it deliberately does not do](#what-it-deliberately-does-not-do)
 - [Files a change accumulates](#files-a-change-accumulates)
 - [Package layout](#package-layout)
+- [License](#license)
 
 ## Why "Readyset"
 
@@ -384,6 +385,11 @@ its `"extensions"` array) and `~/.omp/agent/skills/readyset/SKILL.md` (copied �
 array equivalent in omp). Everything under `src/lib/` and `src/extensions/` stays exactly where
 the package lives and is read from there in place — confirmed against omp's own native discovery
 provider (`loadExtensionModules`), not a guess.
+
+## License
+
+[MIT](LICENSE) — see the `LICENSE` file. `src/skill/mattpocock-grilling.md` is vendored
+separately under its own MIT license (Matt Pocock, full text kept in the file itself).
 
 ---
 

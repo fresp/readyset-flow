@@ -24,7 +24,16 @@
     "brainstorm",
     "spec-driven-development"
   ],
-  "license": "UNLICENSED",
+  "license": "MIT",
+  "author": "Freza <frezanugraha404@gmail.com> (https://github.com/fresp)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fresp/readyset-flow.git"
+  },
+  "homepage": "https://github.com/fresp/readyset-flow#readme",
+  "bugs": {
+    "url": "https://github.com/fresp/readyset-flow/issues"
+  },
   "engines": {
     "node": ">=18"
   }
