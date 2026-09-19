@@ -965,6 +965,12 @@ await test("--idea skips the picker entirely and fires a grill turn as the first
   assert.match(fakePiWrap.calls[0].prompt, /Grill this raw idea into a decided Readyset brainstorm file/);
   assert.match(fakePiWrap.calls[0].prompt, /Add a dark mode toggle to settings/);
   assert.ok(fakeUiWrap.notifications.some((n) => /Grilling started for/.test(n.message)));
+  // mattpocock/skills' own "finding facts is your job, never the user's" rule, extended with
+  // this session's baseline web search tool -- added after a real grilling run left a checkable
+  // external fact (a WhatsApp Business Platform tier requirement) as an open question instead of
+  // looking it up. See src/skill/mattpocock-grilling.md for the vendored source rule.
+  assert.match(fakePiWrap.calls[0].prompt, /[Ff]inding facts is your job, never the user's/);
+  assert.match(fakePiWrap.calls[0].prompt, /web search tool/);
 });
 
 await test("no --idea flag, brainstorms exist: 'Type a new idea' is offered, prompts for the idea, then grills it", async () => {

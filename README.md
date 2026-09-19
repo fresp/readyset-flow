@@ -117,7 +117,20 @@ repeat until the design tree actually resolves. This deliberately matches the cl
 of the separate, standalone `brainstorm-ai` skill (Decision, Seam, Scope, Acceptance Criteria,
 auto-derived branch type and lane) rather than inventing a second brainstorm format: whichever
 tool actually wrote a given `.ai/brainstorms/*.md` file, Readyset's own picker and reconciliation
-treat it identically. Grilling itself is an ordinary back-and-forth in the chat, not something
+treat it identically.
+
+The prompt driving this (`grillTurnPrompt` in `src/extensions/readyset-review.ts`) is adapted
+from mattpocock/skills' actual `grilling` skill, not a from-scratch guess at what that style
+means — the real thing is vendored verbatim (MIT-licensed) at `src/skill/mattpocock-grilling.md`
+for anyone tuning the wording to check against. One of its rules carried over close to verbatim
+because a real grilling run exposed exactly the gap it closes: **"finding facts is your job,
+never the user's."** An early run left a checkable external fact (a WhatsApp Business Platform
+tier requirement) as an open question instead of looking it up, even though a web search tool is
+a baseline part of the omp setup it ran in. The prompt now says so explicitly: a question a web
+search (or the repo) could actually answer doesn't belong in a round as an open question or a
+silent assumption — open questions are reserved for what only the user can decide or knows.
+
+Grilling itself is an ordinary back-and-forth in the chat, not something
 `/readyset-review`'s own code can wait on synchronously — it fires the opening question and
 returns; you answer normally, round by round, until the model writes the brainstorm file and
 tells you to run `/readyset-review` again to pick it up (Explore, then Propose). If you'd rather
@@ -257,12 +270,18 @@ src/
     readyset-omp-config.ts   reads omp's own ~/.omp/agent/config.yml for a default --model fallback
     readyset-review-overlay.ts  the Sidebar view Component — pure layout function + a
                              ctx.ui.custom()-driven overlay, zero runtime dependency on @oh-my-pi/pi-tui
+    readyset-structural-check.ts  the shared "(structural check)" summary wording validateChange
+                             and validateBrainstormContent both use
   extensions/
     readyset-review.ts      the /readyset-review command itself
   skill/
     SKILL.md                reference doc for the phase order + file formats; read by an agent
                              working a Readyset change directly, not loaded by the extension —
                              copied to ~/.omp/agent/skills/readyset/SKILL.md (see note below)
+    mattpocock-grilling.md  mattpocock/skills' actual `grilling` skill, vendored verbatim
+                             (MIT-licensed) — the real source grillTurnPrompt is adapted from,
+                             kept here to check wording against rather than a paraphrase of a
+                             paraphrase. Repo-internal reference only, not installed.
   cli/
     install.mjs            `readyset-review install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)

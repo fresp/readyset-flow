@@ -256,6 +256,15 @@ function codeReviewTurnPrompt(changeId: string): string {
  * half of the mitigation is structural and does run in code: `validateBrainstormContent`
  * (readyset-brainstorm.ts), checked before Explore ever spends a turn on whatever grilling
  * actually produced — see its call site in the command handler.
+ *
+ * The rules below are adapted from mattpocock/skills' actual `grilling` skill, vendored verbatim
+ * (MIT-licensed) at `src/skill/mattpocock-grilling.md` in this package -- check that file, not
+ * just this comment, when tuning wording, since it's the real source this was built from rather
+ * than a paraphrase of a paraphrase. One rule from there carried over close to verbatim because
+ * a real grilling run exposed exactly the gap it closes: "finding facts is your job, never the
+ * user's" -- an early run left a checkable external fact (a WhatsApp Business Platform tier
+ * requirement) as an open question/silent assumption instead of looking it up, even though a web
+ * search tool is a baseline part of this omp setup's toolset. See the corresponding bullet below.
  */
 const GRILL_ROUND_CAP = 4;
 function grillTurnPrompt(ideaText: string, today: string): string {
@@ -285,6 +294,11 @@ function grillTurnPrompt(ideaText: string, today: string): string {
 		"- Do real read-only repo research (Read/Grep/Glob, read-only git/shell commands) before or between " +
 		"rounds wherever it would sharpen a question or firm up a recommendation — don't ask the user something " +
 		"the repo already answers.\n" +
+		"- Finding facts is your job, never the user's (mattpocock/skills' own rule for this — see " +
+		"src/skill/mattpocock-grilling.md in this package). A question about external platform behavior, API " +
+		"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
+		"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
+		"real thing. Reserve open questions for what only the user can decide or knows.\n" +
 		"- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
 		"write at the end must be entirely in English regardless, exactly like the structure below.\n\n" +
 		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
