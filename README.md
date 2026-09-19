@@ -1,6 +1,6 @@
 <p align="center">
 
-<img src="assets/banner.svg" alt="Readyset — from rough idea to grounded, reviewable, executable change for omp" width="100%">{=html}
+<img src="assets/banner.png" alt="Readyset — from rough idea to grounded, reviewable, executable change for omp" width="100%">{=html}
 
 </p>
 
