@@ -214,6 +214,26 @@ function applyTurnPrompt(changeId: string): string {
 }
 
 /**
+ * `internalGuidance` for `ctx.compact()` when the user picks Approve & Compact. Deliberately not
+ * a user-facing "focus" instruction (see `ReviewCtx.compact`'s doc comment on why this rides the
+ * private `internalGuidance` channel, not `customInstructions`) — it tells the summarizer what's
+ * safe to compress away for a Readyset change specifically: proposal/design/specs/tasks are all
+ * persisted under readyset/changes/<id>/ already, so the Explore/Propose discussion that produced
+ * them isn't load-bearing for Apply, which re-reads those files from disk regardless of what's
+ * left in context (see `applyTurnPrompt`).
+ */
+function compactBeforeExecuteGuidance(changeId: string): string {
+	const paths = changePaths("", changeId);
+	return (
+		`Readyset change "${changeId}" was just approved for execution. Its proposal (${paths.proposal}), ` +
+		`design (${paths.design}), specs (${paths.specsDir}), and tasks (${paths.tasks}) are all persisted to ` +
+		"disk and will be re-read from there when execution starts — the Explore/Propose discussion that " +
+		"produced them does not need to be retained. Keep the change id and these file paths; the rest of " +
+		"that discussion can be summarized away."
+	);
+}
+
+/**
  * Code-review turn — new in pipeline v2, fires after every task is done but before the
  * archive offer. This is the mattpocock/skills "review critically in a separate pass"
  * pattern: the same turn that just implemented the change is a poor judge of its own diff
@@ -414,6 +434,26 @@ interface ReviewCtx {
 		current?: () => unknown;
 		resolve?: (spec: string) => unknown;
 	};
+	// Confirmed against the real `ExtensionContext` type (extensibility/extensions/types.ts):
+	// `compact(instructionsOrOptions)` is the same public API native /plan's own "Approve and
+	// compact context" option calls internally. `internalGuidance` is piped only to the native
+	// summarizer, never exposed as `customInstructions` on the `session_before_compact` hook, so
+	// extensions that treat that field as user focus don't mistake this package's boilerplate
+	// for the operator's own intent — same reasoning /plan's usage documents. `suppressContinuation`
+	// is set by the caller (`reviewAndMaybeExecute`) because it dispatches the Apply turn itself
+	// right after compacting, same as plan-mode does after its own "Approve and compact" — without
+	// it, a manual compaction that interrupts something in flight would also fire an unwanted
+	// auto-continue nudge. Optional because omp builds without it should still let Approve &
+	// Compact degrade to a plain Approve (see `reviewAndMaybeExecute`'s "compact" branch) rather
+	// than throw.
+	compact?: (
+		instructionsOrOptions?: string | { internalGuidance?: string; suppressContinuation?: boolean },
+	) => Promise<void>;
+	// Confirmed against the real type (`ContextUsage` in `@oh-my-pi/pi-tui/status-line/types`):
+	// `{ tokens, contextWindow, percent }`. Informational only — shown in the review panel so the
+	// user can judge for themselves whether Approve & Compact is worth reaching for; nothing here
+	// gates which CTAs are offered.
+	getContextUsage?: () => { tokens: number; contextWindow: number; percent: number } | undefined;
 }
 
 /**
@@ -834,8 +874,8 @@ async function buildSingleSectionDocument(ctx: ReviewCtx, chosen: BrainstormMeta
  * The review gate itself, whenever a real TUI is available — a persistent section list +
  * content pane via `ctx.ui.custom()` (Interactive mode only; see `readyset-review-overlay.ts`'s
  * module doc comment for how this was confirmed against `@oh-my-pi/pi-tui`'s own real source,
- * not assumed), with Approve & Execute / Refine / Discard as CTAs inside it (the `[A]`/`[R]`/`[D]`
- * keys `ReviewSidebarOverlay.handleInput` binds). Up/Down scroll the current section's content
+ * not assumed), with Approve & Execute / Approve & Compact / Refine / Discard as CTAs inside it
+ * (the `[A]`/`[C]`/`[R]`/`[D]` keys `ReviewSidebarOverlay.handleInput` binds). Up/Down scroll the current section's content
  * and cross into the next/previous section once it's exhausted; Left/Right jump straight to a
  * section, bypassing its content; PgUp/PgDn take a bigger scroll step within the current
  * section. Esc cancels (treated the same as an explicit Discard by the caller). Errors
@@ -903,6 +943,10 @@ async function browseReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snap
 }
 
 function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot, budget: TurnBudget): void {
+	// Informational only -- doesn't gate which CTAs are offered (Approve & Compact is always
+	// there; see reviewAndMaybeExecute). Lets the user judge for themselves whether it's worth
+	// reaching for right now instead of Readyset guessing at a threshold.
+	const usage = ctx.getContextUsage?.();
 	const lines = [
 		`Change: ${chosen.changeId}`,
 		snapshot.validated.summary,
@@ -918,6 +962,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 			: "runtime evidence: none",
 		snapshot.reviewed ? "code review: done — see REVIEW.md" : "code review: not run yet",
 		`agent turns this run: ${budget.spent}/${budget.max}`,
+		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
 	];
 	ctx.ui.setWidget?.(lines);
@@ -938,6 +983,7 @@ async function classicGateSelect(
 	for (;;) {
 		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
 			{ label: "Approve & Execute", description: `implement per tasks.md, then report progress — ${taskSummary}` },
+			{ label: "Approve & Compact", description: "compact context first (proposal/design/specs/tasks are already on disk), then implement" },
 			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
 			{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" },
 			{ label: "Discard", description: "leave as proposed, do nothing" },
@@ -948,6 +994,7 @@ async function classicGateSelect(
 			continue; // stay in the loop; re-show this same menu after they're done browsing
 		}
 		if (choice === "Approve & Execute") return "approve";
+		if (choice === "Approve & Compact") return "compact";
 		if (choice === "Refine") return "refine";
 		if (choice === "Discard") return "discard";
 		return undefined; // cancelled (no choice)
@@ -960,10 +1007,12 @@ async function classicGateSelect(
  * re-invoking the command either.
  *
  * Whenever `ctx.ui.custom` is available, the sidebar overlay opens automatically at the top of
- * every loop iteration — it IS the review gate, with Approve & Execute / Refine / Discard as
- * CTAs baked into it, not a "Sidebar view" choice offered on a separate menu the user had to
- * pick first. `classicGateSelect` is the fallback for contexts without a real TUI, and also
- * covers the (rare) case where the overlay itself throws on open.
+ * every loop iteration — it IS the review gate, with Approve & Execute / Approve & Compact /
+ * Refine / Discard as CTAs baked into it, not a "Sidebar view" choice offered on a separate menu
+ * the user had to pick first. `classicGateSelect` is the fallback for contexts without a real
+ * TUI, and also covers the (rare) case where the overlay itself throws on open. Approve & Compact
+ * runs `ctx.compact()` before falling through to the same Apply flow Approve & Execute uses —
+ * see the "compact" branch below and `ReviewCtx.compact`'s doc comment.
  */
 async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: BrainstormMeta, budget: TurnBudget): Promise<void> {
 	let chosen = initial;
@@ -991,6 +1040,35 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 		}
 
 		if (!choice || choice === "discard") return;
+
+		// "compact" is Approve & Execute's sibling — same destination, but ctx.compact() runs
+		// first (see ReviewCtx.compact's doc comment for why this is the same public API native
+		// /plan's own "Approve and compact context" calls, and compactBeforeExecuteGuidance's doc
+		// comment for why it's safe here: everything Explore/Propose produced is already
+		// persisted under readyset/changes/<id>/). `suppressContinuation: true` because this
+		// function dispatches the Apply turn itself right below, same as plan-mode does after its
+		// own compact-before-execute. Falls through to the ordinary "approve" branch either way —
+		// a missing ctx.compact (older omp build) or a failed compaction degrades to a plain
+		// Approve & Execute rather than blocking the user from proceeding at all.
+		if (choice === "compact") {
+			if (typeof ctx.compact === "function") {
+				ctx.ui.notify(`Compacting context before executing "${chosen.changeId}"...`, "info");
+				try {
+					await ctx.compact({
+						internalGuidance: compactBeforeExecuteGuidance(chosen.changeId),
+						suppressContinuation: true,
+					});
+				} catch (err) {
+					ctx.ui.notify(
+						`Compact failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.`,
+						"warning",
+					);
+				}
+			} else {
+				ctx.ui.notify("Compact isn't available in this context — approving without it.", "warning");
+			}
+			choice = "approve";
+		}
 
 		if (choice === "refine") {
 			const feedback = ctx.ui.input ? await ctx.ui.input("What should change?") : undefined;

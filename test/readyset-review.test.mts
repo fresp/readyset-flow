@@ -1076,9 +1076,10 @@ await test("Sidebar overlay opens automatically as the review gate when ctx.ui.c
     async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (r: unknown) => void) => unknown, options: unknown) {
       customCalls.push(options);
       // Exercise the factory the way real Interactive mode would: build the overlay, confirm it
-      // renders without throwing (including its Approve/Refine/Discard CTA bar), then close it
-      // as if the user pressed Esc -- our keybindings stub always says no, so nothing calls
-      // done() and it just resolves undefined (== cancel, same as an explicit Discard).
+      // renders without throwing (including its Approve/Approve & Compact/Refine/Discard CTA
+      // bar), then close it as if the user pressed Esc -- our keybindings stub always says no,
+      // so nothing calls done() and it just resolves undefined (== cancel, same as an explicit
+      // Discard).
       let resolved: unknown;
       const overlay = factory(
         {},
@@ -1089,7 +1090,10 @@ await test("Sidebar overlay opens automatically as the review gate when ctx.ui.c
       const rendered = overlay.render(100);
       assert.ok(Array.isArray(rendered) && rendered.length > 0, "overlay factory should produce a real Component with render()");
       assert.ok(rendered.some(l => l.includes("Proposal")), "overlay should include the Proposal section heading");
-      assert.ok(rendered.some(l => l.includes("Approve & Execute") && l.includes("Refine") && l.includes("Discard")), "overlay should render its own Approve/Refine/Discard CTA bar");
+      assert.ok(
+        rendered.some(l => l.includes("Approve & Execute") && l.includes("Approve & Compact") && l.includes("Refine") && l.includes("Discard")),
+        "overlay should render its own Approve/Approve & Compact/Refine/Discard CTA bar",
+      );
       overlay.handleInput?.("\x1b");
       return resolved;
     },
@@ -1431,6 +1435,99 @@ await test("readyset_ask: round cap is enforced in code -- stops opening the dia
   // one more call past the cap must not open the dialog again
   await tool.execute("call", oneQuestion, undefined, undefined, ctx);
   assert.equal(askDialogCallCount, callsAtCap, "askDialog should not be called again once the cap is hit");
+});
+
+await test("Approve & Compact calls ctx.compact() with internalGuidance + suppressContinuation before Apply, same destination as Approve & Execute", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-20-compact.md", {
+    title: "Compact Test",
+    status: "proposed",
+    created: "2026-01-20",
+    change_id: "compact-test",
+  });
+  const dir = join(cwd, "readyset", "changes", "compact-test");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\ncompact test\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-01-20 · Compact Test"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Compact");
+  fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
+
+  // Apply turn effect
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  // Code-review turn effect
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const compactCalls: unknown[] = [];
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    async compact(opts: unknown) {
+      compactCalls.push(opts);
+    },
+  };
+  await handler([], ctx);
+
+  assert.equal(compactCalls.length, 1, "ctx.compact should be called exactly once");
+  const opts = compactCalls[0] as { internalGuidance?: string; suppressContinuation?: boolean };
+  assert.match(opts.internalGuidance ?? "", /compact-test/, "internalGuidance should name the change id");
+  assert.match(opts.internalGuidance ?? "", /readyset\/changes\/compact-test/, "internalGuidance should point at the persisted artifacts");
+  assert.equal(opts.suppressContinuation, true, "the caller dispatches Apply itself right after, so continuation must be suppressed");
+
+  // Same destination as Approve & Execute once compaction is done: Apply, then Code review.
+  assert.equal(fakePiWrap.calls.length, 2);
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "compact-test"/);
+  assert.match(fakePiWrap.calls[1].prompt, /Critically review the implementation of Readyset change "compact-test"/);
+});
+
+await test("Approve & Compact degrades to a plain Approve & Execute when ctx.compact isn't available", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-21-nocompact.md", {
+    title: "No Compact Test",
+    status: "proposed",
+    created: "2026-01-21",
+    change_id: "no-compact-test",
+  });
+  const dir = join(cwd, "readyset", "changes", "no-compact-test");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nno compact test\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-01-21 · No Compact Test"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Compact");
+  fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  // No `compact` on this ctx at all -- an older omp build, or one that never exposed it.
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Compact isn't available in this context/.test(n.message)),
+    "should warn that it's proceeding without compacting",
+  );
+  assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire, same as a plain Approve & Execute");
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "no-compact-test"/);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
