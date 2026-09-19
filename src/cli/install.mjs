@@ -5,6 +5,9 @@
  * Usage:
  *   npx readyset-flow install
  *   npx readyset-flow install --target /path/to/.omp   (defaults to ~/.omp)
+ *   npx readyset-flow configure   (interactive wizard for readyset: in ~/.omp/agent/config.yml
+ *                                  -- see configure.mjs's own module doc comment; a separate
+ *                                  command on purpose, so `install` itself stays non-interactive)
  *
  * Readyset installs GLOBALLY, into the user's own omp home directory (`~/.omp`), not into a
  * per-project repo. It's a personal workflow extension — like the other extensions already
@@ -60,10 +63,19 @@ import { dirname, join, basename } from "node:path";
 import { homedir } from "node:os";
 import { mkdir, copyFile, readFile, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { runConfigureWizard } from "./configure.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..", "..");
 const DEFAULT_TARGET = join(homedir(), ".omp");
+// Deliberately NOT derived from `--target`: readyset-omp-config.ts's OMP_CONFIG_PATH (what
+// /readyset actually reads at runtime, via readPinnedModel/readFallbackChain/readPreferredLanguage)
+// is always ~/.omp/agent/config.yml, regardless of where --target pointed the extension link
+// itself -- those functions are called with no argument from readyset-review.ts, so they never
+// see --target either. Writing the wizard's output anywhere else would produce a file /readyset
+// never reads. Kept as a separate constant (not imported from the .ts file) so install.mjs stays
+// import-free of .ts modules -- see the module doc comment above.
+const OMP_CONFIG_PATH = join(homedir(), ".omp", "agent", "config.yml");
 
 // The one file this package's own extension module is: what settings.json's `extensions` array
 // gets pointed at. Exported so a test can exercise `linkExtension` against a scratch settings.json
@@ -245,11 +257,20 @@ async function main() {
 		await validate(args.positional[0], args.cwd);
 		return;
 	}
+	if (args.command === "configure") {
+		const runnerPath = join(packageRoot, "src", "cli", "configure-runner.mts");
+		await runConfigureWizard(OMP_CONFIG_PATH, { spawnSync, runnerPath });
+		return;
+	}
 
 	console.log("Readyset CLI\n");
 	console.log("Usage:");
 	console.log("  readyset-flow install [--target <path>]        Reference this package's extension in <target>/agent/settings.json");
 	console.log("                                                    (defaults to ~/.omp) and refresh the installed skill doc");
+	console.log("  readyset-flow configure                        Interactive wizard for the readyset: section of");
+	console.log("                                                    ~/.omp/agent/config.yml (language, model, fallback chain) --");
+	console.log("                                                    never runs on its own; only install/validate/version are");
+	console.log("                                                    non-interactive and safe to script");
 	console.log("  readyset-flow validate <change-id> [--cwd <path>]");
 	console.log("                                                    Run the same structural check the omp gate runs, outside omp");
 	console.log("                                                    (CI, pre-commit) -- exit code 0 on pass, 1 on issues found");

@@ -34,6 +34,7 @@ Rough idea → GRILL → EXPLORE → PROPOSE → REVIEW → EXECUTE → ARCHIVE
 - [Design philosophy](#design-philosophy)
 - [How it works](#how-it-works)
 - [Install](#install)
+- [Configure](#configure)
 - [Validate from the CLI](#validate-from-the-cli)
 - [Use](#use)
   - [Grilling — turning an idea into a brainstorm](#grilling--turning-an-idea-into-a-brainstorm)
@@ -137,6 +138,27 @@ elsewhere — a scratch directory, or `<repo>/.omp` to scope this to one project
 Since nothing runtime is copied, code changes need no re-install. Re-run only after moving the
 package, or to refresh the installed skill doc.
 
+## Configure
+
+`/readyset`'s grilling language, default model, and fallback chain live in a `readyset:` section
+of `~/.omp/agent/config.yml` — the same file for every repo, independent of `--target`. Set it up
+with a wizard instead of hand-editing YAML:
+
+```
+npx readyset-flow configure
+```
+
+Walks through language, default model, and fallback chain one at a time, showing whatever's
+already set as the current value. Blank keeps it, a single `-` clears it, anything else replaces
+it. Answer `n` at the first prompt (or Ctrl-C) and nothing is written — you get the block printed
+back to paste in by hand instead. A separate command from `install` on purpose: `install` stays
+non-interactive and script-safe; `configure` is the only command in this package that blocks on
+stdin, so it only runs when you actually ask for it.
+
+Writing this back never touches anything else in `config.yml` — no YAML re-serialization, just a
+plain-text splice of the existing `readyset:` block (or an append if there isn't one yet), so
+comments, key order, and every other section survive untouched.
+
 ## Validate from the CLI
 
 ```
@@ -228,7 +250,9 @@ chrome rather than conversation.
 `--model` pins one model for every turn this run fires, reproducible regardless of whatever model
 was active in the invoking session. The original model is restored once the run finishes.
 
-Without `--model`, Readyset reads a default from omp's own `~/.omp/agent/config.yml`:
+Without `--model`, Readyset reads a default from omp's own `~/.omp/agent/config.yml`. Set it with
+`npx readyset-flow configure` (see [Configure](#configure)) instead of hand-editing YAML, or edit
+it directly:
 
 ```yaml
 readyset:
@@ -340,8 +364,14 @@ src/
                              (MIT-licensed) — the real source grillTurnPrompt is adapted from,
                              kept here to check wording against. Repo-internal reference only.
   cli/
-    install.mjs            `readyset-flow install`/`version`/`validate` — the CLI entry point
-    validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
+    install.mjs             `readyset-flow install`/`version`/`validate`/`configure` — the CLI entry point
+    validate-runner.mts     subprocess `validate` spawns with --experimental-strip-types (see README)
+    configure.mjs           `readyset-flow configure`'s interactive wizard + the plain-text
+                             splice that writes ~/.omp/agent/config.yml's readyset: block back
+                             without a YAML library or touching anything else in the file
+    configure-runner.mts    subprocess `configure` spawns to read the *current* readyset: values
+                             via the real parser in readyset-omp-config.ts, so the wizard's
+                             prefill can never drift from what /readyset itself resolves
 
 resources/
   brainstorm-ai/           a companion Claude Skill for brainstorming outside omp entirely (see
