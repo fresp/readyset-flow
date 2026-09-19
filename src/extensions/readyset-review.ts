@@ -23,7 +23,7 @@ import {
 	scaffoldChange,
 	validateChange,
 } from "../lib/readyset-spec.ts";
-import { readFallbackModel, readPinnedModel } from "../lib/readyset-omp-config.ts";
+import { readFallbackChain, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
 import { ReviewSidebarOverlay, type OverlaySection } from "../lib/readyset-review-overlay.ts";
 
 /** Minimal structural shape this file actually calls — deliberately not importing the real
@@ -267,7 +267,7 @@ function codeReviewTurnPrompt(changeId: string): string {
  * search tool is a baseline part of this omp setup's toolset. See the corresponding bullet below.
  */
 const GRILL_ROUND_CAP = 4;
-function grillTurnPrompt(ideaText: string, today: string): string {
+function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: string): string {
 	return (
 		"Grill this raw idea into a decided Readyset brainstorm file, mattpocock/skills style — interrogate it, " +
 		`don't just accept it. Raw idea from the user: "${ideaText}"\n\n` +
@@ -299,8 +299,13 @@ function grillTurnPrompt(ideaText: string, today: string): string {
 		"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
 		"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
 		"real thing. Reserve open questions for what only the user can decide or knows.\n" +
-		"- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
-		"write at the end must be entirely in English regardless, exactly like the structure below.\n\n" +
+		(preferredLanguage
+			? `- Preferred language for this discussion: ${preferredLanguage}. Write your FIRST round of questions, ` +
+				"and every reply after, in that language -- don't wait for the user to reply in it first before " +
+				"switching. The brainstorm FILE you write at the end must still be entirely in English regardless, " +
+				"exactly like the structure below.\n\n"
+			: "- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
+				"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
 		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
 		"rules, so the file reads as though that skill wrote it: which option is decided (or explicitly " +
 		"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Then auto-derive " +
@@ -374,23 +379,27 @@ interface ReviewCtx {
  * to `setModel()` unchanged for restoration. If either API is missing on a given omp build,
  * this degrades to running with whatever model the session already has, with a warning.
  *
- * `modelSpec` can come from the `--model` flag or from `readyset.model` in
- * `~/.omp/agent/config.yml` (flag wins if both are set) — `source` is just for the
- * notification text, so it's clear which one actually took effect.
+ * `modelSpec` can come from the `--model` flag or from `readyset.model` (its `.default`, in the
+ * current nested shape, or the bare legacy value) in `~/.omp/agent/config.yml` (flag wins if
+ * both are set) — `source` is just for the notification text, so it's clear which one actually
+ * took effect.
  *
- * `fallbackSpec`/`fallbackSource` (optional) cover only the pin itself failing to apply — i.e.
+ * `fallbackChain` (optional, possibly empty) covers only the pin itself failing to apply — i.e.
  * `setModel()` throwing while switching to `modelSpec`, which usually means the configured
- * spec is wrong (typo, retired model), not that the model is transiently unavailable. A
- * runtime provider outage mid-turn is a different problem, and omp already has its own answer
- * for it (`retry.fallbackChains` in `~/.omp/agent/config.yml`, applied automatically to
- * whatever model is active) — this does not attempt to duplicate that.
+ * spec is wrong (typo, retired model), not that the model is transiently unavailable. Each
+ * entry is tried in order, stopping at the first that pins successfully; only once every entry
+ * has failed does this give up and run unpinned. A runtime provider outage mid-turn is a
+ * different problem, and omp already has its own answer for it (`retry.fallbackChains` in
+ * `~/.omp/agent/config.yml`, applied automatically to whatever model is active) — this does not
+ * attempt to duplicate that. `fallbackSource` labels the whole chain (it's read from one place
+ * in config, or is a single `--fallback-model` flag value), not each entry individually.
  */
-async function withPinnedModel<T>(
+export async function withPinnedModel<T>(
 	pi: ExtensionAPI,
 	ctx: ReviewCtx,
 	modelSpec: string | undefined,
 	source: string,
-	fallbackSpec: string | undefined,
+	fallbackChain: string[],
 	fallbackSource: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
@@ -422,24 +431,38 @@ async function withPinnedModel<T>(
 		await setModel(resolved);
 	} catch (err) {
 		const reason = err instanceof Error ? err.message : String(err);
-		if (!fallbackSpec) {
+		if (fallbackChain.length === 0) {
 			ctx.ui.notify(
-				`Couldn't pin model "${modelSpec}" (from ${source}): ${reason}. No fallback configured (readyset.fallbackModel) — ` +
+				`Couldn't pin model "${modelSpec}" (from ${source}): ${reason}. No fallback configured (readyset.model.fallbackChains) — ` +
 					"running with whatever model this session already has.",
 				"warning",
 			);
 			return fn();
 		}
-		ctx.ui.notify(`Couldn't pin model "${modelSpec}" (from ${source}): ${reason}. Trying fallback "${fallbackSpec}" (from ${fallbackSource})...`, "warning");
-		try {
-			const resolvedFallback = ctx.models.resolve ? ctx.models.resolve(fallbackSpec) : fallbackSpec;
-			await setModel(resolvedFallback);
-			activeSpec = fallbackSpec;
-			activeSource = fallbackSource;
-		} catch (fallbackErr) {
-			const fallbackReason = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+
+		let pinned = false;
+		for (const [i, fallbackSpec] of fallbackChain.entries()) {
 			ctx.ui.notify(
-				`Fallback model "${fallbackSpec}" (from ${fallbackSource}) also failed to pin: ${fallbackReason}. ` +
+				i === 0
+					? `Couldn't pin model "${modelSpec}" (from ${source}): ${reason}. Trying fallback "${fallbackSpec}" (from ${fallbackSource})...`
+					: `Fallback "${fallbackChain[i - 1]}" also failed to pin. Trying next fallback "${fallbackSpec}" (from ${fallbackSource})...`,
+				"warning",
+			);
+			try {
+				const resolvedFallback = ctx.models.resolve ? ctx.models.resolve(fallbackSpec) : fallbackSpec;
+				await setModel(resolvedFallback);
+				activeSpec = fallbackSpec;
+				activeSource = fallbackSource;
+				pinned = true;
+				break;
+			} catch {
+				// try the next entry in the chain
+			}
+		}
+
+		if (!pinned) {
+			ctx.ui.notify(
+				`Every fallback in the chain (${fallbackChain.join(", ")}, from ${fallbackSource}) failed to pin. ` +
 					"Running with whatever model this session already has.",
 				"warning",
 			);
@@ -501,16 +524,16 @@ async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string)
  * turns that follow are ordinary chat turns the user answers directly (see `grillTurnPrompt`'s
  * doc comment). Handler call sites `return` right after this.
  */
-function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string): void {
+function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, preferredLanguage?: string): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
 	ctx.ui.notify(
-		`Grilling started for: "${preview}" — Readyset will ask questions right here in the chat; answer them, ` +
-			"and it'll write the brainstorm file once the design is genuinely resolved. Run /readyset " +
-			"again afterward to pick it up from there.",
+		`Grilling started for: "${preview}"${preferredLanguage ? ` in ${preferredLanguage}` : ""} — Readyset will ask questions ` +
+			"right here in the chat; answer them, and it'll write the brainstorm file once the design is genuinely " +
+			"resolved. Run /readyset again afterward to pick it up from there.",
 		"info",
 	);
-	pi.sendUserMessage(grillTurnPrompt(ideaText, today), { deliverAs: "nextTurn", triggerTurn: true });
+	pi.sendUserMessage(grillTurnPrompt(ideaText, today, preferredLanguage), { deliverAs: "nextTurn", triggerTurn: true });
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -944,7 +967,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("readyset", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +
-			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --model <spec> to pin a model " +
+			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --lang <language> to open " +
+			"grilling's discussion in that language from round 1 (must come before --idea), --model <spec> to pin a model " +
 			"for this run's turns, --fallback-model <spec> if the pin fails to apply)",
 		handler: async (args, ctx) => {
 			const showAll = args?.includes("--all");
@@ -954,13 +978,27 @@ export default function (pi: ExtensionAPI) {
 			// separate init step or CLI to run first.
 			await ensureReadysetRoot(ctx.cwd);
 
+			// --lang <language> (or, if no flag, readyset.language in ~/.omp/agent/config.yml) sets
+			// the language grilling's discussion (questions and replies) opens in from round 1,
+			// rather than grillTurnPrompt's reactive default of matching whatever language the
+			// user's own replies happen to be in -- for a dev who isn't fluent in English, waiting
+			// for them to switch first means round 1 always arrives in English regardless. The
+			// brainstorm FILE itself stays English either way (see grillTurnPrompt). Must come
+			// before --idea on the command line: --idea joins everything after it into the idea
+			// text, so a --lang placed after --idea would be swallowed into that text instead of
+			// parsed as a flag.
+			const langFlagIdx = args?.indexOf("--lang") ?? -1;
+			const langFromFlag = langFlagIdx >= 0 ? args?.[langFlagIdx + 1] : undefined;
+			const resolvedConfigLanguage = langFromFlag ? undefined : await readPreferredLanguage();
+			const preferredLanguage = langFromFlag ?? resolvedConfigLanguage?.language;
+
 			// --idea skips the picker entirely: everything after it is joined back into the raw idea
 			// text (so it need not be quoted as a single arg), and grilling starts immediately. Must
 			// come last among flags on the command line.
 			const ideaFlagIdx = args?.indexOf("--idea") ?? -1;
 			const ideaFromFlag = ideaFlagIdx >= 0 ? (args ?? []).slice(ideaFlagIdx + 1).join(" ").trim() : "";
 			if (ideaFromFlag) {
-				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag);
+				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, preferredLanguage);
 				return;
 			}
 
@@ -1014,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("No idea given -- nothing started.", "info");
 					return;
 				}
-				startGrilling(pi, reviewCtxForInput, idea);
+				startGrilling(pi, reviewCtxForInput, idea, preferredLanguage);
 				return;
 			}
 
@@ -1036,9 +1074,11 @@ export default function (pi: ExtensionAPI) {
 			// that invoked it. The original model is restored once this run finishes, whether it
 			// completes, stops early (Discard, budget exhausted), or throws. Flag wins over config.
 			//
-			// --fallback-model <spec> (or readyset.fallbackModel) is tried if pinning the resolved
-			// model above fails outright (a bad/retired spec) — see withPinnedModel's doc comment
-			// for why this is narrower than, and doesn't replace, omp's own retry.fallbackChains.
+			// --fallback-model <spec> (a single spec, not a chain) or readyset.model.fallbackChains
+			// (an ordered list, tried in turn until one pins — legacy readyset.fallbackModel still
+			// works too, as a one-element chain) is tried if pinning the resolved model above fails
+			// outright (a bad/retired spec) — see withPinnedModel's doc comment for why this is
+			// narrower than, and doesn't replace, omp's own retry.fallbackChains.
 			const modelFlagIdx = args?.indexOf("--model") ?? -1;
 			const modelFromFlag = modelFlagIdx >= 0 ? args?.[modelFlagIdx + 1] : undefined;
 			const resolvedConfigModel = modelFromFlag ? undefined : await readPinnedModel();
@@ -1047,11 +1087,11 @@ export default function (pi: ExtensionAPI) {
 
 			const fallbackFlagIdx = args?.indexOf("--fallback-model") ?? -1;
 			const fallbackFromFlag = fallbackFlagIdx >= 0 ? args?.[fallbackFlagIdx + 1] : undefined;
-			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackModel();
-			const fallbackModel = fallbackFromFlag ?? resolvedConfigFallback?.model;
-			const fallbackModelSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");
+			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
+			const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
+			const fallbackChainSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");
 
-			await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackModel, fallbackModelSource, async () => {
+			await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
 				if (isProposed(chosen.status)) {
 					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget);
 					return;

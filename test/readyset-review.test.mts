@@ -800,9 +800,61 @@ await test("both --model and --fallback-model fail to pin -> runs unpinned rathe
   await captured.handler(["--model", "bad/primary", "--fallback-model", "also/bad"], ctx);
 
   assert.equal(setModelCalls.length, 2); // primary attempted, fallback attempted, no restore (nothing succeeded)
-  assert.ok(fakeUiWrap.notifications.some((n) => /also failed to pin/.test(n.message) && n.level === "warning"));
+  assert.ok(fakeUiWrap.notifications.some((n) => /Every fallback in the chain.*failed to pin/.test(n.message) && n.level === "warning"));
   // the run still reached the review gate (Discard) rather than aborting
   assert.ok(fakeUiWrap.selectPrompts.some((p) => p.includes("Review change")));
+});
+
+await test("fallbackChains array: tries every entry in order until one pins, not just the first", async () => {
+  const { withPinnedModel } = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    withPinnedModel: <T>(
+      pi: unknown,
+      ctx: unknown,
+      modelSpec: string | undefined,
+      source: string,
+      fallbackChain: string[],
+      fallbackSource: string,
+      fn: () => Promise<T>,
+    ) => Promise<T>;
+  };
+
+  const setModelCalls: unknown[] = [];
+  const fakePi = {
+    async setModel(spec: unknown) {
+      setModelCalls.push(spec);
+      if (spec !== "resolved:third/good-model") throw new Error(`model not found: ${spec}`);
+    },
+  };
+  const fakeUiWrap = makeFakeUi();
+  const ctx = {
+    ui: fakeUiWrap.ui,
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+  };
+
+  let ran = false;
+  await withPinnedModel(
+    fakePi,
+    ctx,
+    "bad/primary-model",
+    "--model flag",
+    ["also/bad", "still/bad", "third/good-model"],
+    "readyset.model.fallbackChains in ~/.omp/agent/config.yml",
+    async () => {
+      ran = true;
+    },
+  );
+
+  assert.ok(ran, "fn should have run once a chain entry pinned");
+  assert.deepEqual(setModelCalls, [
+    "resolved:bad/primary-model",
+    "resolved:also/bad",
+    "resolved:still/bad",
+    "resolved:third/good-model",
+    "session-default-model", // restore
+  ]);
+  assert.ok(fakeUiWrap.notifications.some((n) => /Pinned model "third\/good-model"/.test(n.message)));
+  assert.ok(fakeUiWrap.notifications.some((n) => /Trying fallback "also\/bad"/.test(n.message)));
+  assert.ok(fakeUiWrap.notifications.some((n) => /Trying next fallback "still\/bad"/.test(n.message)));
 });
 
 await test("review gate pushes a full compiled document (all sections) to the editor pane", async () => {
@@ -971,6 +1023,38 @@ await test("--idea skips the picker entirely and fires a grill turn as the first
   // looking it up. See src/skill/mattpocock-grilling.md for the vendored source rule.
   assert.match(fakePiWrap.calls[0].prompt, /[Ff]inding facts is your job, never the user's/);
   assert.match(fakePiWrap.calls[0].prompt, /web search tool/);
+});
+
+await test("--lang before --idea opens grilling's discussion in that language from round 1", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler(["--lang", "Indonesian", "--idea", "Add", "a", "dark", "mode", "toggle"], ctx);
+
+  assert.equal(fakePiWrap.calls.length, 1);
+  assert.match(fakePiWrap.calls[0].prompt, /Preferred language for this discussion: Indonesian/);
+  assert.match(fakePiWrap.calls[0].prompt, /Add a dark mode toggle/);
+  // --lang's own value must not leak into the idea text (it's parsed out before --idea's join).
+  assert.doesNotMatch(fakePiWrap.calls[0].prompt, /Raw idea from the user: "--lang/);
+  assert.ok(fakeUiWrap.notifications.some((n) => /Grilling started for.*in Indonesian/.test(n.message)));
+});
+
+await test("no --lang flag: grillTurnPrompt keeps its reactive default (no 'Preferred language' line)", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler(["--idea", "Add", "a", "dark", "mode", "toggle"], ctx);
+
+  assert.doesNotMatch(fakePiWrap.calls[0].prompt, /Preferred language for this discussion/);
+  assert.match(fakePiWrap.calls[0].prompt, /Reply in whatever language the user is using/);
 });
 
 await test("no --idea flag, brainstorms exist: 'Type a new idea' is offered, prompts for the idea, then grills it", async () => {

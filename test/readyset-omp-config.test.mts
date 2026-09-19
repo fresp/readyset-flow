@@ -2,7 +2,18 @@ import { writeFile, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
-import { parseFallbackModel, parseModelOverride, parseOmpDefaultModel, readFallbackModel, readPinnedModel } from "../src/lib/readyset-omp-config.ts";
+import {
+	parseFallbackChain,
+	parseFallbackModel,
+	parseLanguageOverride,
+	parseModelOverride,
+	parseOmpDefaultModel,
+	parseYamlSubset,
+	readFallbackChain,
+	readFallbackModel,
+	readPinnedModel,
+	readPreferredLanguage,
+} from "../src/lib/readyset-omp-config.ts";
 
 let pass = 0;
 let fail = 0;
@@ -115,6 +126,113 @@ await test("readFallbackModel: reads a real file at an overridden path", async (
 await test("readFallbackModel: missing file or key -> {model: undefined, source: undefined}", async () => {
   const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
   assert.deepEqual(await readFallbackModel(join(dir, "does-not-exist.yml")), { model: undefined, source: undefined });
+});
+
+await test("parseLanguageOverride: reads readyset.language, sibling to readyset.model", () => {
+  const raw = "readyset:\n  model: anthropic/claude-opus-5\n  language: Indonesian\n";
+  assert.equal(parseLanguageOverride(raw), "Indonesian");
+});
+
+await test("parseLanguageOverride: not set -> undefined", () => {
+  assert.equal(parseLanguageOverride("readyset:\n  model: anthropic/claude-opus-5\n"), undefined);
+});
+
+await test("readPreferredLanguage: reads a real file at an overridden path", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  language: Indonesian\n", "utf8");
+  assert.deepEqual(await readPreferredLanguage(configPath), {
+    language: "Indonesian",
+    source: "readyset.language in ~/.omp/agent/config.yml",
+  });
+});
+
+await test("readPreferredLanguage: missing file or key -> {language: undefined, source: undefined}", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  assert.deepEqual(await readPreferredLanguage(join(dir, "does-not-exist.yml")), { language: undefined, source: undefined });
+});
+
+await test("parseYamlSubset: nested mapping under a mapping (readyset.model.default)", () => {
+  const raw = "readyset:\n  model:\n    default: anthropic/claude-opus-5\n";
+  const doc = parseYamlSubset(raw) as any;
+  assert.equal(doc.readyset.model.default, "anthropic/claude-opus-5");
+});
+
+await test("parseYamlSubset: a list under a nested key (fallbackChains)", () => {
+  const raw = "readyset:\n  model:\n    default: a\n    fallbackChains:\n      - b\n      - c\n";
+  const doc = parseYamlSubset(raw) as any;
+  assert.deepEqual(doc.readyset.model.fallbackChains, ["b", "c"]);
+});
+
+await test("parseYamlSubset: strips comments and quotes on both mapping and list lines", () => {
+  const raw = ["readyset:", "  model:", '    default: "a/b" # pinned', "    fallbackChains:", "      - 'c/d' # first try", "      - e/f"].join("\n");
+  const doc = parseYamlSubset(raw) as any;
+  assert.equal(doc.readyset.model.default, "a/b");
+  assert.deepEqual(doc.readyset.model.fallbackChains, ["c/d", "e/f"]);
+});
+
+await test("parseYamlSubset: blank lines and comment-only lines are ignored", () => {
+  const raw = ["# top comment", "readyset:", "", "  # nested comment", "  model: a/b", ""].join("\n");
+  const doc = parseYamlSubset(raw) as any;
+  assert.equal(doc.readyset.model, "a/b");
+});
+
+await test("parseModelOverride: nested readyset.model.default (current shape)", () => {
+  const raw = "readyset:\n  model:\n    default: anthropic/claude-opus-5\n    fallbackChains:\n      - anthropic/claude-sonnet-5\n";
+  assert.equal(parseModelOverride(raw), "anthropic/claude-opus-5");
+});
+
+await test("parseModelOverride: bare readyset.model (legacy shape) still works", () => {
+  const raw = "readyset:\n  model: anthropic/claude-opus-5\n";
+  assert.equal(parseModelOverride(raw), "anthropic/claude-opus-5");
+});
+
+await test("parseFallbackChain: reads readyset.model.fallbackChains as an ordered list", () => {
+  const raw = "readyset:\n  model:\n    default: a\n    fallbackChains:\n      - b\n      - c\n      - d\n";
+  assert.deepEqual(parseFallbackChain(raw), ["b", "c", "d"]);
+});
+
+await test("parseFallbackChain: falls back to legacy readyset.fallbackModel as a one-element chain", () => {
+  const raw = "readyset:\n  model: a\n  fallbackModel: b\n";
+  assert.deepEqual(parseFallbackChain(raw), ["b"]);
+});
+
+await test("parseFallbackChain: fallbackChains wins over legacy fallbackModel when both are set", () => {
+  const raw = "readyset:\n  model:\n    default: a\n    fallbackChains:\n      - b\n      - c\n  fallbackModel: z\n";
+  assert.deepEqual(parseFallbackChain(raw), ["b", "c"]);
+});
+
+await test("parseFallbackChain: neither set -> empty array", () => {
+  assert.deepEqual(parseFallbackChain("readyset:\n  model: a\n"), []);
+});
+
+await test("readFallbackChain: reads a real file with a multi-entry chain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(
+    configPath,
+    "readyset:\n  model:\n    default: eai1/cbai/deepseek-v4.1-flash\n    fallbackChains:\n      - eai1/cbai/deepseek-v4.1-flash\n      - eai2/muse-spark-1.3-contributor\n",
+    "utf8",
+  );
+  assert.deepEqual(await readFallbackChain(configPath), {
+    chain: ["eai1/cbai/deepseek-v4.1-flash", "eai2/muse-spark-1.3-contributor"],
+    source: "readyset.model.fallbackChains in ~/.omp/agent/config.yml",
+  });
+});
+
+await test("readFallbackChain: missing file or key -> {chain: [], source: undefined}", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  assert.deepEqual(await readFallbackChain(join(dir, "does-not-exist.yml")), { chain: [], source: undefined });
+});
+
+await test("readFallbackModel (deprecated): still returns the chain's first entry for backward compat", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  model:\n    default: a\n    fallbackChains:\n      - b\n      - c\n", "utf8");
+  assert.deepEqual(await readFallbackModel(configPath), {
+    model: "b",
+    source: "readyset.model.fallbackChains in ~/.omp/agent/config.yml",
+  });
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

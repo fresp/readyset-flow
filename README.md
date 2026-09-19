@@ -137,6 +137,28 @@ tells you to run `/readyset` again to pick it up (Explore, then Propose). If you
 hand-write or dictate the brainstorm to a separate tool first, that path still works exactly as
 before.
 
+By default, grilling's own reactive rule kicks in: reply in whatever language you use, once you
+use it — so round 1 itself still arrives in English, since there's no signal yet of what
+language you'd rather use. `--lang <language>` (placed *before* `--idea` — `--idea` joins
+everything after it into the idea text, so a `--lang` placed after it would just become part of
+that text) opens the discussion in that language from round 1 instead:
+
+```
+/readyset --lang Indonesian --idea "let users export their data as CSV"
+```
+
+Or set a default once in `~/.omp/agent/config.yml` so you don't have to type it every run
+(`--lang` still wins if given):
+
+```yaml
+readyset:
+  language: Indonesian
+```
+
+Either way, only the *discussion* changes language — the brainstorm FILE `/readyset --idea`
+eventually writes is always entirely in English, same structure either way, since that's what
+the rest of Readyset (and most tooling reading `.ai/brainstorms/*.md`) expects.
+
 `--model` pins one model for every turn this run fires (Explore through Code-review), so a run
 is reproducible independent of whatever model happened to be active in the chat session that
 invoked it. The session's original model is restored once the run finishes, whether it
@@ -146,27 +168,35 @@ Without `--model`, Readyset reads a default out of omp's own `~/.omp/agent/confi
 doesn't invent a second, separate config file. Two places it looks, in order:
 
 ```yaml
-readyset:            # Readyset's own section, same style as modelRoles — omp itself doesn't
-  model: anthropic/claude-opus-5       # read or validate this section, it's meaningful only
-  fallbackModel: anthropic/claude-sonnet-5   # to Readyset. See "if the pin itself fails" below.
+readyset:                    # Readyset's own section, nested the same shape as omp's own
+  model:                     # retry.fallbackChains (a default plus an ordered list of
+    default: anthropic/claude-opus-5     # fallbacks) rather than a bespoke shape of its own —
+    fallbackChains:                      # omp itself doesn't read or validate this section,
+      - anthropic/claude-sonnet-5        # it's meaningful only to Readyset. See "if the pin
+      - spark/minimax-m3                 # itself fails" below.
 
 modelRoles:         # omp's own general default (confirmed against omp's docs), used as the
-  default: spark/minimax-m3            # fallback if readyset.model isn't set
+  default: spark/minimax-m3            # fallback if readyset.model.default isn't set
 ```
 
-`readyset.model` wins if both are set — it lets you pin a model for `/readyset` specifically
-without changing what everything else in omp defaults to. If neither is set, Readyset just runs
-with whatever model the session already has (no pinning at all).
+`readyset.model.default` wins if both are set — it lets you pin a model for `/readyset`
+specifically without changing what everything else in omp defaults to. If neither is set,
+Readyset just runs with whatever model the session already has (no pinning at all). A bare
+`readyset.model: <spec>` (no nested `default`/`fallbackChains`) still works too, for anyone who
+set this up before the nested shape existed.
 
-**If the pin itself fails** — `readyset.model`/`modelRoles.default` names a spec that's wrong,
-retired, or otherwise rejected when Readyset tries to switch to it — Readyset tries
-`readyset.fallbackModel` (or `--fallback-model <spec>`) next, and if that also fails, runs unpinned
-rather than aborting the whole command. This is deliberately narrow: it only covers the pin
-failing to apply before any turn starts, not a model that goes down mid-turn. For that — a
-transient provider outage during generation — configure omp's own `retry.fallbackChains` in
-`~/.omp/agent/config.yml` (per-role/per-model chains that kick in automatically on 429s/quota
-errors, restored on cooldown); that already applies to whatever model is active, Readyset-pinned
-or not, and this package doesn't try to duplicate it.
+**If the pin itself fails** — `readyset.model.default`/`modelRoles.default` names a spec that's
+wrong, retired, or otherwise rejected when Readyset tries to switch to it — Readyset tries every
+entry in `readyset.model.fallbackChains` next, **in order, until one actually pins**, and only
+once every entry has failed does it give up and run unpinned rather than aborting the whole
+command. `--fallback-model <spec>` on the command line is a single spec, not a chain (it wins
+over the config-derived chain entirely when given). A bare `readyset.fallbackModel: <spec>`
+(legacy shape, a single fallback rather than a chain) still works too. This whole mechanism is
+deliberately narrow: it only covers the pin failing to apply before any turn starts, not a model
+that goes down mid-turn. For that — a transient provider outage during generation — configure
+omp's own `retry.fallbackChains` in `~/.omp/agent/config.yml` (per-role/per-model chains that
+kick in automatically on 429s/quota errors, restored on cooldown); that already applies to
+whatever model is active, Readyset-pinned or not, and this package doesn't try to duplicate it.
 
 Every run also has a hard turn budget (10 agent turns by default) — a guardrail against an
 unbounded Refine or verification-retry loop burning cost with no natural stopping point, not a

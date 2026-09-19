@@ -26,7 +26,7 @@ export type Lane = "full" | "fast";
 
 /** Statuses a brainstorm moves through. "planned" is a legacy value from an earlier,
  *  native-/plan-based flow and is still accepted wherever "proposed" is. "approved" is a
- *  manual gate crossed via /readyset-review's review step, between "proposed" and
+ *  manual gate crossed via /readyset's review step, between "proposed" and
  *  "archived" — it is also treated as "already proposed" everywhere that matters, so
  *  reconciliation never downgrades it back to "proposed". */
 export type BrainstormStatus = "open" | "planned" | "proposed" | "approved" | "archived" | (string & {});
@@ -303,7 +303,7 @@ function extractSection(body: string, heading: string): string | undefined {
  * Structural — not semantic — check that a brainstorm's closing sections were actually filled
  * in, not left as the brainstorm-ai skill's own unfilled template text. Exists for the same
  * reason `validateChange` (readyset-spec.ts) exists for change artifacts: a brainstorm can now
- * come out of `/readyset-review --idea`'s own grilling turn, which — like every LLM turn
+ * come out of `/readyset --idea`'s own grilling turn, which — like every LLM turn
  * working from a prose instruction alone — can accept a passive answer and write the file early
  * despite being told not to (the same class of failure that motivated `listSubmodules()` being
  * injected into Explore's prompt deterministically, rather than trusted to a "check
