@@ -36,6 +36,7 @@ Rough idea → GRILL → EXPLORE → PROPOSE → REVIEW → EXECUTE → ARCHIVE
 - [Install](#install)
 - [Configure](#configure)
 - [Validate from the CLI](#validate-from-the-cli)
+  - [Node compatibility](#node-compatibility)
 - [Use](#use)
   - [Grilling — turning an idea into a brainstorm](#grilling--turning-an-idea-into-a-brainstorm)
   - [Grilling from outside omp](#grilling-from-outside-omp)
@@ -178,6 +179,19 @@ readyset-flow validate complete-embedded-signup-onboarding || exit 1
 exception: it spawns a small subprocess (`validate-runner.mts`) with `--experimental-strip-types`
 (Node 22.6+) to run `readyset-spec.ts`'s real check rather than a re-implementation that could
 drift.
+
+### Node compatibility
+
+| Command | Minimum Node | Why |
+|---|---|---|
+| `install`, `version` | `>=18` | Plain `.mjs`, no `.ts` import. |
+| `configure` | `22.6+` | Reads current config via a subprocess (`configure-runner.mts`) with `--experimental-strip-types`, same reasoning as `validate`. Without it, the wizard still runs, just without prefill. |
+| `validate` | `22.6+` | Same subprocess pattern (`validate-runner.mts`), no fallback — it's the whole command. |
+| `/readyset` itself, inside omp | whatever Node omp itself requires | Not spawned by this package's CLI at all. |
+
+`package.json`'s `engines` field states the package-wide floor (`>=18`) since `install` has to
+work there; individual commands that need more say so themselves (above, and in each command's
+own section).
 
 ## Use
 

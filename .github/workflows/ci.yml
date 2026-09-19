@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 22.6+ for --experimental-strip-types -- the whole test suite needs it, not just
+      # configure/validate's own subprocesses (see README's "Node compatibility" table).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - run: npm ci
+      - run: npm test
+
+      # Cheap regression check for package.json's "files" allowlist -- catches a new src/
+      # directory that was added but never listed, without needing a real publish to notice.
+      - run: npm pack --dry-run
