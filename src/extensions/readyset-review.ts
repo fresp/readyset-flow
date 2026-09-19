@@ -280,15 +280,32 @@ function codeReviewTurnPrompt(changeId: string): string {
  */
 const GRILL_ROUND_CAP = 4;
 
-/** How many `readyset_ask` rounds have fired for the CURRENT grilling session. Reset by
- *  `startGrilling`. Module-level (not per-invocation state threaded through the tool call) is a
+/** How many `readyset_ask` rounds have fired for the CURRENT grilling session, plus whether a
+ *  grilling session has been started this session at all (`active`) that the command handler
+ *  hasn't checked yet. Reset by `startGrilling`; `active` is consumed (set back to `false`) the
+ *  next time the command handler's content-check gate runs, so it fires at most once per
+ *  grilling session. Module-level (not per-invocation state threaded through the tool call) is a
  *  deliberate trade-off: `registerTool`'s `execute()` has no way to receive extension-local
  *  state per grilling run, only `ctx` (the ExtensionContext) — this is the same reason
  *  `TurnBudget` is a plain object rather than something passed through the tool API. Good enough
  *  for a single-user, single-session tool like this one; a concurrent second grilling session in
  *  the same omp process would share (and reset) this counter, which is an accepted limitation,
- *  not a real scenario Readyset needs to guard against. */
-const grillRoundState = { rounds: 0 };
+ *  not a real scenario Readyset needs to guard against.
+ *
+ * `active` exists specifically so the command handler can catch a real failure mode: nothing
+ * forces the model to actually call `readyset_ask` — that's a prompt-level instruction, not a
+ * structural one — so a model running fast/aggressively (more likely with `tools.approvalMode:
+ * yolo`, though that setting itself only gates tool-call approval and has no effect on
+ * `ctx.ui.select`/`askDialog` truly waiting for real input) could in principle skip asking
+ * entirely and just write a brainstorm from its own assumptions. `grillRoundState.active` is
+ * deliberately scoped tight to avoid false alarms: it only means "grilling was started THIS
+ * session and the gate hasn't looked yet" — a brainstorm hand-written, or grilled in an earlier
+ * omp process, leaves `active` at its default `false` and triggers no warning, since this
+ * session genuinely has no signal either way about it. It only fires for the one scenario it can
+ * actually attest to: a grilling run that started and finished (or was abandoned) in this same
+ * process without ever calling `readyset_ask`. See the gate's call site (in the command handler)
+ * for how this combines with `validateBrainstormContent`. */
+const grillRoundState = { rounds: 0, active: false };
 function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: string): string {
 	return (
 		"Grill this raw idea into a decided Readyset brainstorm file, mattpocock/skills style — interrogate it, " +
@@ -550,7 +567,8 @@ async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string)
 function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, preferredLanguage?: string): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
-	grillRoundState.rounds = 0; // fresh cap for this grilling session — see readyset_ask's doc comment
+	grillRoundState.rounds = 0;
+	grillRoundState.active = true; // consumed by the command handler's zero-rounds check -- see grillRoundState's doc comment
 	ctx.ui.notify(
 		`Grilling started for: "${preview}"${preferredLanguage ? ` in ${preferredLanguage}` : ""} — Readyset will ask questions ` +
 			"right here in the chat (a structured picker where available); answer them, and it'll write the " +
@@ -1274,13 +1292,29 @@ export default function (pi: ExtensionAPI) {
 				// and there is no other structural check between grilling writing the file and Explore
 				// spending real turns on it.
 				const contentCheck = validateBrainstormContent(chosen.raw);
-				if (!contentCheck.ok) {
-					const gapList = contentCheck.issues.map((i) => `${i.section} (${i.problem})`).join("; ");
-					// contentCheck.summary carries the "(structural check)" label deliberately -- same
-					// wording validateChange uses below in the review gate, so neither reads as a
-					// stronger guarantee than it actually is just because of how it's phrased here.
+
+				// Consumed here, one-shot -- see grillRoundState's doc comment for exactly what this
+				// does and doesn't attest to.
+				const grillingSkippedAsking = grillRoundState.active && grillRoundState.rounds === 0;
+				grillRoundState.active = false;
+
+				if (!contentCheck.ok || grillingSkippedAsking) {
+					const issues: string[] = [];
+					if (!contentCheck.ok) {
+						// contentCheck.summary carries the "(structural check)" label deliberately -- same
+						// wording validateChange uses below in the review gate, so neither reads as a
+						// stronger guarantee than it actually is just because of how it's phrased here.
+						const gapList = contentCheck.issues.map((i) => `${i.section} (${i.problem})`).join("; ");
+						issues.push(`${contentCheck.summary}: ${gapList}`);
+					}
+					if (grillingSkippedAsking) {
+						issues.push(
+							"grilling was started this session but readyset_ask was never called before the brainstorm " +
+								"was written -- the model may have answered every question itself instead of asking you",
+						);
+					}
 					const proceed = await reviewCtx.ui.select(
-						`${contentCheck.summary}: ${gapList}.`,
+						`${issues.join(". ")}.`,
 						[
 							{ label: "Continue anyway", description: "proceed to Explore/Propose despite the gaps above" },
 							{ label: "Go back", description: "cancel -- fill in (or keep grilling) the brainstorm first, then run /readyset again" },

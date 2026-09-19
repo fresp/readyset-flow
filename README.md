@@ -273,6 +273,23 @@ It picks a brainstorm, and depending on its status:
   actually got filled in, not left as the brainstorm-ai skill's own template placeholders —
   "Continue anyway" is always available if the gaps are acceptable, but it's a deliberate extra
   step, not silently skipped.
+- Nothing forces the model to actually call `readyset_ask` — that's a prompt-level instruction,
+  not something extension code can require. Note that `tools.approvalMode: yolo` in omp's own
+  config does **not** change this either way: it only auto-approves tool-call permission prompts
+  (the "Allow tool: eval/bash/write" gate) — `ctx.ui.select`/`ctx.ui.askDialog` always render a
+  real dialog and block for real input in Interactive mode, with no code path that skips showing
+  them based on approval mode. The actual risk is a model that just races ahead and writes a
+  brainstorm from its own assumptions without asking anything — a real failure mode seen with
+  native `/plan` before. The content-check gate above catches this partially: if the model
+  invents a plausible-sounding Decision/Seam/Scope, `validateBrainstormContent` sees filled-in
+  sections and passes it. What actually catches "the model never asked" specifically is a
+  zero-rounds check in the same gate — if grilling was started this session
+  (`grillRoundState.active`) and `readyset_ask` was never called before the brainstorm showed up
+  for review, the gate adds that as an extra line and still requires "Continue anyway". This is
+  deliberately scoped tight to avoid nagging on every unrelated brainstorm: it only fires for a
+  grilling run that started and finished in this same omp process without ever calling
+  `readyset_ask` — a brainstorm that's hand-written, or was grilled in an earlier session, leaves
+  no signal either way and triggers nothing.
 - The review screen has two tiers, chosen automatically by feature-detecting `ctx.ui.custom` at
   gate time. Where it's available (an interactive terminal session — the normal way `omp` is
   actually run), **Sidebar view** renders a real persistent two-pane overlay via `ctx.ui.custom()`

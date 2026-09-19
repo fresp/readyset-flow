@@ -216,6 +216,40 @@ async function loadAskTool(): Promise<{
   return captured as any;
 }
 
+// Loads ONE fresh module instance and captures BOTH the /readyset command handler and the
+// readyset_ask tool from it, so grillRoundState (module-level) is genuinely shared between them
+// -- needed to test the zero-rounds gate, which depends on readyset_ask's execute() and the
+// command handler's content-check gate agreeing on the same in-memory state.
+async function loadHandlerAndAskTool(fakePi: { sendUserMessage: (prompt: string, opts: unknown) => void }): Promise<{
+  handler: (args: string[], ctx: unknown) => Promise<void>;
+  askExecute: (
+    toolCallId: string,
+    params: { questions: unknown[] },
+    signal: unknown,
+    onUpdate: unknown,
+    ctx: unknown,
+  ) => Promise<{ content: { type: string; text: string }[] }>;
+}> {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    default: (pi: unknown) => void;
+  };
+  let capturedHandler: { handler: (args: string[], ctx: unknown) => Promise<void> } | undefined;
+  let capturedAsk: { execute: (...args: unknown[]) => Promise<unknown> } | undefined;
+  mod.default({
+    ...fakePi,
+    registerCommand(_name: string, def: { handler: (args: string[], ctx: unknown) => Promise<void> }) {
+      capturedHandler = def;
+    },
+    registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+      if (def.name === "readyset_ask") capturedAsk = def;
+    },
+    zod: fakeZod,
+  } as any);
+  if (!capturedHandler) throw new Error("registerCommand was never called");
+  if (!capturedAsk) throw new Error("readyset_ask was never registered");
+  return { handler: capturedHandler.handler, askExecute: capturedAsk.execute as any };
+}
+
 await test("full happy path: open -> explore -> propose -> approve & execute -> code review -> archive", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-01-my-feature.md", {
@@ -1227,6 +1261,63 @@ await test("content-check gate: a fully-filled-in brainstorm never triggers the 
     "content-check gate should not have fired for a fully-filled-in brainstorm",
   );
   assert.ok(fakePiWrap.calls.length >= 1, "Explore should have fired directly");
+});
+
+await test("zero-rounds gate: grilling started this session but readyset_ask never fired -> warns before Explore", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler } = await loadHandlerAndAskTool(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+  // Start grilling (sets grillRoundState.active = true, rounds = 0) -- but never call
+  // readyset_ask, simulating a model that skipped asking and just wrote the file itself.
+  await handler(["--idea", "Some", "risky", "feature"], ctx);
+  assert.equal(fakePiWrap.calls.length, 1, "grilling should have fired its opening message");
+
+  // Simulate the model writing a perfectly well-formed brainstorm anyway (content-check alone
+  // would NOT catch this -- the zero-rounds signal is the only thing that can).
+  await writeBrainstorm(cwd, "2026-01-20-risky.md", { title: "Risky", status: "open", created: "2026-01-20" }, VALID_BRAINSTORM_BODY);
+
+  fakeUiWrap.selectQueue.push("2026-01-20 · Risky"); // pick it up
+  fakeUiWrap.selectQueue.push("Go back"); // decline to proceed
+  await handler([], ctx);
+
+  assert.ok(
+    fakeUiWrap.selectPrompts.some((p) => /readyset_ask was never called/.test(p)),
+    "expected the zero-rounds warning to appear in the gate prompt",
+  );
+  assert.ok(fakeUiWrap.notifications.some((n) => /Stopped before Explore/.test(n.message)));
+});
+
+await test("zero-rounds gate: does not fire once readyset_ask has actually been called this grilling session", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, askExecute } = await loadHandlerAndAskTool(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+  await handler(["--idea", "Some", "risky", "feature"], ctx);
+
+  // The model actually asked at least one real round this time.
+  await askExecute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, {
+    ui: {}, // no askDialog -- falls back to plain text, but still counts as a round asked
+  });
+
+  await writeBrainstorm(cwd, "2026-01-21-asked.md", { title: "Asked", status: "open", created: "2026-01-21" }, VALID_BRAINSTORM_BODY);
+
+  fakeUiWrap.selectQueue.push("2026-01-21 · Asked"); // pick it up -- no gate select should be needed
+
+  fakePiWrap.queueEffect(async () => {});
+  fakePiWrap.queueEffect(async () => {});
+
+  await handler([], ctx);
+
+  assert.ok(
+    !fakeUiWrap.selectPrompts.some((p) => /readyset_ask was never called/.test(p)),
+    "the zero-rounds warning should not fire once a real round was asked",
+  );
+  assert.ok(fakePiWrap.calls.length >= 2, "Explore should have fired directly (1 grilling call + at least 1 Explore call)");
 });
 
 await test("readyset_ask: presents askDialog and returns the user's picks back to the model", async () => {
