@@ -56,7 +56,7 @@ await test("overflow hint only appears when the section's body is taller than th
 	assert.ok(!noOverflow.includes("PgUp/PgDn"));
 
 	const withOverflow = renderSidebarLayout("Title", sections(), 1, 0, 100, 20, "3/5 tasks ticked", "sections", 0, identity, identity, identity).join("\n");
-	assert.match(withOverflow, /PgUp\/PgDn to scroll/);
+	assert.match(withOverflow, /PgUp\/PgDn/);
 });
 
 await test("every line fits within the requested width (no ragged/overflowing rows)", () => {
@@ -226,6 +226,68 @@ await test("section-nav keys (Up/Down/PgUp/PgDn) are inert while focus is on the
 	overlay.handleInput("\x1b[A"); // an up-arrow-shaped byte sequence, not one of PgUp/PgDn/Tab/Left/Right/Enter/letters
 	const after = overlay.render(100);
 	assert.deepEqual(before, after, "an unrecognized key while focus is on the CTA bar should not change anything");
+});
+
+const upDownOnly = {
+	matches: (data: string, name: string) => (data === "down" && name === "tui.select.down") || (data === "up" && name === "tui.select.up"),
+} as any;
+
+await test("Down scrolls the current section's content line by line, then advances into the next section once it's exhausted", () => {
+	const overlay = new ReviewSidebarOverlay(fakeTheme, upDownOnly, "Title", sections(), "0/1", () => {});
+	// Exploration (index 0) has 2 body lines -> maxScrollOffset 1.
+	overlay.handleInput("down"); // scrollOffset 0 -> 1 (still within Exploration)
+	let joined = overlay.render(100).join("\n");
+	assert.match(joined, /› Exploration/, "still on Exploration after one Down (content wasn't exhausted yet)");
+	assert.match(joined, /line two/, "should now show Exploration's second line");
+
+	overlay.handleInput("down"); // Exploration's content is exhausted -> advance to Proposal, at its top
+	joined = overlay.render(100).join("\n");
+	assert.match(joined, /› Proposal/, "Down should advance to the next section once content is exhausted");
+	assert.match(joined, /proposal line 0\b/, "the next section should open at its top, not mid-scroll");
+});
+
+await test("Up scrolls content upward, then goes back to the PREVIOUS section landing at ITS bottom (continuous-scroll feel, not reset-to-top)", () => {
+	const overlay = new ReviewSidebarOverlay(fakeTheme, upDownOnly, "Title", sections(), "0/1", () => {});
+	overlay.handleInput("down"); // Exploration: 0 -> 1
+	overlay.handleInput("down"); // Exploration exhausted -> Proposal @ 0
+	overlay.handleInput("up"); // Proposal is at scrollOffset 0 -> go back to Exploration, at ITS bottom
+
+	const joined = overlay.render(100).join("\n");
+	assert.match(joined, /› Exploration/, "Up from the top of Proposal's content should return to Exploration");
+	assert.match(joined, /line two/, "should land on Exploration's LAST line, not jump back to its first");
+});
+
+await test("Down wraps from the last section back to the first, and Up wraps the other way", () => {
+	const down = new ReviewSidebarOverlay(fakeTheme, upDownOnly, "Title", sections(), "0/1", () => {});
+	down.handleInput("down"); // Tasks... no wait, starts on Exploration; drive it all the way around instead:
+	// Exploration (2 lines) -> Proposal (30 lines) -> Tasks (2 lines) -> wraps to Exploration.
+	for (let i = 0; i < 2 + 30; i++) down.handleInput("down"); // exhaust Exploration then Proposal
+	assert.match(down.render(100).join("\n"), /› Tasks/, "should now be on the last section, Tasks");
+	for (let i = 0; i < 2; i++) down.handleInput("down"); // exhaust Tasks
+	assert.match(down.render(100).join("\n"), /› Exploration/, "Down past the last section's content should wrap to the first");
+
+	const up = new ReviewSidebarOverlay(fakeTheme, upDownOnly, "Title", sections(), "0/1", () => {});
+	up.handleInput("up"); // already at the top of the first section -> wraps to the last, at its bottom
+	assert.match(up.render(100).join("\n"), /› Tasks/, "Up from the very top should wrap to the last section");
+});
+
+await test("Left/Right jump straight to the previous/next section, resetting scroll to the top and bypassing content", () => {
+	const noKeybindings = { matches: () => false } as any; // Left/Right are raw-byte checks, independent of keybindings.matches
+	const overlay = new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1", () => {});
+
+	overlay.handleInput("\x1b[C"); // Right: Exploration -> Proposal
+	assert.match(overlay.render(100).join("\n"), /› Proposal/);
+
+	overlay.handleInput("\x1b[C"); // Right: Proposal -> Tasks
+	assert.match(overlay.render(100).join("\n"), /› Tasks/);
+
+	overlay.handleInput("\x1b[C"); // Right wraps: Tasks -> Exploration
+	assert.match(overlay.render(100).join("\n"), /› Exploration/);
+
+	overlay.handleInput("\x1b[D"); // Left wraps back: Exploration -> Tasks
+	const joined = overlay.render(100).join("\n");
+	assert.match(joined, /› Tasks/);
+	assert.match(joined, /- \[x\] task 1/, "a direct Left/Right jump should land at the top of that section's content, not mid-scroll");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

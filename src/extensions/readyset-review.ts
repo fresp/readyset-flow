@@ -835,8 +835,10 @@ async function buildSingleSectionDocument(ctx: ReviewCtx, chosen: BrainstormMeta
  * content pane via `ctx.ui.custom()` (Interactive mode only; see `readyset-review-overlay.ts`'s
  * module doc comment for how this was confirmed against `@oh-my-pi/pi-tui`'s own real source,
  * not assumed), with Approve & Execute / Refine / Discard as CTAs inside it (the `[A]`/`[R]`/`[D]`
- * keys `ReviewSidebarOverlay.handleInput` binds). Up/Down moves the section cursor, PgUp/PgDn
- * scrolls the body, Esc cancels (treated the same as an explicit Discard by the caller). Errors
+ * keys `ReviewSidebarOverlay.handleInput` binds). Up/Down scroll the current section's content
+ * and cross into the next/previous section once it's exhausted; Left/Right jump straight to a
+ * section, bypassing its content; PgUp/PgDn take a bigger scroll step within the current
+ * section. Esc cancels (treated the same as an explicit Discard by the caller). Errors
  * opening the overlay are NOT swallowed here — the caller (`reviewAndMaybeExecute`) catches them
  * and falls back to `classicGateSelect`'s menu, since a failed overlay open means there's no CTA
  * surface for the user to act on at all. `ctx.ui.custom` is feature-detected by the caller, not

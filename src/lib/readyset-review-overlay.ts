@@ -107,6 +107,14 @@ const MIN_SIDEBAR_WIDTH = 22;
 const MAX_SIDEBAR_WIDTH = 36;
 const BODY_SCROLL_STEP = 10;
 
+/** The furthest a section's content can be scrolled -- the offset at which its LAST line is
+ *  still the top visible line (not "the last full page", which would need the viewport height
+ *  this function deliberately doesn't take, so it works the same whether called from render()
+ *  or from handleInput(), which has no width/height of its own to compute a real page with). */
+function maxScrollOffset(section: OverlaySection | undefined): number {
+	return section ? Math.max(0, section.bodyLines.length - 1) : 0;
+}
+
 /** Pad-or-truncate a single line to exactly `width` visible columns. */
 function fitLine(text: string, width: number): string {
 	if (width <= 0) return "";
@@ -201,9 +209,11 @@ export function renderSidebarLayout(
 	// primary controls; the quieter nav hint stays dim below it. They also behave like a select()
 	// (see renderCtaBar) once Tab moves focus onto them, not just direct A/R/D keystrokes.
 	lines.push(bold(renderCtaBar(taskSummary, focus, actionIndex, innerWidth)));
-	const scrollHint = bodyOverflow > 0 ? ` · PgUp/PgDn to scroll (${scrollOffset}/${section?.bodyLines.length ?? 0})` : "";
-	const focusHint = focus === "actions" ? "←/→ move · Enter confirm · Tab: sections" : "Tab: actions";
-	lines.push(dim(fitLine(` ↑/↓ section${scrollHint} · ${focusHint} · Esc cancel`, innerWidth)));
+	// ↑/↓ scroll the CURRENT section's content and cross into the next/previous one once it's
+	// exhausted (see handleInput); ←/→ jump straight to a section, bypassing its content.
+	const scrollHint = bodyOverflow > 0 ? ` · PgUp/PgDn ±${BODY_SCROLL_STEP} (${scrollOffset}/${section?.bodyLines.length ?? 0})` : "";
+	const focusHint = focus === "actions" ? "←/→ move · Enter confirm · Tab: sections" : "←/→ section · Tab: actions";
+	lines.push(dim(fitLine(` ↑/↓ scroll${scrollHint} · ${focusHint} · Esc cancel`, innerWidth)));
 
 	return lines;
 }
@@ -291,8 +301,7 @@ export class ReviewSidebarOverlay implements Component {
 			return;
 		}
 		if (data === "\x1b[6~") {
-			const section = this.#sections[this.#selectedIndex];
-			const maxOffset = section ? Math.max(0, section.bodyLines.length - 1) : 0;
+			const maxOffset = maxScrollOffset(this.#sections[this.#selectedIndex]);
 			this.#scrollOffset = Math.min(maxOffset, this.#scrollOffset + BODY_SCROLL_STEP);
 			return;
 		}
@@ -347,14 +356,49 @@ export class ReviewSidebarOverlay implements Component {
 
 		if (this.#sections.length === 0) return;
 
-		if (this.#keybindings.matches(data, "tui.select.up")) {
+		// Left/Right jump straight to the previous/next section, bypassing whatever's left of the
+		// current one's content -- for someone who already knows which section they want and
+		// doesn't care to scroll through this one first. Always lands at the top (scrollOffset 0):
+		// unlike Up/Down below, this is an explicit "go to this section" jump, not a continuation
+		// of reading. Checked as raw byte sequences, before `keybindings.matches`, for the same
+		// reason PageUp/PageDown are up top -- no risk of a broadly-bound logical action
+		// intercepting them first.
+		if (data === "\x1b[D") {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#sections.length - 1 : this.#selectedIndex - 1;
 			this.#scrollOffset = 0;
 			return;
 		}
-		if (this.#keybindings.matches(data, "tui.select.down")) {
+		if (data === "\x1b[C") {
 			this.#selectedIndex = this.#selectedIndex === this.#sections.length - 1 ? 0 : this.#selectedIndex + 1;
 			this.#scrollOffset = 0;
+			return;
+		}
+
+		// Up/Down scroll the CURRENT section's content one line at a time, and only cross into
+		// the neighboring section once that content is exhausted -- so browsing a long design.md
+		// no longer requires reaching for PgUp/PgDn (still there for a bigger jump within the
+		// same section; see the PageUp/PageDown handling up top, unchanged). Down at the bottom
+		// advances to the next section at its top; Up at the top goes back to the previous
+		// section at ITS bottom, matching how scrolling up through a continuous, merged document
+		// would read (not reset to its top, which would read as jumping past what you just saw).
+		if (this.#keybindings.matches(data, "tui.select.down")) {
+			const current = this.#sections[this.#selectedIndex];
+			const maxOffset = maxScrollOffset(current);
+			if (this.#scrollOffset < maxOffset) {
+				this.#scrollOffset += 1;
+			} else {
+				this.#selectedIndex = this.#selectedIndex === this.#sections.length - 1 ? 0 : this.#selectedIndex + 1;
+				this.#scrollOffset = 0;
+			}
+			return;
+		}
+		if (this.#keybindings.matches(data, "tui.select.up")) {
+			if (this.#scrollOffset > 0) {
+				this.#scrollOffset -= 1;
+			} else {
+				this.#selectedIndex = this.#selectedIndex === 0 ? this.#sections.length - 1 : this.#selectedIndex - 1;
+				this.#scrollOffset = maxScrollOffset(this.#sections[this.#selectedIndex]);
+			}
 			return;
 		}
 	}
