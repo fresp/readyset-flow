@@ -6,6 +6,20 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.11.0
+
+- **New: `readyset-flow update` and `readyset-flow uninstall`.** `update` is an alias for
+  `install`, so refreshing the linked extension and skill docs doesn't require remembering
+  `install`'s exact name. `uninstall [--target <path>] [--keep-config]` reverses everything
+  `install` sets up: it removes the extension entry from `~/.omp/agent/settings.json`
+  (`unlinkExtension`, matched by basename so it works regardless of which copy of the package
+  wrote it), deletes the installed skill docs from the target project, and strips the
+  readyset-managed block out of `~/.omp/agent/config.yml` (`clearConfigBlock`, reusing
+  `spliceReadysetBlock` from `configure.mjs`) unless `--keep-config` is passed. It does not touch
+  project-level `readyset/changes/` directories.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.10.0...0.11.0
+
 ## 0.10.0
 
 - **The review gate's sidebar overlay opens automatically -- it IS the gate now, not a "Sidebar
