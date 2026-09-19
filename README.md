@@ -54,6 +54,7 @@ Rough idea
 - [Validate from the CLI](#validate-from-the-cli)
 - [Use](#use)
   - [Grilling — turning an idea into a brainstorm](#grilling--turning-an-idea-into-a-brainstorm)
+  - [Grilling from outside omp](#grilling-from-outside-omp)
   - [Language](#language)
   - [Configure a model](#configure-a-model)
   - [The review gate](#the-review-gate)
@@ -244,6 +245,42 @@ back-and-forth automatically, same rules and content. Either way it ends once th
 brainstorm file and tells you to run `/readyset` again to pick it up. Hand-writing or dictating
 the brainstorm to a separate tool first still works exactly as before.
 
+### Grilling from outside omp
+
+`/readyset --idea` isn't the only way to arrive at a `.ai/brainstorms/*.md` file — the grilling
+turn above deliberately writes the same shape the standalone `brainstorm-ai` skill does, so
+Readyset's picker can't tell which one produced a given file, and doesn't try to. A common
+workaround for that skill's own read-only, no-repo-write, interactive-discussion discipline
+before you ever open `omp`: run the brainstorming session in **Claude Cowork**, then bring the
+resulting file into the repo.
+
+A copy of that skill ships in this package at `src/skill/brainstorm-ai.md`, so you don't have to
+reconstruct the format by hand:
+
+- **Claude Cowork or Claude Code** — copy it into your `.claude/skills/brainstorm-ai/SKILL.md`
+  (any `.claude/skills/` directory Claude reads skills from), then invoke it as
+  `/brainstorm-ai <topic>`. Its frontmatter (`allowed-tools`, `disable-model-invocation`) is real
+  Claude Skill plumbing there — it's actually held to read-only repo research plus writes scoped
+  to `.ai/brainstorms/*.md`, same as `readyset_ask`'s structured picker is real UI in omp.
+- **ChatGPT desktop, or any other assistant** — the frontmatter above the `---` fence is
+  Claude-specific and does nothing outside a Claude surface; paste the body below it into a
+  project's custom instructions instead. The read-only/scoped-write constraint becomes a
+  convention you're trusting that assistant to follow, not something enforced — the same
+  trade-off `readyset_verify`'s `shell:true` makes for a different reason (see
+  [Design philosophy](#design-philosophy)): no sandbox, the discipline lives in the prompt, not
+  the runtime.
+
+Either way, the session runs entirely outside `omp` — a separate assistant, a separate context,
+often a separate language (the skill's own discussion happens in Bahasa Indonesia by design; the
+saved file is always English, same reasoning as [Language](#language) below). Once it writes
+`.ai/brainstorms/<date>-<slug>.md`, bring that file into the repo and run `/readyset`: it shows
+up in the normal picker alongside anything grilled in-session, **Grill is skipped entirely**
+(the file already carries a resolved Decision/Seam/Scope/Acceptance Criteria), and picking it
+goes straight to Explore, then Propose — the same content-check gate that catches an
+under-filled grilling result (see [What it deliberately does not do](#what-it-deliberately-does-not-do))
+applies here too, so a thin or template-only import still gets flagged before Explore spends a
+turn on it.
+
 ### Language
 
 By default, grilling's reactive rule kicks in: reply in whatever language you use, once you use
@@ -417,6 +454,11 @@ src/
                              (MIT-licensed) — the real source grillTurnPrompt is adapted from,
                              kept here to check wording against rather than a paraphrase of a
                              paraphrase. Repo-internal reference only, not installed.
+    brainstorm-ai.md        the /brainstorm-ai Claude Skill (see "Grilling from outside omp")
+                             — unlike the file above, this one is meant to be copied out and
+                             used: attach it in Claude Cowork/Claude Code, or paste its body into
+                             another assistant's custom instructions. Not installed by this
+                             package either; you place it yourself.
   cli/
     install.mjs            `readyset-flow install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
