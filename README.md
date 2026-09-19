@@ -22,9 +22,32 @@ anything (grilling), grounds what it writes in the real repo instead of assumpti
 and won't let you execute a change that's structurally incomplete or skipped review — each of
 those is a code-enforced gate, not a prompt asking nicely.
 
+```text
+Rough idea
+    │
+    ▼
+  GRILL ──────── resolve ambiguity
+    │
+    ▼
+ EXPLORE ─────── ground in the real repository
+    │
+    ▼
+ PROPOSE ─────── write change artifacts
+    │
+    ▼
+ REVIEW ──────── human approval / refine / discard
+    │
+    ▼
+ EXECUTE ─────── implement + capture evidence + code review
+    │
+    ▼
+ ARCHIVE ─────── preserve the change
+```
+
 ## Table of contents
 
 - [Why "Readyset"](#why-readyset)
+- [What Readyset adds to omp](#what-readyset-adds-to-omp)
 - [Design philosophy](#design-philosophy)
 - [How it works](#how-it-works)
 - [Install](#install)
@@ -61,6 +84,20 @@ Each is a structural gate — a phase that has to run, a machine-checkable condi
 hold — not just prose in a prompt. Prose already proved insufficient once: an earlier propose
 turn was told to check `.gitmodules` and still silently dropped a submodule. Prose is a request;
 a gate is a requirement.
+
+## What Readyset adds to omp
+
+Readyset doesn't replace anything omp already does — it adds a workflow discipline around it:
+
+| Without a dedicated workflow | With Readyset |
+|---|---|
+| An idea can jump straight into implementation | Idea passes through Grill → Explore → Propose → Review → Execute |
+| Repo grounding depends on whatever the current turn happens to check | Explore is a dedicated phase, logged to `EXPLORATION.md` |
+| Planning artifacts scatter across a chat | Each change gets its own `readyset/changes/<id>/` directory |
+| Review can be informal, or skipped under time pressure | A review gate structurally separates proposal from execution |
+| "Done" is whatever the model claims | Verification is a required `_Verified:` note, optionally backed by captured runtime evidence |
+| Implementation and review happen in the same context | A fresh-context code-review pass runs after execution |
+| Change history is hard to reconstruct later | Proposal, design, specs, tasks, exploration, review, and evidence all accumulate as files |
 
 ## Design philosophy
 
@@ -400,3 +437,13 @@ confirmed against omp's own native discovery provider (`loadExtensionModules`), 
 `settings.json` `"extensions"` array entry that points at a file, not a directory, and loads it
 in place; not a guess. Skills have no such array in omp (only a fixed
 `~/.omp/agent/skills/` directory scan), so the skill doc is still copied rather than referenced.
+
+---
+
+> Resolve ambiguity before planning. Ground the plan in the real repo. Make the proposal
+> reviewable. Require human approval before execution. Keep runtime evidence separate from
+> claims of correctness. Then:
+>
+> ```
+> /readyset
+> ```
