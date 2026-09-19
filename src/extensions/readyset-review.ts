@@ -6,6 +6,7 @@ import {
 	loadBrainstorms,
 	markApproved,
 	reconcileStatuses,
+	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
 import { readFile } from "node:fs/promises";
 import {
@@ -228,6 +229,91 @@ function codeReviewTurnPrompt(changeId: string): string {
 	);
 }
 
+/**
+ * Grill turn — fires the FIRST message of what will become a real multi-turn conversation,
+ * unlike Explore/Propose/Apply/Refine/Code-review (which are each a single fire-and-wait turn
+ * driven by `spendTurn`/`fireTurnAndWait`). A genuine "grill until the design tree resolves,
+ * never accept a passive answer" loop — mattpocock/skills style, matching the existing
+ * upstream `brainstorm-ai` skill's own rules 3 and 6 — means asking the user real questions and
+ * getting real replies across ordinary chat turns. There is nothing for extension code to
+ * synchronously wait on: `startGrilling` below fires this prompt and returns immediately; the
+ * rest of the back-and-forth happens as normal chat turns the user answers directly, ending
+ * once the model writes the brainstorm file itself and the user re-invokes /readyset-review to
+ * pick it up.
+ *
+ * The file this writes must match `loadBrainstorms()`/`parseBranch()`'s expected shape exactly
+ * (same frontmatter keys, a "- Branch: <type>/<slug>" line under Git Workflow) so once written
+ * it is indistinguishable from a brainstorm the separate upstream `brainstorm-ai` skill
+ * produced — /readyset-review's own picker, and reconcileStatuses, treat either identically.
+ *
+ * Round cap is prompt-level only, deliberately — there is no `TurnBudget`-style hard stop on
+ * grilling the way there is on Explore/Propose/Apply/Refine/Code-review, because those are each
+ * one `spendTurn` call extension code fires and waits on; grilling's rounds are ordinary chat
+ * turns the user answers directly, which this extension's code never sees or counts (it only
+ * fires the opening message). GRILL_ROUND_CAP below is the number of question-rounds after
+ * which the prompt itself is told to check in rather than keep going indefinitely — a soft,
+ * model-followed convention, not something `startGrilling`/the handler can enforce. The other
+ * half of the mitigation is structural and does run in code: `validateBrainstormContent`
+ * (readyset-brainstorm.ts), checked before Explore ever spends a turn on whatever grilling
+ * actually produced — see its call site in the command handler.
+ */
+const GRILL_ROUND_CAP = 4;
+function grillTurnPrompt(ideaText: string, today: string): string {
+	return (
+		"Grill this raw idea into a decided Readyset brainstorm file, mattpocock/skills style — interrogate it, " +
+		`don't just accept it. Raw idea from the user: "${ideaText}"\n\n` +
+		"This is the first message of a real conversation, not a one-shot task: ask your first round of " +
+		"questions now, in this reply, and then stop — end your turn there. The user will answer in their next " +
+		"message, in the same chat. Keep going, round by round, until the design is genuinely settled. Rules:\n" +
+		// Trimmed (2026-09-18) to roughly half its original wording after an audit flagged this
+		// prompt's real, recurring token cost against its unenforceable, soft-only nature -- same
+		// instruction, fewer words. See GRILL_ROUND_CAP's own doc comment for why this can only ever
+		// be a soft, prompt-level check rather than something the extension's code enforces.
+		`- Track your round count. At round ${GRILL_ROUND_CAP} without the design tree resolved, stop and check in: ` +
+		"summarize what's decided, name what's still open, and ask whether to keep grilling or write the " +
+		"brainstorm now with the rest under Open Questions. Pace check only — not permission to accept a passive answer.\n" +
+		"- Map out the decision branches this idea implies before asking anything (what's actually unresolved: " +
+		"approach, scope boundary, the seam/module it touches, how success is observed), then ask only the " +
+		"questions answerable right now, all in one numbered round, each with your own recommended answer so " +
+		"the user can confirm or override rather than starting from a blank page.\n" +
+		"- Never accept a passive reply ('okay', 'terserah', 'up to you', 'looks good') as a real decision on " +
+		"anything load-bearing — if the user brushes past a question, restate it as a concrete pick with your " +
+		"recommendation and ask again. Only an explicit 'defer this to the planning harness' counts as a " +
+		"resolved answer for something the user genuinely doesn't want to decide yet.\n" +
+		"- Offer at least two real options/approaches when there's more than one reasonable way in, and discuss " +
+		"the trade-off — don't just assert a pick.\n" +
+		"- Do real read-only repo research (Read/Grep/Glob, read-only git/shell commands) before or between " +
+		"rounds wherever it would sharpen a question or firm up a recommendation — don't ask the user something " +
+		"the repo already answers.\n" +
+		"- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
+		"write at the end must be entirely in English regardless, exactly like the structure below.\n\n" +
+		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
+		"rules, so the file reads as though that skill wrote it: which option is decided (or explicitly " +
+		"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Then auto-derive " +
+		"(don't ask) the branch type with a one-line reason, and the lane from that branch type — full for " +
+		"feature/adjust/experimental, fast for bugfix/hotfix/refactor/chore/docs/test/release. Do ask directly " +
+		"(it's a workflow preference the content can't reveal): commit-only vs. commit + merge request per task.\n\n" +
+		"Once — and only once — every one of those is actually resolved or explicitly deferred, write the file " +
+		`to .ai/brainstorms/${today}-<slug>.md (kebab-case slug derived from the title) with exactly this shape:\n\n` +
+		"---\n" +
+		"title: <short topic title>\n" +
+		"slug: <slug>\n" +
+		"status: open\n" +
+		"lane: full/fast\n" +
+		"change_id:\n" +
+		`created: ${today}\n` +
+		"namespace: <repo/project path this is scoped to, or cross-namespace>\n" +
+		"---\n\n" +
+		"## Problem / Context\n## Options Explored\n### Option A: <name>\n### Option B: <name>\n" +
+		"## Leaning Direction\n## Decision\n## Seam\n## Scope\n## Acceptance Criteria\n## Spec Impact\n" +
+		"## Git Workflow\n- Branch: <type>/<slug>\n- Inference reason: <one line>\n" +
+		"- Lane: <full | fast> — <one line>\n- Per-task flow: <\"commit only\" | \"commit + merge request per task\">\n" +
+		"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +
+		"Once the file is written, tell the user its path and that running /readyset-review again picks it up " +
+		"from here (Explore, then Propose) — do not fire off Explore or Propose yourself in this turn."
+	);
+}
+
 interface ReviewCtx {
 	cwd: string;
 	ui: {
@@ -393,6 +479,24 @@ async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string)
 		}
 	}
 	await ctx.waitForIdle();
+}
+
+/**
+ * Kicks off grilling for a raw, directly-typed idea and returns immediately — deliberately not
+ * awaited against `ctx.waitForIdle()` the way `spendTurn`/`fireTurnAndWait` are, because the
+ * turns that follow are ordinary chat turns the user answers directly (see `grillTurnPrompt`'s
+ * doc comment). Handler call sites `return` right after this.
+ */
+function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string): void {
+	const today = new Date().toISOString().slice(0, 10);
+	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
+	ctx.ui.notify(
+		`Grilling started for: "${preview}" — Readyset will ask questions right here in the chat; answer them, ` +
+			"and it'll write the brainstorm file once the design is genuinely resolved. Run /readyset-review " +
+			"again afterward to pick it up from there.",
+		"info",
+	);
+	pi.sendUserMessage(grillTurnPrompt(ideaText, today), { deliverAs: "nextTurn", triggerTurn: true });
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -826,7 +930,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("readyset-review", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +
-			"(flags: --all, --fast, --model <spec> to pin a model for this run's turns, --fallback-model <spec> if the pin fails to apply)",
+			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --model <spec> to pin a model " +
+			"for this run's turns, --fallback-model <spec> if the pin fails to apply)",
 		handler: async (args, ctx) => {
 			const showAll = args?.includes("--all");
 			const includeFast = args?.includes("--fast");
@@ -834,6 +939,16 @@ export default function (pi: ExtensionAPI) {
 			// Standalone: bootstrap readyset/{changes,specs} ourselves if missing — there is no
 			// separate init step or CLI to run first.
 			await ensureReadysetRoot(ctx.cwd);
+
+			// --idea skips the picker entirely: everything after it is joined back into the raw idea
+			// text (so it need not be quoted as a single arg), and grilling starts immediately. Must
+			// come last among flags on the command line.
+			const ideaFlagIdx = args?.indexOf("--idea") ?? -1;
+			const ideaFromFlag = ideaFlagIdx >= 0 ? (args ?? []).slice(ideaFlagIdx + 1).join(" ").trim() : "";
+			if (ideaFromFlag) {
+				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag);
+				return;
+			}
 
 			const all = await loadBrainstorms(ctx.cwd);
 			const updated = await reconcileStatuses(ctx.cwd, all);
@@ -843,9 +958,16 @@ export default function (pi: ExtensionAPI) {
 				.filter((b) => showAll || b.status !== "archived")
 				.filter((b) => includeFast || b.lane === "full");
 
+			// Offering "type a new idea" needs ctx.ui.input to actually collect it -- feature-detected
+			// the same way ctx.ui.custom is for the Sidebar view, so this degrades gracefully (falls
+			// back to --idea only) on an omp build that doesn't expose input() on this ctx shape.
+			const canGrillFromScratch = typeof (ctx as unknown as ReviewCtx).ui.input === "function";
+			const NEW_IDEA_LABEL = "✎ Type a new idea (grill it here)";
+
 			if (items.length === 0) {
 				ctx.ui.notify(
-					`No full-lane brainstorms found in ${BRAINSTORM_DIR}/ (--fast includes fast-lane, --all includes archived)`,
+					`No full-lane brainstorms found in ${BRAINSTORM_DIR}/ (--fast includes fast-lane, --all includes archived)` +
+						(canGrillFromScratch ? ` -- or run /readyset-review --idea "<your raw idea>" to grill a new one into existence.` : ""),
 					"warning",
 				);
 				return;
@@ -859,11 +981,29 @@ export default function (pi: ExtensionAPI) {
 				byLabel.set(label, b);
 				return { label, description: [next, lane, b.namespace].filter(Boolean).join(" · ") };
 			});
+			if (canGrillFromScratch) {
+				options.unshift({
+					label: NEW_IDEA_LABEL,
+					description: "type a raw idea; Readyset grills it mattpocock-style into a brainstorm, then hands off to Explore",
+				});
+			}
 
 			const picked = await ctx.ui.select("Pick a brainstorm to take through Readyset (fused review)", options, {
 				helpText: "enter to continue · esc to cancel",
 			});
 			if (!picked) return;
+
+			if (picked === NEW_IDEA_LABEL) {
+				const reviewCtxForInput = ctx as unknown as ReviewCtx;
+				const idea = (await reviewCtxForInput.ui.input!("What's the idea? A sentence or two is enough -- Readyset will grill for the rest."))?.trim();
+				if (!idea) {
+					ctx.ui.notify("No idea given -- nothing started.", "info");
+					return;
+				}
+				startGrilling(pi, reviewCtxForInput, idea);
+				return;
+			}
+
 			const chosen = byLabel.get(picked);
 			if (!chosen) return;
 
@@ -901,6 +1041,32 @@ export default function (pi: ExtensionAPI) {
 				if (isProposed(chosen.status)) {
 					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget);
 					return;
+				}
+
+				// Structural gate on the brainstorm itself, before Explore/Propose spend any turns on
+				// it — catches a brainstorm (from grilling or otherwise) whose Decision/Seam/Scope/
+				// Acceptance Criteria were never actually resolved. See validateBrainstormContent's doc
+				// comment for why this exists specifically for the grilling path: a fired turn working
+				// from a prose instruction alone can accept a passive answer despite being told not to,
+				// and there is no other structural check between grilling writing the file and Explore
+				// spending real turns on it.
+				const contentCheck = validateBrainstormContent(chosen.raw);
+				if (!contentCheck.ok) {
+					const gapList = contentCheck.issues.map((i) => `${i.section} (${i.problem})`).join("; ");
+					// contentCheck.summary carries the "(structural check)" label deliberately -- same
+					// wording validateChange uses below in the review gate, so neither reads as a
+					// stronger guarantee than it actually is just because of how it's phrased here.
+					const proceed = await reviewCtx.ui.select(
+						`${contentCheck.summary}: ${gapList}.`,
+						[
+							{ label: "Continue anyway", description: "proceed to Explore/Propose despite the gaps above" },
+							{ label: "Go back", description: "cancel -- fill in (or keep grilling) the brainstorm first, then run /readyset-review again" },
+						],
+					);
+					if (proceed !== "Continue anyway") {
+						ctx.ui.notify(`Stopped before Explore -- resolve the gaps in "${chosen.title}" and run /readyset-review again.`, "info");
+						return;
+					}
 				}
 
 				await scaffoldChange(ctx.cwd, chosen.changeId);

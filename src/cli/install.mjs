@@ -20,53 +20,140 @@
  * `readyset-review install` command (the same pattern tools like husky use) is predictable: it
  * only touches files when you run it.
  *
- * What it does: copies the .ts source files into `<target>/agent/lib/` and
- * `<target>/agent/extensions/`, and the skill doc into `<target>/agent/skills/`. No build step —
- * omp loads extensions as .ts files directly (its own loader handles the stripping), so there is
- * nothing to compile. Every run overwrites the previously installed copies; this is how you pick
- * up a Readyset update (bump the package, re-run `readyset-review install`). Don't hand-edit the
- * installed files — edits are lost on the next install.
+ * What it does: REFERENCES this package's own `.ts` source in place -- it does not copy it.
+ * omp supports this directly: `<configDir>/settings.json`'s top-level `"extensions"` array
+ * accepts an arbitrary file path, and if that path is a *file* (not a directory), omp loads it
+ * as a full extension module exactly where it sits -- no requirement that it live under
+ * `<configDir>/extensions/` first. This is real, source-verified behavior (omp's own
+ * `loadExtensionModules`, in its native `.omp` discovery provider), not a guess or a convention
+ * this package invented. So installing means: merge one absolute path --
+ * `<packageRoot>/src/extensions/readyset-review.ts` -- into `<target>/agent/settings.json`'s
+ * `extensions` array. `readyset-review.ts`'s own relative imports (`../lib/readyset-*.ts`)
+ * resolve against *its actual location on disk*, not against where omp discovered it from --
+ * that's ordinary Node module resolution, unaffected by how omp found the entry file. So every
+ * other `.ts` file in this package (`src/lib/**`) needs no install step at all: it's read
+ * straight out of wherever this package itself lives (a git clone, or `node_modules/readyset-
+ * review/` after `npm install`), and picking up an update is just updating the package -- no
+ * re-run needed, since nothing was copied to go stale.
  *
- * These destinations are omp's own documented user-level discovery paths (verified against
- * omp's `docs/extension-loading.md` and `docs/skills.md`, and against a real `~/.omp` on a
- * machine already running other extensions — not guessed): "User-level (global): the active
- * agent directory's extensions/" resolves to `~/.omp/agent/extensions` by default, with a
- * matching `~/.omp/agent/lib/` convention already in use there for shared helpers, and
- * `~/.omp/agent/skills/<name>/SKILL.md` for skills.
+ * The one thing this still copies is `src/skill/SKILL.md` -- a reference doc, not a runtime
+ * file (see its own installed-path comment below): skills have no settings.json-array
+ * equivalent in omp's native provider (only a fixed `~/.omp/agent/skills/` directory scan), so
+ * referencing it in place isn't an option the way it is for the extension module. Being a
+ * doc with no import graph of its own, a stale copy after an update is a much smaller problem
+ * than a stale copy of runtime code would have been -- and `install` still re-copies it every
+ * run, so `readyset-review install` after a version bump keeps it current either way.
  *
- * Every installed filename is prefixed `readyset-` (`readyset-brainstorm.ts`,
- * `readyset-omp-config.ts`, `readyset-spec.ts`, `readyset-review.ts`) — deliberately, because
- * `~/.omp/agent/` is a shared namespace: a real `~/.omp/agent/lib/brainstorm.ts` was found
- * already installed and in active use by other extensions (`brainstorm-plan.ts`,
- * `brainstorm-propose.ts`, `brainstorm-review.ts`) on the machine this was verified against.
- * An unprefixed `brainstorm.ts` from this package would have silently overwritten that file —
- * same name, similar shape, different content — and broken those other extensions the moment
- * this package was installed. Nothing this package installs can collide with another
- * extension's files as long as that extension doesn't also use the `readyset-` prefix.
+ * Earlier versions of this installer copied every `.ts` file into `<target>/agent/lib/` and
+ * `<target>/agent/extensions/`. That meant re-running `install` after every code change just to
+ * pick it up, and it meant dropping files into a shared, globally-namespaced directory
+ * (`~/.omp/agent/`) that other extensions also write into -- both of which this reference-based
+ * approach avoids. If you have files from that older install still sitting in
+ * `~/.omp/agent/lib/readyset-*.ts` / `~/.omp/agent/extensions/readyset-review.ts`, they're
+ * inert leftovers once `settings.json` points at the package directly (a later `extensions`
+ * entry always wins on a name collision in omp's own dedup) -- safe to delete by hand, `install`
+ * won't do it for you.
  */
 
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, basename } from "node:path";
 import { homedir } from "node:os";
-import { mkdir, copyFile, readFile } from "node:fs/promises";
+import { mkdir, copyFile, readFile, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..", "..");
 const DEFAULT_TARGET = join(homedir(), ".omp");
 
-const INSTALL_MAP = [
-	{ from: join(packageRoot, "src", "lib", "readyset-brainstorm.ts"), to: join("agent", "lib", "readyset-brainstorm.ts") },
-	{ from: join(packageRoot, "src", "lib", "readyset-spec.ts"), to: join("agent", "lib", "readyset-spec.ts") },
-	{ from: join(packageRoot, "src", "lib", "readyset-omp-config.ts"), to: join("agent", "lib", "readyset-omp-config.ts") },
-	{ from: join(packageRoot, "src", "lib", "readyset-review-overlay.ts"), to: join("agent", "lib", "readyset-review-overlay.ts") },
-	{ from: join(packageRoot, "src", "extensions", "readyset-review.ts"), to: join("agent", "extensions", "readyset-review.ts") },
-	// Reference doc, not a runtime file — read by an agent working a Readyset change directly
-	// (outside a /readyset-review-triggered turn), not loaded by the extension itself. Installed
-	// under agent/skills/<name>/SKILL.md, matching the real ~/.omp/agent/skills/<name>/SKILL.md
-	// layout already in use on the machine this was verified against.
-	{ from: join(packageRoot, "src", "skill", "SKILL.md"), to: join("agent", "skills", "readyset", "SKILL.md") },
-];
+// The one file this package's own extension module is: what settings.json's `extensions` array
+// gets pointed at. Exported so a test can exercise `linkExtension` against a scratch settings.json
+// without going through the whole CLI.
+export const EXTENSION_ENTRY_POINT = join(packageRoot, "src", "extensions", "readyset-review.ts");
+const EXTENSION_ENTRY_BASENAME = basename(EXTENSION_ENTRY_POINT); // "readyset-review.ts"
+
+const SKILL_DOC = { from: join(packageRoot, "src", "skill", "SKILL.md"), to: join("agent", "skills", "readyset", "SKILL.md") };
+
+/**
+ * Merge `EXTENSION_ENTRY_POINT` into `<agentDir>/settings.json`'s `extensions` array, replacing
+ * any prior entry that resolves to a file also named `readyset-review.ts` (covers both a
+ * previous run of this same installer, and the repo having moved since the last install) and
+ * leaving every other entry -- anything belonging to another extension -- untouched.
+ *
+ * Returns "added" | "updated" | "unchanged" so the caller can report accurately.
+ */
+export async function linkExtension(agentDir) {
+	const settingsPath = join(agentDir, "settings.json");
+	let settings = {};
+	let raw = null;
+	try {
+		raw = await readFile(settingsPath, "utf8");
+	} catch (err) {
+		if (err.code !== "ENOENT") throw err;
+	}
+	if (raw !== null && raw.trim() !== "") {
+		try {
+			settings = JSON.parse(raw);
+		} catch (err) {
+			throw new Error(`${settingsPath} isn't valid JSON -- fix or remove it, then re-run install: ${err.message}`);
+		}
+	}
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+		throw new Error(`${settingsPath} isn't a JSON object at its top level -- can't add an "extensions" entry to it.`);
+	}
+
+	const existing = Array.isArray(settings.extensions) ? settings.extensions : [];
+	const ours = existing.filter((entry) => typeof entry === "string" && basename(entry) === EXTENSION_ENTRY_BASENAME);
+	const others = existing.filter((entry) => !(typeof entry === "string" && basename(entry) === EXTENSION_ENTRY_BASENAME));
+
+	let status;
+	if (ours.length === 1 && ours[0] === EXTENSION_ENTRY_POINT) {
+		status = "unchanged";
+	} else if (ours.length === 0) {
+		status = "added";
+	} else {
+		status = "updated"; // stale path(s) pointing at a readyset-review.ts elsewhere -- replaced
+	}
+
+	if (status !== "unchanged") {
+		settings.extensions = [...others, EXTENSION_ENTRY_POINT];
+		await mkdir(agentDir, { recursive: true });
+		await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+	}
+
+	return { status, settingsPath };
+}
+
+async function install(targetRoot) {
+	const agentDir = join(targetRoot, "agent");
+
+	const dest = join(targetRoot, SKILL_DOC.to);
+	await mkdir(dirname(dest), { recursive: true });
+	await copyFile(SKILL_DOC.from, dest);
+	console.log(`  installed: ${SKILL_DOC.to}`);
+
+	const { status, settingsPath } = await linkExtension(agentDir);
+	const relSettingsPath = join(targetRoot === DEFAULT_TARGET ? "~/.omp" : targetRoot, "agent", "settings.json");
+	if (status === "added") {
+		console.log(`  linked:    ${EXTENSION_ENTRY_POINT}\n             -> added to ${relSettingsPath} ("extensions")`);
+	} else if (status === "updated") {
+		console.log(`  linked:    ${EXTENSION_ENTRY_POINT}\n             -> replaced a stale readyset-review.ts entry in ${relSettingsPath}`);
+	} else {
+		console.log(`  linked:    ${EXTENSION_ENTRY_POINT}\n             -> already up to date in ${relSettingsPath}`);
+	}
+	void settingsPath;
+
+	console.log(`\nReadyset: installed into ${targetRoot} (extension referenced in place, not copied)`);
+	console.log("Run `/readyset-review` in omp (in any repo) to use it.");
+	console.log(
+		"The extension module is read straight from this package, so code updates need no re-install -- " +
+			"only re-run `readyset-review install` after moving the package itself, or to refresh the skill doc.",
+	);
+}
+
+async function printVersion() {
+	const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+	console.log(pkg.version);
+}
 
 function parseArgs(argv) {
 	const args = { command: argv[0], target: DEFAULT_TARGET, cwd: process.cwd(), positional: [] };
@@ -82,25 +169,6 @@ function parseArgs(argv) {
 		}
 	}
 	return args;
-}
-
-async function install(targetRoot) {
-	let installedCount = 0;
-	for (const { from, to } of INSTALL_MAP) {
-		const dest = join(targetRoot, to);
-		await mkdir(dirname(dest), { recursive: true });
-		await copyFile(from, dest);
-		console.log(`  installed: ${to}`);
-		installedCount++;
-	}
-	console.log(`\nReadyset: ${installedCount} file(s) installed into ${targetRoot}`);
-	console.log("Run `/readyset-review` in omp (in any repo) to use it.");
-	console.log("Re-run `npx readyset-review install` after bumping the readyset-review version to pick up updates.");
-}
-
-async function printVersion() {
-	const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
-	console.log(pkg.version);
 }
 
 /**
@@ -180,7 +248,8 @@ async function main() {
 
 	console.log("Readyset CLI\n");
 	console.log("Usage:");
-	console.log("  readyset-review install [--target <path>]        Install/update Readyset's extension files (defaults to ~/.omp)");
+	console.log("  readyset-review install [--target <path>]        Reference this package's extension in <target>/agent/settings.json");
+	console.log("                                                    (defaults to ~/.omp) and refresh the installed skill doc");
 	console.log("  readyset-review validate <change-id> [--cwd <path>]");
 	console.log("                                                    Run the same structural check the omp gate runs, outside omp");
 	console.log("                                                    (CI, pre-commit) -- exit code 0 on pass, 1 on issues found");
@@ -188,7 +257,14 @@ async function main() {
 	process.exitCode = args.command ? 1 : 0;
 }
 
-main().catch((err) => {
-	console.error("Readyset install failed:", err?.message ?? err);
-	process.exitCode = 1;
-});
+// Guarded so this file can be `import()`ed (e.g. by test/readyset-install-link.test.mts, to call
+// `linkExtension` directly) without actually running the CLI as a side effect of importing it.
+// Still runs exactly as before when executed directly (`node install.mjs ...`, or spawned as a
+// subprocess the way test/readyset-cli-validate.test.mts already does) -- import.meta.url only
+// equals the invoked script's own path in that case.
+if (import.meta.url === `file://${process.argv[1]}`) {
+	main().catch((err) => {
+		console.error("Readyset install failed:", err?.message ?? err);
+		process.exitCode = 1;
+	});
+}

@@ -23,6 +23,59 @@ async function freshRepo(): Promise<string> {
   return cwd;
 }
 
+// A "not yet proposed" brainstorm that clears validateBrainstormContent's gate (readyset-brainstorm.ts)
+// -- Decision/Seam/Scope/Acceptance Criteria all genuinely filled in, matching the brainstorm-ai
+// skill's own template. Used by tests that are meant to sail straight through to Explore without
+// the new content-check gate intervening; the gate itself gets its own dedicated tests below.
+const VALID_BRAINSTORM_BODY = `## Problem / Context
+
+Some problem worth solving.
+
+## Options Explored
+
+### Option A: Do it directly
+- Pros: simple
+- Cons: less flexible
+
+## Leaning Direction
+
+Leaning towards Option A.
+
+## Decision
+- Chosen option: Option A
+- Rationale: simplest fit for the problem
+
+## Seam
+
+The relevant service boundary this touches.
+
+## Scope
+- In scope: the thing itself
+- Out of scope: unrelated things
+
+## Acceptance Criteria
+- WHEN the trigger happens THEN the observable outcome occurs
+
+## Spec Impact
+- Not applicable -- this project does not use OpenSpec.
+
+## Git Workflow
+- Branch: feature/my-feature
+- Inference reason: new capability, no existing behavior touched
+- Lane: full -- new behavior
+- Per-task flow: commit only
+
+## Open Questions
+- none
+
+## Technical Constraints & Notes from Repo
+- none
+
+## Next Step
+
+Continue with an OpenSpec proposal in another harness, using this file as starting context.
+`;
+
 async function writeBrainstorm(cwd: string, filename: string, frontmatter: Record<string, string>, body = "") {
   const fm = Object.entries(frontmatter)
     .map(([k, v]) => `${k}: ${v}`)
@@ -121,7 +174,7 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
     title: "My Feature",
     status: "open",
     created: "2026-01-01",
-  });
+  }, VALID_BRAINSTORM_BODY);
 
   const fakePiWrap = makeFakePi(cwd);
   const handler = await loadHandler(fakePiWrap.pi);
@@ -248,7 +301,7 @@ await test("verification gate: missing _Verified notes sends back for another ap
 
 await test("propose fails to produce a valid change -> warns, does not enter review", async () => {
   const cwd = await freshRepo();
-  await writeBrainstorm(cwd, "2026-01-02-broken.md", { title: "Broken", status: "open", created: "2026-01-02" });
+  await writeBrainstorm(cwd, "2026-01-02-broken.md", { title: "Broken", status: "open", created: "2026-01-02" }, VALID_BRAINSTORM_BODY);
 
   const fakePiWrap = makeFakePi(cwd);
   const handler = await loadHandler(fakePiWrap.pi);
@@ -387,7 +440,7 @@ await test("archived brainstorm short-circuits with a warning", async () => {
 
 await test("fireTurnAndWait survives the observed race: waitForIdle would resolve before the turn actually starts", async () => {
   const cwd = await freshRepo();
-  await writeBrainstorm(cwd, "2026-01-07-race.md", { title: "Race", status: "open", created: "2026-01-07" });
+  await writeBrainstorm(cwd, "2026-01-07-race.md", { title: "Race", status: "open", created: "2026-01-07" }, VALID_BRAINSTORM_BODY);
 
   const handler = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
     default: (pi: unknown) => void;
@@ -894,6 +947,140 @@ await test("Sidebar view: offered instead of Jump to section when ctx.ui.custom 
   assert.equal(customCalls.length, 1, "ctx.ui.custom should be called exactly once for Sidebar view");
   assert.equal((customCalls[0] as { overlay?: boolean }).overlay, true);
   assert.ok(!fakeUiWrap.selectPrompts.some(p => p === "Jump to a section — \"sidebar-test\""), "Jump to section's menu should not appear when Sidebar view is available");
+});
+
+await test("--idea skips the picker entirely and fires a grill turn as the first message (not fire-and-wait)", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  // No selectQueue/inputQueue pushed at all: if the handler tried to show the picker or ask
+  // for input, select()/input() would throw on an empty queue and fail the test.
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler(["--idea", "Add", "a", "dark", "mode", "toggle", "to", "settings"], ctx);
+
+  assert.equal(fakePiWrap.calls.length, 1);
+  assert.match(fakePiWrap.calls[0].prompt, /Grill this raw idea into a decided Readyset brainstorm file/);
+  assert.match(fakePiWrap.calls[0].prompt, /Add a dark mode toggle to settings/);
+  assert.ok(fakeUiWrap.notifications.some((n) => /Grilling started for/.test(n.message)));
+});
+
+await test("no --idea flag, brainstorms exist: 'Type a new idea' is offered, prompts for the idea, then grills it", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-01-my-feature.md", { title: "My Feature", status: "open", created: "2026-01-01" });
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("✎ Type a new idea (grill it here)");
+  fakeUiWrap.inputQueue.push("Let users export their data as CSV");
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.equal(fakePiWrap.calls.length, 1);
+  assert.match(fakePiWrap.calls[0].prompt, /Let users export their data as CSV/);
+});
+
+await test("'Type a new idea' selected but input cancelled -> notifies, does not fire a turn", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-01-my-feature.md", { title: "My Feature", status: "open", created: "2026-01-01" });
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("✎ Type a new idea (grill it here)");
+  fakeUiWrap.inputQueue.push(undefined);
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.equal(fakePiWrap.calls.length, 0);
+  assert.ok(fakeUiWrap.notifications.some((n) => /No idea given/.test(n.message)));
+});
+
+await test("'No full-lane brainstorms found' warning still fires with no brainstorms and no --idea (existing behavior preserved)", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  // No selectQueue pushed: the handler must return via the warning path, not reach select().
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.ok(fakeUiWrap.notifications.some((n) => /No full-lane brainstorms found/.test(n.message) && /--idea/.test(n.message)));
+  assert.equal(fakePiWrap.calls.length, 0);
+});
+
+await test("content-check gate: an unresolved brainstorm (empty body) blocks Explore until the user picks 'Continue anyway'", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-17-vague.md", { title: "Vague", status: "open", created: "2026-01-17" }); // no body at all
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-17 · Vague"); // pick
+  fakeUiWrap.selectQueue.push("Continue anyway"); // content-check gate
+
+  fakePiWrap.queueEffect(async () => {}); // Explore turn: does nothing, fine for this test
+  fakePiWrap.queueEffect(async () => {}); // Propose turn: does nothing either -- we only care that it fired
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.ok(
+    fakeUiWrap.selectPrompts.some((p) => /section\(s\) look unresolved \(structural check\)/.test(p)),
+    "content-check gate should have fired",
+  );
+  assert.ok(fakePiWrap.calls.length >= 1, "Explore should still have fired after 'Continue anyway'");
+});
+
+await test("content-check gate: 'Go back' stops before Explore fires at all", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-18-vague2.md", { title: "Vague2", status: "open", created: "2026-01-18" });
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-18 · Vague2"); // pick
+  fakeUiWrap.selectQueue.push("Go back"); // content-check gate
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.equal(fakePiWrap.calls.length, 0, "Explore must not fire once the user picks 'Go back'");
+  assert.ok(fakeUiWrap.notifications.some((n) => /Stopped before Explore/.test(n.message)));
+});
+
+await test("content-check gate: a fully-filled-in brainstorm never triggers the gate", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(
+    cwd,
+    "2026-01-19-solid.md",
+    { title: "Solid", status: "open", created: "2026-01-19" },
+    VALID_BRAINSTORM_BODY,
+  );
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-19 · Solid"); // pick only -- no gate select should be needed
+
+  fakePiWrap.queueEffect(async () => {});
+  fakePiWrap.queueEffect(async () => {});
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler([], ctx);
+
+  assert.ok(
+    !fakeUiWrap.selectPrompts.some((p) => /section\(s\) look unresolved \(structural check\)/.test(p)),
+    "content-check gate should not have fired for a fully-filled-in brainstorm",
+  );
+  assert.ok(fakePiWrap.calls.length >= 1, "Explore should have fired directly");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -13,6 +13,7 @@
 
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { structuralCheckSummary } from "./readyset-structural-check.ts";
 
 export const BRAINSTORM_DIR = ".ai/brainstorms";
 export const READYSET_DIR = "readyset";
@@ -273,6 +274,100 @@ export async function findBrainstormBranch(cwd: string, changeId: string): Promi
 		return parseBranchLine(body);
 	}
 	return undefined;
+}
+
+export interface BrainstormContentIssue {
+	section: string;
+	problem: string;
+}
+
+export interface BrainstormContentCheck {
+	ok: boolean;
+	issues: BrainstormContentIssue[];
+	summary: string;
+}
+
+/** Extracts the body of a level-2 (`## Heading`) section, up to the next level-2 heading or
+ *  end of the body. Case-insensitive; tolerates trailing whitespace on the heading line. */
+function extractSection(body: string, heading: string): string | undefined {
+	const headingRe = new RegExp(`^##[ \\t]*${heading}[ \\t]*$`, "im");
+	const m = body.match(headingRe);
+	if (!m) return undefined;
+	const start = m.index! + m[0].length;
+	const rest = body.slice(start);
+	const next = rest.match(/^##[ \t]/m);
+	return rest.slice(0, next ? next.index : undefined);
+}
+
+/**
+ * Structural — not semantic — check that a brainstorm's closing sections were actually filled
+ * in, not left as the brainstorm-ai skill's own unfilled template text. Exists for the same
+ * reason `validateChange` (readyset-spec.ts) exists for change artifacts: a brainstorm can now
+ * come out of `/readyset-review --idea`'s own grilling turn, which — like every LLM turn
+ * working from a prose instruction alone — can accept a passive answer and write the file early
+ * despite being told not to (the same class of failure that motivated `listSubmodules()` being
+ * injected into Explore's prompt deterministically, rather than trusted to a "check
+ * .gitmodules" instruction). This catches the file that never actually got decided, not one
+ * that made a bad but genuine decision — the same shallow-by-design trade-off `validateChange`
+ * states about itself, stated here too rather than hidden.
+ *
+ * Deliberately does not require Options Explored / Spec Impact / Git Workflow to be filled — a
+ * brainstorm can legitimately defer some of those (e.g. "not applicable, no OpenSpec here"), and
+ * the four sections checked here (Decision, Seam, Scope, Acceptance Criteria) are exactly the
+ * four the brainstorm-ai skill's own rule #6 says must never be left soft before writing the file
+ * at all — the same bar this check enforces.
+ */
+export function validateBrainstormContent(raw: string): BrainstormContentCheck {
+	const { body } = parseFrontmatter(raw);
+	const issues: BrainstormContentIssue[] = [];
+
+	const decision = extractSection(body, "Decision")?.trim();
+	if (!decision) {
+		issues.push({ section: "Decision", problem: "section missing or empty" });
+	} else if (!/Chosen option\s*:\s*\S/i.test(decision)) {
+		issues.push({ section: "Decision", problem: "no filled-in 'Chosen option:' line found" });
+	}
+
+	const seam = extractSection(body, "Seam")?.trim();
+	if (!seam) {
+		issues.push({ section: "Seam", problem: "section missing or empty" });
+	} else if (/^<.*>$/s.test(seam)) {
+		issues.push({ section: "Seam", problem: "still the unfilled '<...>' template placeholder" });
+	}
+
+	const scope = extractSection(body, "Scope")?.trim();
+	if (!scope) {
+		issues.push({ section: "Scope", problem: "section missing or empty" });
+	} else if (/-\s*In scope\s*:\s*\.\.\.\s*$/im.test(scope) && /-\s*Out of scope\s*:\s*\.\.\.\s*$/im.test(scope)) {
+		issues.push({ section: "Scope", problem: "still the unfilled 'In scope: ... / Out of scope: ...' template" });
+	}
+
+	const acceptance = extractSection(body, "Acceptance Criteria")?.trim();
+	if (!acceptance) {
+		issues.push({ section: "Acceptance Criteria", problem: "section missing or empty" });
+	} else if (!/\bWHEN\b[\s\S]*?\bTHEN\b/i.test(acceptance)) {
+		issues.push({ section: "Acceptance Criteria", problem: "no WHEN ... THEN-shaped criterion found" });
+	}
+
+	return {
+		ok: issues.length === 0,
+		issues,
+		// "(structural check)" is deliberate, same wording readyset-spec.ts's validateChange
+		// uses for the same reason: this confirms the four sections are filled in with
+		// something that isn't the unfilled template, not that the content is actually good.
+		// A brainstorm that clears this can still describe a bad plan -- that judgment happens
+		// later, in the human back-and-forth during grilling itself and in the review gate, not
+		// here. structuralCheckSummary (readyset-structural-check.ts) is what actually keeps the
+		// wording identical to validateChange's -- see that file's doc comment for why this is a
+		// shared function now instead of each check spelling out "(structural check)" by hand.
+		summary: structuralCheckSummary({
+			kind: "brainstorm",
+			issueCount: issues.length,
+			okDetail: "Decision/Seam/Scope/Acceptance Criteria filled in",
+			issueNoun: "section(s) look unresolved",
+			notOkDetail: issues.length > 0 ? "may not have been fully grilled" : undefined,
+		}),
+	};
 }
 
 /**

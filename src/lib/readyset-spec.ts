@@ -18,6 +18,7 @@
 
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { structuralCheckSummary } from "./readyset-structural-check.ts";
 
 export const READYSET_ROOT = "readyset";
 
@@ -267,7 +268,7 @@ export async function validateChange(cwd: string, changeId: string): Promise<Val
 	const ok = issues.length === 0;
 	return {
 		ok,
-		summary: ok ? "validate: pass (structural check)" : `validate: ${issues.length} issue(s) (structural check)`,
+		summary: structuralCheckSummary({ kind: "validate", issueCount: issues.length, okDetail: "pass", issueNoun: "issue(s)" }),
 		issues,
 	};
 }

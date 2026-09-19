@@ -41,27 +41,40 @@ npm install --save-dev readyset-review
 npx readyset-review install
 ```
 
-Readyset installs **globally**, into `~/.omp/agent/` — not into any one repo. It's a personal
-workflow extension, like the other extensions that may already live in `~/.omp/agent/extensions/`,
-meant to be available in every repo you work in, not scoped to one. This is omp's own documented
-user-level discovery path (`~/.omp/agent/extensions`, `~/.omp/agent/lib`, confirmed against
-`docs/extension-loading.md` and against a real `~/.omp` already running other extensions, not
-guessed): `.ts` source goes to `~/.omp/agent/lib/` and `~/.omp/agent/extensions/`, the skill doc
-to `~/.omp/agent/skills/`. There's no build step — omp loads extensions as `.ts` files directly.
+Readyset installs **globally**, tied to `~/.omp/` — not into any one repo. It's a personal
+workflow extension meant to be available in every repo you work in, not scoped to one.
 
-`~/.omp/agent/` is a shared namespace — other extensions' files already live there. Every file
-this package installs is prefixed `readyset-` (`readyset-brainstorm.ts`, `readyset-omp-config.ts`,
-`readyset-spec.ts`, `readyset-review-overlay.ts`, `readyset-review.ts`) specifically so it can
-never collide with or silently
-overwrite something already installed there, regardless of what else you have running.
+It does **not** copy `.ts` files into `~/.omp/agent/`. Instead it references its own extension
+module in place: omp's native config provider reads `~/.omp/agent/settings.json`'s top-level
+`"extensions"` array, and when an entry resolves to a *file* (not a directory), it loads that
+file as a full extension module wherever it actually sits on disk — no requirement that it live
+under `~/.omp/agent/extensions/` first. This is real, source-verified omp behavior (its
+`loadExtensionModules`, in the native `.omp` discovery provider), not a convention this package
+invented. So `install` merges one absolute path —
+`<this package>/src/extensions/readyset-review.ts` — into that array. `readyset-review.ts`'s own
+imports (`../lib/readyset-*.ts`) resolve against its real location on disk, so every other `.ts`
+file in this package needs no install step at all — updating the package is enough, since
+nothing was copied to go stale.
+
+The one thing `install` does still copy is the skill doc, to `~/.omp/agent/skills/readyset/`
+— skills have no `settings.json`-array equivalent in omp (only a fixed directory scan), and
+being a reference doc with no import graph, a stale copy is a much smaller problem than stale
+runtime code would be. `install` re-copies it every run regardless.
+
+Existing entries in `settings.json` — anything belonging to another extension — are left
+untouched; `install` only ever touches the one entry that resolves to a file named
+`readyset-review.ts`; re-running it is a no-op once that entry is already correct.
 
 Pass `--target <path>` to install somewhere else instead — a scratch directory for testing, or
 `<repo>/.omp` if you'd rather scope this to one project (omp supports that layout too; this
 installer just doesn't default to it).
 
-Re-run `npx readyset-review install` after bumping the `readyset-review` version to pick up
-changes. **Don't hand-edit the installed files** — they get overwritten on the next install. If
-you need different behavior, change it here and re-publish, not in the installed copy.
+Since nothing runtime is copied, code changes need no re-install to take effect. Re-run
+`npx readyset-review install` only after moving the package itself (the settings.json entry
+would otherwise point at a path that no longer exists) or to refresh the installed skill doc.
+If you have leftover files from an older, copy-based version of this installer under
+`~/.omp/agent/lib/readyset-*.ts` / `~/.omp/agent/extensions/readyset-review.ts`, they're inert
+once `settings.json` points at the package directly — safe to delete by hand.
 
 ## Validate from the CLI
 
@@ -87,12 +100,29 @@ has. If that subprocess can't start, `validate` says so plainly rather than fail
 
 ## Use
 
-With Readyset installed and at least one brainstorm under `.ai/brainstorms/` in a repo, run:
+With Readyset installed, run:
 
 ```
 /readyset-review
+/readyset-review --idea "let users export their data as CSV"   # grill a new brainstorm from a raw idea
 /readyset-review --model anthropic/claude-opus-5   # pin a model for this run's turns (optional)
 ```
+
+A brainstorm under `.ai/brainstorms/` is no longer a hard prerequisite. `--idea <text>` (or
+picking **"Type a new idea"** at the top of the normal picker, when nothing was typed after
+`--idea`) starts a **grilling** turn instead: mattpocock/skills-style interrogation — map the
+open decision branches, ask one numbered round of frontier questions with a recommended answer
+for each, never accept a passive "okay"/"terserah" as a real decision on anything load-bearing,
+repeat until the design tree actually resolves. This deliberately matches the closing discipline
+of the separate, standalone `brainstorm-ai` skill (Decision, Seam, Scope, Acceptance Criteria,
+auto-derived branch type and lane) rather than inventing a second brainstorm format: whichever
+tool actually wrote a given `.ai/brainstorms/*.md` file, Readyset's own picker and reconciliation
+treat it identically. Grilling itself is an ordinary back-and-forth in the chat, not something
+`/readyset-review`'s own code can wait on synchronously — it fires the opening question and
+returns; you answer normally, round by round, until the model writes the brainstorm file and
+tells you to run `/readyset-review` again to pick it up (Explore, then Propose). If you'd rather
+hand-write or dictate the brainstorm to a separate tool first, that path still works exactly as
+before.
 
 `--model` pins one model for every turn this run fires (Explore through Code-review), so a run
 is reproducible independent of whatever model happened to be active in the chat session that
@@ -162,10 +192,31 @@ It picks a brainstorm, and depending on its status:
   spec.md with three requirements and only one scenario fails, it doesn't pass on the strength
   of its one good sibling. But it still catches an empty or malformed artifact, not a
   semantically wrong one. A "validate: pass" in the review panel is not a claim the plan is
-  correct, only that every requirement is structurally complete.
+  correct, only that every requirement is structurally complete — which is why its summary text
+  always carries the literal suffix `(structural check)`, everywhere it's shown (review panel,
+  the gate prompt, `readyset-review validate`'s CLI output). `validateBrainstormContent`
+  (checked before Explore ever runs — see below) uses the exact same wording for the exact same
+  reason: neither check should read as a stronger guarantee than it actually gives just because
+  of how it happens to be phrased — enforced by construction now, via a shared
+  `structuralCheckSummary` helper (`readyset-structural-check.ts`) both checks call, rather than
+  by two files independently spelling out the same literal string and hoping they stay in sync.
+  The only check in this package that *is* a semantic pass is
+  the separate Code-review turn (`REVIEW.md`) — its line in the panel says "done" or "not run
+  yet", deliberately not sharing the `(structural check)` wording, since it's the one place a
+  real judgment call, not a presence check, actually happened.
 - `archiveChange` merges delta specs into the main spec **append-only** — never a real
   ADDED/MODIFIED/REMOVED diff-merge. Safe (nothing is deleted or silently rewritten), but cruder
   than a proper schema-aware archiver; review the merged spec afterward.
+- Grilling's round cap is **prompt-level only** — the prompt tells the model to check in after 4
+  rounds rather than interrogate forever, but nothing in the extension's own code enforces that
+  the way `TurnBudget` enforces the 10-turn ceiling on Explore/Propose/Refine/Apply/Code-review.
+  It can't be: those are each one `spendTurn` call the extension fires and synchronously waits
+  on, while grilling's rounds are ordinary chat turns the user answers directly — the extension
+  only ever sees the opening message. What *is* enforced in code is `validateBrainstormContent`
+  (readyset-brainstorm.ts): before Explore spends a single turn on whatever grilling (or anyone
+  else) wrote, it checks Decision/Seam/Scope/Acceptance Criteria actually got filled in, not left
+  as the brainstorm-ai skill's own template placeholders — "Continue anyway" is always available
+  if the gaps are acceptable, but it's a deliberate extra step, not silently skipped.
 - The review screen has two tiers, chosen automatically by feature-detecting `ctx.ui.custom` at
   gate time. Where it's available (an interactive terminal session — the normal way `omp` is
   actually run), **Sidebar view** renders a real persistent two-pane overlay via `ctx.ui.custom()`
@@ -211,26 +262,24 @@ src/
   skill/
     SKILL.md                reference doc for the phase order + file formats; read by an agent
                              working a Readyset change directly, not loaded by the extension —
-                             installed to ~/.omp/agent/skills/readyset/SKILL.md (see note below)
+                             copied to ~/.omp/agent/skills/readyset/SKILL.md (see note below)
   cli/
     install.mjs            `readyset-review install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
 ```
 
-Installed layout, once `readyset-review install` has run (default target `~/.omp`):
+What `readyset-review install` actually touches on disk (default target `~/.omp`):
 
 ```
 ~/.omp/agent/
-  lib/readyset-brainstorm.ts, readyset-spec.ts, readyset-omp-config.ts, readyset-review-overlay.ts
-  extensions/readyset-review.ts
-  skills/readyset/SKILL.md
+  settings.json     "extensions" array gets one entry merged in: the absolute path to this
+                     package's own src/extensions/readyset-review.ts -- not a copy of it
+  skills/readyset/SKILL.md   copied (see note below; this one file has no reference-in-place option)
 ```
 
-This is omp's own documented user-level discovery path, confirmed against `docs/extension-loading.md`
-("User-level (global): the active agent directory's extensions/", which resolves to
-`~/.omp/agent/extensions` by default) and against a real `~/.omp` already running other
-extensions — not a guess. Every filename here is prefixed `readyset-` on purpose: `~/.omp/agent/`
-is shared with whatever else you already have installed there, and an earlier, unprefixed version
-of this installer (`brainstorm.ts`, `omp-config.ts`) would have collided with an existing,
-unrelated `~/.omp/agent/lib/brainstorm.ts` in active use by other extensions on the machine this
-was verified against, silently overwriting it and breaking them.
+Everything under `src/lib/` and `src/extensions/` stays exactly where the package itself lives
+(a git clone, or `node_modules/readyset-review/` after `npm install`) and is read from there —
+confirmed against omp's own native discovery provider (`loadExtensionModules`), which resolves a
+`settings.json` `"extensions"` array entry that points at a file, not a directory, and loads it
+in place; not a guess. Skills have no such array in omp (only a fixed
+`~/.omp/agent/skills/` directory scan), so the skill doc is still copied rather than referenced.
