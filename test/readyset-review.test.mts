@@ -3,6 +3,17 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 
+// This whole file exercises readyset-review.ts's handler, which reads omp config
+// (language/model/fallback chain) via readPreferredLanguage()/readPinnedModel()/
+// readFallbackChain() called with NO argument -- by design, that always resolves to the real
+// ~/.omp/agent/config.yml (see readyset-omp-config.ts's OMP_CONFIG_PATH comment), never a scratch
+// path. Point it at a path that's guaranteed not to exist instead, so every "no --lang/--model
+// flag" test here gets the same clean "nothing configured" starting point regardless of what's
+// actually sitting in the real config.yml on whatever machine runs this suite. Must be set before
+// the first `import(".../readyset-review.ts?t=...")` below, since OMP_CONFIG_PATH is a top-level
+// const evaluated at module load.
+process.env.READYSET_TEST_CONFIG_PATH = join(tmpdir(), `readyset-test-omp-config-${Date.now()}-${Math.random()}`, "config.yml");
+
 let pass = 0;
 let fail = 0;
 async function test(name: string, fn: () => Promise<void>) {

@@ -57,7 +57,19 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const OMP_CONFIG_PATH = join(homedir(), ".omp", "agent", "config.yml");
+// readyset-review.ts's handler calls readPreferredLanguage()/readPinnedModel()/readFallbackChain()
+// with NO argument by design -- see readyset-review.ts's own comment on that invariant (the
+// wizard's writes and /readyset's reads must always agree on this exact path, never a
+// --target-derived one). That means the test suite has no way to isolate those call sites from
+// a real ~/.omp/agent/config.yml through the public API alone. READYSET_TEST_CONFIG_PATH is that
+// seam: unset in every real invocation (install.mjs/configure.mjs never set it, and nothing in
+// this package's own runtime code sets an env var to influence its own config resolution), so
+// production behavior is exactly `join(homedir(), ".omp", "agent", "config.yml")` as before --
+// only test/readyset-review.test.mts sets it, to a scratch path that's guaranteed not to exist.
+// (Found this gap because a real `npm publish` on a machine that actually has a populated
+// ~/.omp/agent/config.yml -- e.g. one already using `readyset-flow configure` -- surfaced two
+// "reactive default" tests silently reading that real file instead of a clean one.)
+const OMP_CONFIG_PATH = process.env.READYSET_TEST_CONFIG_PATH || join(homedir(), ".omp", "agent", "config.yml");
 
 export type YamlValue = string | YamlValue[] | { [key: string]: YamlValue };
 
