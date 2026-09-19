@@ -157,11 +157,12 @@ that text) opens the discussion in that language from round 1 instead:
 ```
 
 Or set a default once in `~/.omp/agent/config.yml` so you don't have to type it every run
-(`--lang` still wins if given):
+(`--lang` the flag still wins if given). `readyset.lang` also works as an alias for
+`readyset.language` — pick whichever reads better to you, both are read the same way:
 
 ```yaml
 readyset:
-  language: Indonesian
+  language: Indonesian   # or: lang: Indonesian
 ```
 
 Either way, only the *discussion* changes language — the brainstorm FILE `/readyset --idea`

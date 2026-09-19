@@ -152,6 +152,48 @@ await test("readPreferredLanguage: missing file or key -> {language: undefined, 
   assert.deepEqual(await readPreferredLanguage(join(dir, "does-not-exist.yml")), { language: undefined, source: undefined });
 });
 
+await test("parseLanguageOverride: readyset.lang works as an alias for readyset.language", () => {
+  const raw = 'readyset:\n  lang: "Indonesian"\n  model:\n    default: a\n';
+  assert.equal(parseLanguageOverride(raw), "Indonesian");
+});
+
+await test("parseLanguageOverride: readyset.language wins over readyset.lang when both are set", () => {
+  const raw = "readyset:\n  language: Indonesian\n  lang: English\n";
+  assert.equal(parseLanguageOverride(raw), "Indonesian");
+});
+
+await test("readPreferredLanguage: reads readyset.lang from a real file, labels the source accordingly", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, 'readyset:\n  lang: "Indonesian"\n', "utf8");
+  assert.deepEqual(await readPreferredLanguage(configPath), {
+    language: "Indonesian",
+    source: "readyset.lang in ~/.omp/agent/config.yml",
+  });
+});
+
+await test("readPreferredLanguage: matches the user's real config.yml shape (lang + nested model.fallbackChains)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(
+    configPath,
+    [
+      "readyset:",
+      '  lang: "Indonesian"',
+      "  model:",
+      "    default: eai1/cbai/deepseek-v4.1-flash",
+      "    fallbackChains: ",
+      "      - eai1/cbai/deepseek-v4.1-flash",
+      "      - eai2/muse-spark-1.3-contributor",
+    ].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual(await readPreferredLanguage(configPath), {
+    language: "Indonesian",
+    source: "readyset.lang in ~/.omp/agent/config.yml",
+  });
+});
+
 await test("parseYamlSubset: nested mapping under a mapping (readyset.model.default)", () => {
   const raw = "readyset:\n  model:\n    default: anthropic/claude-opus-5\n";
   const doc = parseYamlSubset(raw) as any;

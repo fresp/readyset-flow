@@ -190,13 +190,15 @@ export function parseFallbackModel(raw: string): string | undefined {
 }
 
 /** Readyset's own grilling-discussion language default, namespaced under `readyset.language`
- *  in the same file. Same precedence pattern as `model` above, but there is no omp-wide
- *  equivalent to fall back to the way there is `modelRoles.default` -- omp has no notion of a
- *  preferred discussion language, so the only fallback when this is unset is the existing
- *  reactive default (grillTurnPrompt tells the model to match whatever language the user
- *  replies in, rather than picking one up front). See `readPreferredLanguage`. */
+ *  in the same file (`readyset.lang` also works, as an alias -- a real config was seen using
+ *  the short form, presumably by analogy with the `--lang` CLI flag; both are accepted rather
+ *  than silently ignoring one of them). Same precedence pattern as `model` above, but there is
+ *  no omp-wide equivalent to fall back to the way there is `modelRoles.default` -- omp has no
+ *  notion of a preferred discussion language, so the only fallback when this is unset is the
+ *  existing reactive default (grillTurnPrompt tells the model to match whatever language the
+ *  user replies in, rather than picking one up front). See `readPreferredLanguage`. */
 export function parseLanguageOverride(raw: string): string | undefined {
-	return parseNestedKey(raw, "readyset", "language");
+	return parseNestedKey(raw, "readyset", "language") ?? parseNestedKey(raw, "readyset", "lang");
 }
 
 export interface ResolvedModelDefault {
@@ -276,8 +278,11 @@ export async function readPreferredLanguage(configPath: string = OMP_CONFIG_PATH
 	const raw = await readFile(configPath, "utf8").catch(() => undefined);
 	if (raw === undefined) return { language: undefined, source: undefined };
 
-	const language = parseLanguageOverride(raw);
+	const language = parseNestedKey(raw, "readyset", "language");
 	if (language) return { language, source: "readyset.language in ~/.omp/agent/config.yml" };
+
+	const lang = parseNestedKey(raw, "readyset", "lang");
+	if (lang) return { language: lang, source: "readyset.lang in ~/.omp/agent/config.yml" };
 
 	return { language: undefined, source: undefined };
 }
