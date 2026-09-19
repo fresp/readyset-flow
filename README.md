@@ -1,11 +1,42 @@
-# Readyset
+<p align="center">
+  <img src="assets/banner.svg" alt="Readyset — grounded, reviewable, executable changes for omp" width="100%">
+</p>
 
-Readyset is a standalone omp extension. It turns a brainstorm sitting in `.ai/brainstorms/*.md`
-into a grounded, reviewable, executable change under Readyset's own `readyset/changes/<id>/`
+<p align="center">
+  <a href="#install"><b>Install</b></a> ·
+  <a href="#use"><b>Use</b></a> ·
+  <a href="#how-it-works"><b>How it works</b></a> ·
+  <a href="#configure-a-model"><b>Configure a model</b></a> ·
+  <a href="#what-it-deliberately-does-not-do"><b>Limitations</b></a>
+</p>
+
+Readyset is a standalone [omp](https://github.com/oh-my-pi) extension, invoked as `/readyset`.
+It turns a rough idea, or a brainstorm already sitting in `.ai/brainstorms/*.md`, into a
+grounded, reviewable, executable change under Readyset's own `readyset/changes/<id>/`
 directory — without depending on omp's native `/plan`, or any external spec-driven-development
 CLI, at runtime. The proposal/design/spec/tasks split is a well-established shape for this kind
 of work, but Readyset's directory layout, file format, and validation are its own — it does not
 read from, write to, or stay compatible with any other tool's files.
+
+**In one sentence:** `/readyset` asks the questions a plan needs answered *before* it writes
+anything (grilling), grounds what it writes in the real repo instead of assumptions (Explore),
+and won't let you execute a change that's still structurally incomplete or that skipped a review
+pass — each of those is a code-enforced gate, not just a prompt asking nicely.
+
+## Table of contents
+
+- [Why "Readyset"](#why-readyset)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Validate from the CLI](#validate-from-the-cli)
+- [Use](#use)
+  - [Grilling — turning an idea into a brainstorm](#grilling--turning-an-idea-into-a-brainstorm)
+  - [Language](#language)
+  - [Configure a model](#configure-a-model)
+  - [The review gate](#the-review-gate)
+- [What it deliberately does not do](#what-it-deliberately-does-not-do)
+- [Files a change accumulates](#files-a-change-accumulates)
+- [Package layout](#package-layout)
 
 ## Why "Readyset"
 
@@ -33,6 +64,23 @@ condition that has to hold), not just something described in a prompt — a prom
 proved insufficient once: an earlier version of the propose turn was told in prose to check
 `.gitmodules`, and still silently dropped one of two submodules from its output. Prose is a
 request; a gate is a requirement.
+
+## How it works
+
+A `/readyset` change moves through five stages. You only ever see the ones that still apply —
+running `/readyset` again on an already-proposed change skips straight to review, for instance.
+
+| Stage | What happens | Who can skip it |
+|---|---|---|
+| **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity in a structured Q&A picker until Decision/Seam/Scope/Acceptance Criteria actually resolve, instead of accepting a passive "sure, whatever". | Skipped entirely if you already hand-wrote a brainstorm in `.ai/brainstorms/`. |
+| **2. Explore** | Reads the real repo — file contents, `.gitmodules`, commit hashes — and writes down what it actually found in `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm. |
+| **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in what Explore found — not re-derived from scratch. | Never skipped. |
+| **4. Review gate** | You approve, ask for a revision (**Refine**), or **Discard**. Nothing executes without you looking at it first. | Never skipped — this is the one gate Readyset exists to enforce. |
+| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note (what was checked, what the result was) or the gate sends it back. A separate, fresh-context **code-review** pass runs after, before the change can be archived. | Never skipped. |
+
+The one loop in this: **Refine** at the review gate sends you back into another Propose pass,
+and a run that fails verification at Execute sends you back to the review gate — either way you
+land back at a stage above, not off into an unrecoverable branch.
 
 ## Install
 
@@ -108,6 +156,8 @@ With Readyset installed, run:
 /readyset --model anthropic/claude-opus-5   # pin a model for this run's turns (optional)
 ```
 
+### Grilling — turning an idea into a brainstorm
+
 A brainstorm under `.ai/brainstorms/` is no longer a hard prerequisite. `--idea <text>` (or
 picking **"Type a new idea"** at the top of the normal picker, when nothing was typed after
 `--idea`) starts a **grilling** turn instead: mattpocock/skills-style interrogation — map the
@@ -146,6 +196,8 @@ brainstorm file and tells you to run `/readyset` again to pick it up (Explore, t
 you'd rather hand-write or dictate the brainstorm to a separate tool first, that path still works
 exactly as before.
 
+### Language
+
 By default, grilling's own reactive rule kicks in: reply in whatever language you use, once you
 use it — so round 1 itself still arrives in English, since there's no signal yet of what
 language you'd rather use. `--lang <language>` (placed *before* `--idea` — `--idea` joins
@@ -172,6 +224,8 @@ stays in English on purpose even with `--lang` set: each `readyset_ask` question
 short tab/chip label above it, e.g. "Eligibility gate") — those read like fixed UI chrome, not
 conversation, and a picker with some tabs translated and some not is more jarring than keeping
 all of them in English.
+
+### Configure a model
 
 `--model` pins one model for every turn this run fires (Explore through Code-review), so a run
 is reproducible independent of whatever model happened to be active in the chat session that
@@ -217,6 +271,8 @@ unbounded Refine or verification-retry loop burning cost with no natural stoppin
 precise cost estimate. The review panel shows `agent turns this run: N/10`; hitting the ceiling
 stops the run with a warning rather than firing another turn, and `/readyset` can simply be
 re-run for a fresh budget.
+
+### The review gate
 
 It picks a brainstorm, and depending on its status:
 
