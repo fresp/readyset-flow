@@ -339,11 +339,14 @@ function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: st
 		"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
 		"real thing. Reserve open questions for what only the user can decide or knows.\n" +
 		(preferredLanguage
-			? `- Preferred language for this discussion: ${preferredLanguage}. Write every question/header/option ` +
+			? `- Preferred language for this discussion: ${preferredLanguage}. Write every question and option ` +
 				"text you pass to `readyset_ask`, and any plain-chat fallback text, in that language from the very " +
-				"first round -- don't wait for the user to reply in it first before switching. The brainstorm FILE " +
-				"you write at the end must still be entirely in English regardless, exactly like the structure " +
-				"below.\n\n"
+				"first round -- don't wait for the user to reply in it first before switching. Keep each " +
+				"`readyset_ask` question's `header` (the short chip label above it, e.g. 'Eligibility gate') in " +
+				"English regardless of preferred language -- it reads like fixed UI chrome, not conversation, and " +
+				"a picker with some tabs translated and some not (e.g. 'Framing' next to a translated tab) is more " +
+				"jarring than just keeping all of them in English. The brainstorm FILE you write at the end must " +
+				"still be entirely in English regardless, exactly like the structure below.\n\n"
 			: "- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
 				"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
 		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +

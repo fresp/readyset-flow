@@ -1131,6 +1131,10 @@ await test("--lang before --idea opens grilling's discussion in that language fr
   // --lang's own value must not leak into the idea text (it's parsed out before --idea's join).
   assert.doesNotMatch(fakePiWrap.calls[0].prompt, /Raw idea from the user: "--lang/);
   assert.ok(fakeUiWrap.notifications.some((n) => /Grilling started for.*in Indonesian/.test(n.message)));
+  // readyset_ask's `header` (the tab chip label) stays in English even with --lang set -- a
+  // picker with some tabs translated and some not read as more jarring than none of them
+  // translated (real feedback: mixed "Framing" / "Sumber kebenaran" tabs in the same round).
+  assert.match(fakePiWrap.calls[0].prompt, /Keep each `readyset_ask` question's `header`.*in English/);
 });
 
 await test("no --lang flag: grillTurnPrompt keeps its reactive default (no 'Preferred language' line)", async () => {

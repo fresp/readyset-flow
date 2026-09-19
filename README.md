@@ -167,7 +167,11 @@ readyset:
 
 Either way, only the *discussion* changes language — the brainstorm FILE `/readyset --idea`
 eventually writes is always entirely in English, same structure either way, since that's what
-the rest of Readyset (and most tooling reading `.ai/brainstorms/*.md`) expects.
+the rest of Readyset (and most tooling reading `.ai/brainstorms/*.md`) expects. One more thing
+stays in English on purpose even with `--lang` set: each `readyset_ask` question's `header` (the
+short tab/chip label above it, e.g. "Eligibility gate") — those read like fixed UI chrome, not
+conversation, and a picker with some tabs translated and some not is more jarring than keeping
+all of them in English.
 
 `--model` pins one model for every turn this run fires (Explore through Code-review), so a run
 is reproducible independent of whatever model happened to be active in the chat session that
