@@ -1,26 +1,3 @@
-<!--
-Authored by Freza (this package's maintainer), vendored here 2026-09-19. Unlike
-mattpocock-grilling.md, this one isn't repo-internal reference material -- it's meant to be
-copied out and actually used: create/upload it as an account-level Skill at
-claude.ai -> Settings -> Skills. It then syncs down to every surface that reads your synced
-skills (Claude Cowork, and Claude Code sessions too) -- there's no per-repo copy step, and
-`readyset-flow install` deliberately doesn't touch this file at all, since it's Claude account
-plumbing, not something omp reads.
-
-Readyset's own grilling turn (`grillTurnPrompt` in src/extensions/readyset-review.ts) matches
-this skill's closing discipline and file shape deliberately -- see "Grilling from outside omp"
-in the README. A brainstorm this skill writes and a brainstorm Readyset's own `--idea` grilling
-writes are indistinguishable to Readyset's picker; either is a legitimate way to arrive at a
-`.ai/brainstorms/*.md` file.
-
-Portability note: the YAML frontmatter below (`allowed-tools`, `disable-model-invocation`,
-`argument-hint`, and the `$ARGUMENTS`/`!`command`` substitution syntax) is Claude Skill plumbing
--- on a Claude surface it actually restricts which tools the skill can call. Using this on a
-non-Claude assistant (ChatGPT desktop, say) hasn't actually been tried: in principle only the
-body below the `---` closing fence would carry over, as plain instructions with no tool
-restriction enforced -- untested theory, not a documented path.
--->
-
 ---
 name: brainstorm-ai
 description: Read-only interactive brainstorming session (idea/option exploration, NOT detailed planning) whose output is saved as a markdown file in .ai/brainstorms/ at the project root. This file is meant to be picked up by another harness (e.g. omp) that will handle implementation planning or an OpenSpec proposal. Invoke manually via /brainstorm-ai — do not auto-trigger.

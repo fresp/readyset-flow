@@ -254,11 +254,13 @@ workaround for that skill's own read-only, no-repo-write, interactive-discussion
 before you ever open `omp`: run the brainstorming session in **Claude Cowork**, then bring the
 resulting file into the repo.
 
-A copy of that skill ships in this package at `src/skill/brainstorm-ai.md`, so you don't have to
-reconstruct the format by hand. To actually use it: go to **claude.ai → Settings → Skills** and
-create/upload a skill from that file's content — this is an account-level Skill, so once it's
-there it syncs down to every surface that reads your synced skills (Claude Cowork, and Claude
-Code sessions too — confirmed, not assumed: this package's own vendored copy was found by
+A byte-identical copy of that skill ships in this package at `resources/brainstorm-ai/SKILL.md`
+— outside `src/`, deliberately: nothing in this package's code loads, installs, or adapts from
+it, unlike `src/skill/mattpocock-grilling.md`'s direct provenance relationship to `grillTurnPrompt`
+(see [Package layout](#package-layout)). To actually use it: go to **claude.ai → Settings →
+Skills** and create/upload a skill from that file's content — this is an account-level Skill, so
+once it's there it syncs down to every surface that reads your synced skills (Claude Cowork, and
+Claude Code sessions too — confirmed, not assumed: this package's own vendored copy was found by
 grepping a live Claude Code session's `~/.claude/skills/synced/` directory, which is exactly
 where an account-level Skill lands once synced). There's no per-repo copy step and no install
 flag for this — `readyset-flow install` doesn't touch it at all, deliberately, since it's not
@@ -458,15 +460,20 @@ src/
                              (MIT-licensed) — the real source grillTurnPrompt is adapted from,
                              kept here to check wording against rather than a paraphrase of a
                              paraphrase. Repo-internal reference only, not installed.
-    brainstorm-ai.md        the /brainstorm-ai Claude Skill (see "Grilling from outside omp")
-                             — unlike the file above, this one is meant to be copied out and
-                             used: create/upload it as an account-level Skill at claude.ai ->
-                             Settings -> Skills, which syncs it to Claude Cowork and Claude Code
-                             alike. `readyset-flow install` deliberately doesn't touch this file
-                             — it's Claude account plumbing, not something omp reads.
   cli/
     install.mjs            `readyset-flow install`/`version`/`validate` — the CLI entry point
     validate-runner.mts    subprocess `validate` spawns with --experimental-strip-types (see README)
+
+resources/
+  brainstorm-ai/
+    SKILL.md                the /brainstorm-ai Claude Skill (see "Grilling from outside omp")
+                             — byte-identical to the original; deliberately outside src/, since
+                             unlike mattpocock-grilling.md above, nothing in this package's code
+                             is loaded from, installed from, or adapted from it. Kept here purely
+                             for discoverability, for a workflow this package's grilling matches
+                             the shape of but doesn't depend on.
+    README.md                provenance, how to actually attach it (claude.ai -> Settings ->
+                             Skills), and its portability boundary outside Claude surfaces
 ```
 
 What `readyset-flow install` actually touches on disk (default target `~/.omp`):

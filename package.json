@@ -11,6 +11,7 @@
     "src/extensions",
     "src/cli",
     "src/skill",
+    "resources",
     "assets",
     "README.md"
   ],
