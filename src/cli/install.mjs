@@ -5,6 +5,11 @@
  * Usage:
  *   npx readyset-flow install
  *   npx readyset-flow install --target /path/to/.omp   (defaults to ~/.omp)
+ *   npx readyset-flow update      (alias for install -- run as `npx readyset-flow@latest update`
+ *                                  to actually fetch a newer published version; see `main`'s
+ *                                  routing comment for why this needs no separate code path)
+ *   npx readyset-flow uninstall [--keep-config]   (the inverse of install -- see `uninstall`'s
+ *                                  own doc comment)
  *   npx readyset-flow configure   (interactive wizard for readyset: in ~/.omp/agent/config.yml
  *                                  -- see configure.mjs's own module doc comment; a separate
  *                                  command on purpose, so `install` itself stays non-interactive)
@@ -61,10 +66,10 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, basename } from "node:path";
 import { homedir } from "node:os";
-import { mkdir, copyFile, readFile, writeFile } from "node:fs/promises";
+import { mkdir, copyFile, readFile, writeFile, rm, rmdir } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { runConfigureWizard } from "./configure.mjs";
+import { runConfigureWizard, spliceReadysetBlock } from "./configure.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..", "..");
@@ -136,6 +141,91 @@ export async function linkExtension(agentDir) {
 	return { status, settingsPath };
 }
 
+/**
+ * The inverse of `linkExtension`: removes any `<agentDir>/settings.json` "extensions" entry
+ * that resolves to a file also named `readyset-review.ts` -- covers this package's own entry
+ * however it currently reads (an npx cache path, a dev checkout, whatever `install` last wrote),
+ * without needing to know that exact path -- and leaves every other entry (anything belonging
+ * to another extension) untouched. A missing or non-object settings.json is treated the same as
+ * "nothing to remove" (status "not-found"), same as a settings.json with no matching entry --
+ * uninstall is idempotent, running it twice (or on a machine that never ran install) is a no-op,
+ * not an error. Only a settings.json that exists but fails to *parse* as JSON is an error, same
+ * as `linkExtension` -- silently ignoring corrupt JSON here could hide a real problem from a
+ * script that chains uninstall after other tooling.
+ *
+ * Returns "removed" | "not-found" so the caller (`uninstall`) can report accurately. Exported
+ * for direct testing, same as `linkExtension`.
+ */
+export async function unlinkExtension(agentDir) {
+	const settingsPath = join(agentDir, "settings.json");
+	let raw;
+	try {
+		raw = await readFile(settingsPath, "utf8");
+	} catch (err) {
+		if (err.code === "ENOENT") return { status: "not-found", settingsPath };
+		throw err;
+	}
+
+	let settings;
+	if (raw.trim() === "") {
+		settings = {};
+	} else {
+		try {
+			settings = JSON.parse(raw);
+		} catch (err) {
+			throw new Error(`${settingsPath} isn't valid JSON -- fix or remove it, then re-run uninstall: ${err.message}`);
+		}
+	}
+	if (typeof settings !== "object" || settings === null || Array.isArray(settings) || !Array.isArray(settings.extensions)) {
+		return { status: "not-found", settingsPath }; // nothing shaped like our entry could live here
+	}
+
+	const others = settings.extensions.filter((entry) => !(typeof entry === "string" && basename(entry) === EXTENSION_ENTRY_BASENAME));
+	if (others.length === settings.extensions.length) {
+		return { status: "not-found", settingsPath };
+	}
+
+	settings.extensions = others;
+	await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+	return { status: "removed", settingsPath };
+}
+
+/**
+ * Removes the top-level `readyset:` block from `configPath` (config.yml) via `configure.mjs`'s
+ * own `spliceReadysetBlock(raw, [])` -- the exact same plain-text splice the configure wizard
+ * uses to clear every field, reused here rather than re-implemented, so there's one splice
+ * implementation to trust. Returns `false` (nothing changed) when the file doesn't exist, has no
+ * `readyset:` block, or has one in a shape `spliceReadysetBlock` won't touch automatically (an
+ * inline value -- see its own doc comment); `true` when a block was actually found and removed.
+ * Exported for direct testing against a scratch config.yml, same reasoning as `unlinkExtension`
+ * -- `OMP_CONFIG_PATH` is a fixed `~/.omp/...` path (see its own module-level comment), so
+ * `uninstall` itself can't be pointed at a scratch directory for this part the way `--target`
+ * lets it for the extension link.
+ */
+export async function clearConfigBlock(configPath) {
+	let raw;
+	try {
+		raw = await readFile(configPath, "utf8");
+	} catch (err) {
+		if (err.code === "ENOENT") return false;
+		throw err;
+	}
+
+	let next;
+	try {
+		next = spliceReadysetBlock(raw, []);
+	} catch (err) {
+		console.log(`  kept:      couldn't clear the readyset: section of config.yml automatically -- ${err.message}`);
+		return false;
+	}
+
+	const normalizedRaw = raw.endsWith("\n") ? raw : `${raw}\n`;
+	if (next === normalizedRaw) return false; // no readyset: block was there to begin with
+
+	await writeFile(configPath, next, "utf8");
+	return true;
+}
+
 async function install(targetRoot) {
 	const agentDir = join(targetRoot, "agent");
 
@@ -163,13 +253,61 @@ async function install(targetRoot) {
 	);
 }
 
+/**
+ * `readyset-flow uninstall [--target <path>] [--keep-config]` -- the inverse of `install`:
+ * removes the settings.json "extensions" entry, deletes the installed skill doc, and (unless
+ * `--keep-config`) clears the `readyset:` section of `~/.omp/agent/config.yml`. Deliberately
+ * does NOT touch any repo's `readyset/changes/` directory -- those are per-project change
+ * history the user made, not install-time config, and this package has no way to know which
+ * repos to even look in from `~/.omp` alone. Told to the user explicitly at the end instead of
+ * silently left alone, so nobody assumes uninstall took their in-flight changes with it.
+ */
+async function uninstall(targetRoot, { keepConfig }) {
+	const agentDir = join(targetRoot, "agent");
+	const relTargetRoot = targetRoot === DEFAULT_TARGET ? "~/.omp" : targetRoot;
+	const relSettingsPath = join(relTargetRoot, "agent", "settings.json");
+
+	const { status: extStatus } = await unlinkExtension(agentDir);
+	if (extStatus === "removed") {
+		console.log(`  unlinked:  removed the readyset-review.ts entry from ${relSettingsPath} ("extensions")`);
+	} else {
+		console.log(`  unlinked:  no readyset-review.ts entry found in ${relSettingsPath} (nothing to remove)`);
+	}
+
+	const skillDocPath = join(targetRoot, SKILL_DOC.to);
+	try {
+		await rm(skillDocPath);
+		console.log(`  removed:   ${SKILL_DOC.to}`);
+		await rmdir(dirname(skillDocPath)).catch(() => {}); // best-effort: leaves it if not empty
+	} catch (err) {
+		if (err.code !== "ENOENT") throw err;
+		console.log(`  removed:   ${SKILL_DOC.to} (already absent)`);
+	}
+
+	if (keepConfig) {
+		console.log("  kept:      the readyset: section of ~/.omp/agent/config.yml (--keep-config)");
+	} else {
+		const cleared = await clearConfigBlock(OMP_CONFIG_PATH);
+		console.log(
+			cleared
+				? "  cleared:   the readyset: section of ~/.omp/agent/config.yml (language/model/fallback settings)"
+				: "  cleared:   ~/.omp/agent/config.yml had no readyset: section (nothing to remove)",
+		);
+	}
+
+	console.log(
+		`\nReadyset: uninstalled from ${targetRoot}. Project-level readyset/changes/ directories in your ` +
+			"repos are NOT touched -- remove those by hand (rm -rf readyset/) in any repo where you want them gone too.",
+	);
+}
+
 async function printVersion() {
 	const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
 	console.log(pkg.version);
 }
 
 function parseArgs(argv) {
-	const args = { command: argv[0], target: DEFAULT_TARGET, cwd: process.cwd(), positional: [] };
+	const args = { command: argv[0], target: DEFAULT_TARGET, cwd: process.cwd(), keepConfig: false, positional: [] };
 	for (let i = 1; i < argv.length; i++) {
 		if (argv[i] === "--target" && argv[i + 1]) {
 			args.target = argv[i + 1];
@@ -177,6 +315,8 @@ function parseArgs(argv) {
 		} else if (argv[i] === "--cwd" && argv[i + 1]) {
 			args.cwd = argv[i + 1];
 			i++;
+		} else if (argv[i] === "--keep-config") {
+			args.keepConfig = true;
 		} else {
 			args.positional.push(argv[i]);
 		}
@@ -246,8 +386,18 @@ async function validate(changeId, targetCwd) {
 async function main() {
 	const args = parseArgs(process.argv.slice(2));
 
-	if (args.command === "install") {
+	if (args.command === "install" || args.command === "update") {
+		// `update` is not a distinct code path -- re-running `install` (via `npx readyset-flow@latest
+		// install`, which is what `npx readyset-flow update` amounts to once npx has fetched the
+		// newer package) already does everything an "update" needs: refresh the skill doc copy and
+		// confirm the settings.json link still points at wherever this run of the package lives.
+		// Kept as an alias purely for discoverability -- someone looking for "how do I update this"
+		// shouldn't have to already know install is idempotent and doubles as update.
 		await install(args.target);
+		return;
+	}
+	if (args.command === "uninstall") {
+		await uninstall(args.target, { keepConfig: args.keepConfig });
 		return;
 	}
 	if (args.command === "--version" || args.command === "-v" || args.command === "version") {
@@ -268,10 +418,18 @@ async function main() {
 	console.log("Usage:");
 	console.log("  readyset-flow install [--target <path>]        Reference this package's extension in <target>/agent/settings.json");
 	console.log("                                                    (defaults to ~/.omp) and refresh the installed skill doc");
+	console.log("  readyset-flow update [--target <path>]          Alias for install -- run this (as `npx readyset-flow@latest");
+	console.log("                                                    update`) to pick up a newer published version");
+	console.log("  readyset-flow uninstall [--target <path>] [--keep-config]");
+	console.log("                                                    Remove the settings.json extension entry and installed skill");
+	console.log("                                                    doc, and clear the readyset: section of");
+	console.log("                                                    ~/.omp/agent/config.yml (skip that last part with");
+	console.log("                                                    --keep-config). Does NOT touch any repo's readyset/changes/");
+	console.log("                                                    directory -- that's per-project change history, not config");
 	console.log("  readyset-flow configure                        Interactive wizard for the readyset: section of");
 	console.log("                                                    ~/.omp/agent/config.yml (language, model, fallback chain) --");
-	console.log("                                                    never runs on its own; only install/validate/version are");
-	console.log("                                                    non-interactive and safe to script");
+	console.log("                                                    never runs on its own; only install/update/uninstall/validate/");
+	console.log("                                                    version are non-interactive and safe to script");
 	console.log("  readyset-flow validate <change-id> [--cwd <path>]");
 	console.log("                                                    Run the same structural check the omp gate runs, outside omp");
 	console.log("                                                    (CI, pre-commit) -- exit code 0 on pass, 1 on issues found");
