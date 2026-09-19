@@ -6,6 +6,31 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.10.0
+
+- **The review gate's sidebar overlay opens automatically -- it IS the gate now, not a "Sidebar
+  view" choice on a separate menu.** Previously `ctx.ui.select()` showed Approve & Execute /
+  Refine / Sidebar view / Discard first, and picking "Sidebar view" opened a read-only overlay
+  you then Esc'd out of to get back to that same menu to actually act. Now, whenever
+  `ctx.ui.custom` is available, the overlay opens directly as soon as the review artifacts are
+  ready, with Approve & Execute / Refine / Discard baked into it as CTAs (`[A]`/`[R]`/`[D]`
+  keystrokes, or Tab onto the CTA bar and use it like a real `select()`: Left/Right to move the
+  highlight, Enter -- `tui.select.confirm` -- to confirm). Contexts without a real TUI
+  (RPC/ACP/print-headless) still get the classic select() menu as a fallback.
+- **The overlay renders at 90% of the terminal's width instead of capping at ~80 columns.**
+  Read `@oh-my-pi/pi-tui`'s actual published source (`src/tui.ts`) to confirm why it was narrow:
+  `overlayOptions.fullscreen` only controls the alt-screen buffer, not sizing -- width defaults
+  to `min(80, terminalWidth)` unless `overlayOptions.width` is set explicitly.
+- **Up/Down now scroll the selected section's content, not the section list.** They move one
+  line at a time through whatever's open (design.md, a spec, tasks.md, ...), and only cross into
+  the next/previous section once that content is exhausted -- landing at the top when advancing,
+  or at the *bottom* of the previous section when going back (a continuous-scroll feel, not a
+  reset). Left/Right take over the section list's old job: jump straight to a section, bypassing
+  its content, always landing at the top. PgUp/PgDn are unchanged (a bigger scroll step within
+  the current section).
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.9.2...0.10.0
+
 ## 0.9.2
 
 - **Fix: the CLI silently did nothing under a real `npm install -g` / `npx` invocation.**
