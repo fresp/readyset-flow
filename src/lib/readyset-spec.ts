@@ -290,6 +290,28 @@ export async function getProgress(cwd: string, changeId: string): Promise<Progre
 	return { done, total, state };
 }
 
+const TASK_LINE_RE = /^\s*-\s*\[([ xX])\]\s*(\S+)/;
+
+/** Maps each task's leading id token (the "N.M" `applyTurnPrompt` asks for, e.g. "2.1") to
+ *  whether its checkbox is currently ticked. Used to correlate runtime evidence
+ *  (readyset-evidence.ts) back to tasks.md's own completion state — kept here rather than in
+ *  readyset-evidence.ts since it's a tasks.md-format concern like the other functions in this
+ *  file, not an evidence-format concern. Returns an empty map if tasks.md doesn't exist; a
+ *  task line without a recognizable id token is simply not included (best-effort, not a hard
+ *  format requirement). */
+export async function taskCheckedStates(cwd: string, changeId: string): Promise<Map<string, boolean>> {
+	const paths = changePaths(cwd, changeId);
+	const raw = await readFile(paths.tasks, "utf8").catch(() => undefined);
+	const map = new Map<string, boolean>();
+	if (raw === undefined) return map;
+	for (const line of raw.split(/\r?\n/)) {
+		const m = TASK_LINE_RE.exec(line);
+		if (!m) continue;
+		map.set(m[2], /[xX]/.test(m[1]));
+	}
+	return map;
+}
+
 export interface VerificationCheck {
 	checkedTasks: number;
 	withVerificationNote: number;
@@ -336,6 +358,46 @@ export async function readReview(cwd: string, changeId: string): Promise<string 
 export interface ArchiveResult {
 	archivedDir: string;
 	mergedSpecFiles: string[];
+	/**
+	 * Requirements declared MODIFIED or REMOVED in a delta spec merged during this archive.
+	 * `archiveChange`'s merge is (and stays) append-only — see its doc comment. For an ADDED
+	 * requirement that's harmless: appending is genuinely correct. For MODIFIED/REMOVED it is
+	 * NOT: the old requirement block in the canonical spec is left completely untouched, and
+	 * the delta is appended as more text alongside it — so the canonical spec ends up
+	 * containing both the old and new/removed text for the same requirement name, with
+	 * nothing marking which is current. This list exists so the archive notification can warn
+	 * specifically about THESE requirements (the ones actually at risk of being silently
+	 * misleading) rather than a generic "review the merged spec" that reads the same whether
+	 * the change only added things or actually needs manual cleanup.
+	 */
+	unappliedModifications: { specFile: string; verb: "MODIFIED" | "REMOVED"; requirement: string }[];
+}
+
+interface VerbSection {
+	verb: "ADDED" | "MODIFIED" | "REMOVED";
+	requirementNames: string[];
+}
+
+/** Splits a delta spec into its `## ADDED/MODIFIED/REMOVED Requirements` sections and lists
+ *  the `### Requirement:` names declared under each — used only to warn about MODIFIED/REMOVED
+ *  requirements that `archiveChange`'s append-only merge won't actually apply (see
+ *  `ArchiveResult.unappliedModifications`). Not a general-purpose spec parser: it does not
+ *  attempt to diff or apply anything, only to name what a human should double-check. */
+function splitVerbSections(raw: string): VerbSection[] {
+	const headingRe = /^##[ \t]*(ADDED|MODIFIED|REMOVED)[ \t]+Requirements\b/gim;
+	const matches = [...raw.matchAll(headingRe)];
+	const boundaryRe = /^##[ \t]/m; // next level-2 heading ends this section (### is not a match)
+
+	return matches.map((m) => {
+		const verb = m[1].toUpperCase() as VerbSection["verb"];
+		const start = m.index! + m[0].length;
+		const rest = raw.slice(start);
+		const boundary = rest.match(boundaryRe);
+		const end = boundary ? start + boundary.index! : raw.length;
+		const body = raw.slice(start, end);
+		const requirementNames = [...body.matchAll(/^###[ \t]*Requirement:[ \t]*(.+)$/gim)].map((r) => r[1].trim());
+		return { verb, requirementNames };
+	});
 }
 
 /**
@@ -358,6 +420,7 @@ export async function archiveChange(cwd: string, changeId: string): Promise<Arch
 	await rename(paths.dir, archivedDir);
 
 	const mergedSpecFiles: string[] = [];
+	const unappliedModifications: ArchiveResult["unappliedModifications"] = [];
 	const archivedSpecsDir = join(archivedDir, "specs");
 	const specFiles = await findSpecFiles(archivedSpecsDir).catch(() => [] as string[]);
 	for (const deltaSpec of specFiles) {
@@ -365,6 +428,14 @@ export async function archiveChange(cwd: string, changeId: string): Promise<Arch
 		const targetPath = join(cwd, READYSET_ROOT, "specs", rel);
 		const deltaRaw = await readFile(deltaSpec, "utf8").catch(() => "");
 		if (!deltaRaw) continue;
+
+		for (const section of splitVerbSections(deltaRaw)) {
+			if (section.verb === "ADDED") continue; // append is genuinely correct for ADDED -- nothing to warn about
+			for (const requirement of section.requirementNames) {
+				unappliedModifications.push({ specFile: targetPath, verb: section.verb, requirement });
+			}
+		}
+
 		await mkdir(join(targetPath, ".."), { recursive: true });
 		const targetExists = await exists(targetPath);
 		if (!targetExists) {
@@ -376,5 +447,5 @@ export async function archiveChange(cwd: string, changeId: string): Promise<Arch
 		mergedSpecFiles.push(targetPath);
 	}
 
-	return { archivedDir, mergedSpecFiles };
+	return { archivedDir, mergedSpecFiles, unappliedModifications };
 }

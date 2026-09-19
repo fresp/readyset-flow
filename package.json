@@ -1,6 +1,6 @@
 {
   "name": "readyset-flow",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "description": "Readyset — a standalone omp extension, invoked as /readyset, that fuses /plan's grounding discipline, a structured grill/propose/review/apply workflow, and mattpocock/skills prompting hygiene into its own independent command, with no runtime dependency on any of the three.",
   "type": "module",
   "bin": {
@@ -15,7 +15,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/readyset-brainstorm.test.mts && node --experimental-strip-types test/readyset-omp-config.test.mts && node --experimental-strip-types test/readyset-review-overlay.test.mts && node --experimental-strip-types test/readyset-review.test.mts && node --experimental-strip-types test/readyset-cli-validate.test.mts && node --experimental-strip-types test/readyset-install-link.test.mts"
+    "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/readyset-brainstorm.test.mts && node --experimental-strip-types test/readyset-omp-config.test.mts && node --experimental-strip-types test/readyset-review-overlay.test.mts && node --experimental-strip-types test/readyset-review.test.mts && node --experimental-strip-types test/readyset-evidence.test.mts && node --experimental-strip-types test/readyset-cli-validate.test.mts && node --experimental-strip-types test/readyset-install-link.test.mts"
   },
   "keywords": [
     "omp",

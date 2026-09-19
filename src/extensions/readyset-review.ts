@@ -25,6 +25,15 @@ import {
 } from "../lib/readyset-spec.ts";
 import { readFallbackChain, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
 import { ReviewSidebarOverlay, type OverlaySection } from "../lib/readyset-review-overlay.ts";
+import {
+	checkTaskEvidence,
+	EVIDENCE_MAX_OUTPUT_BYTES,
+	EVIDENCE_TIMEOUT_MS,
+	findEvidenceConflicts,
+	persistEvidence,
+	runCommand,
+	truncateForCapture,
+} from "../lib/readyset-evidence.ts";
 
 /** Minimal structural shape this file actually calls — deliberately not importing the real
  *  `Theme`/`KeybindingsManager` types from `@oh-my-pi/pi-tui` even as types, so this file has
@@ -625,6 +634,11 @@ interface ReviewSnapshot {
 	verification: Awaited<ReturnType<typeof checkTaskVerification>>;
 	explored: boolean;
 	reviewed: boolean;
+	/** Runtime evidence (readyset_verify) — independent of, and never reconciled with,
+	 *  `verification` (the self-reported _Verified: note check) above. See
+	 *  `findEvidenceConflicts`'s doc comment for exactly what "conflict" means here. */
+	evidenceTotal: number;
+	evidenceConflicts: Awaited<ReturnType<typeof findEvidenceConflicts>>;
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -636,12 +650,16 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const verification = await checkTaskVerification(ctx.cwd, chosen.changeId);
 	const explored = await hasExploration(ctx.cwd, chosen.changeId);
 	const review = await readReview(ctx.cwd, chosen.changeId);
+	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
+	const evidenceConflicts = await findEvidenceConflicts(ctx.cwd, chosen.changeId);
 	return {
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
 		validated,
 		verification,
 		explored,
 		reviewed: !!review,
+		evidenceTotal,
+		evidenceConflicts,
 	};
 }
 
@@ -720,6 +738,36 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 				snapshot.verification
 					? `${snapshot.verification.withVerificationNote}/${snapshot.verification.checkedTasks} checked tasks carry a _Verified: note (${snapshot.verification.missing} missing).`
 					: "_(tasks.md unreadable — nothing to summarize.)_",
+		},
+		{
+			id: "evidence",
+			heading: "Runtime evidence",
+			status:
+				snapshot.evidenceTotal > 0
+					? `${snapshot.evidenceTotal} record(s)${snapshot.evidenceConflicts.length > 0 ? `, ${snapshot.evidenceConflicts.length} conflict(s)` : ""}`
+					: "none",
+			render: async () => {
+				const { byTask } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
+				if (byTask.size === 0) {
+					return "_(No readyset_verify evidence recorded for this change. This is independent of the " +
+						"_Verified: notes above -- their absence here doesn't mean verification wasn't done, only that " +
+						"it wasn't runtime-captured.)_";
+				}
+				const conflictTaskIds = new Set(snapshot.evidenceConflicts.map((c) => c.taskId));
+				const parts: string[] = [];
+				for (const [taskId, summary] of byTask) {
+					const flag = conflictTaskIds.has(taskId)
+						? " -- ⚠ CONFLICT: task is marked done, but the latest evidence below shows a non-zero/no exit code"
+						: "";
+					parts.push(`### Task ${taskId}${flag}`, "");
+					for (const rec of summary.records) {
+						const outcome = rec.timedOut ? "timed out" : rec.exitCode === null ? "no exit code" : `exit ${rec.exitCode}`;
+						parts.push(`- ${rec.id}: \`${rec.command}\` -> ${outcome} (${rec.durationMs}ms)`);
+					}
+					parts.push("");
+				}
+				return parts.join("\n");
+			},
 		},
 		{
 			id: "code-review",
@@ -847,6 +895,9 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 				? `verification: ${snapshot.verification.missing}/${snapshot.verification.checkedTasks} checked tasks missing a _Verified: note`
 				: `verification: ${snapshot.verification.withVerificationNote}/${snapshot.verification.checkedTasks} checked tasks verified`
 			: "verification: n/a",
+		snapshot.evidenceTotal > 0
+			? `runtime evidence: ${snapshot.evidenceTotal} record(s)${snapshot.evidenceConflicts.length > 0 ? ` -- ${snapshot.evidenceConflicts.length} conflict(s): task done but evidence shows failure` : ""}`
+			: "runtime evidence: none",
 		snapshot.reviewed ? "code review: done — see REVIEW.md" : "code review: not run yet",
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -920,7 +971,13 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 
 		let verification: Awaited<ReturnType<typeof checkTaskVerification>>;
 		applyLoop: for (;;) {
-			const applyFired = await spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId));
+			activeVerifyChangeId = chosen.changeId;
+			let applyFired: boolean;
+			try {
+				applyFired = await spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId));
+			} finally {
+				activeVerifyChangeId = undefined;
+			}
 			if (!applyFired) return;
 
 			const status = await getProgress(ctx.cwd, chosen.changeId);
@@ -999,11 +1056,27 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 		);
 		if (archiveChoice === "Archive now") {
 			const result = await archiveChange(ctx.cwd, chosen.changeId);
-			ctx.ui.notify(
+			const baseNotice =
 				`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
-					"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.",
-				"info",
-			);
+				"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
+			if (result.unappliedModifications.length === 0) {
+				ctx.ui.notify(baseNotice, "info");
+			} else {
+				// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
+				// the old requirement text is still sitting in the canonical spec, untouched, right next to the
+				// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
+				// than the same generic notice an ADDED-only archive gets.
+				const items = result.unappliedModifications
+					.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
+					.join("\n");
+				ctx.ui.notify(
+					`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
+						"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
+						"old text is still there. Manual cleanup needed:\n" +
+						items,
+					"warning",
+				);
+			}
 		}
 		return;
 	}
@@ -1152,8 +1225,147 @@ function registerAskTool(pi: ExtensionAPI): void {
 	});
 }
 
+/**
+ * Which Readyset change `readyset_verify` should attach evidence to. Module-level, same
+ * trade-off `grillRoundState` documents above: `registerTool`'s `execute()` has no per-run
+ * channel for extension-local state, only `ctx`, and evidence needs to know which
+ * `readyset/changes/<id>/` to write into — a concept Readyset owns, not omp. Set right before
+ * an Apply turn fires (see the `applyLoop` call site below) and cleared once that turn
+ * finishes, so a `readyset_verify` call outside an active Apply turn gets a clear "not
+ * currently applicable" result instead of silently writing evidence to a stale change. Not
+ * designed for two concurrent Apply turns in the same process — an accepted limitation, not a
+ * real scenario this single-session tool needs to guard against.
+ */
+let activeVerifyChangeId: string | undefined;
+
+/**
+ * Registers `readyset_verify` — a runtime evidence *collector*, not a correctness judge.
+ *
+ * What it does, and only this: runs a command (real `node:child_process`, see
+ * `readyset-evidence.ts`'s `runCommand` doc comment for why `shell: true` and why there's no
+ * OMP execution mechanism to reuse instead), captures the REAL exit code/stdout/stderr/
+ * duration, and persists it as an immutable evidence record tied to a `taskId`
+ * (`readyset/changes/<id>/evidence/E<NNN>.md`).
+ *
+ * What it deliberately does NOT do, on purpose, per the locked v1 scope: mark a task `[x]`,
+ * modify `_Verified:`, decide correctness, infer requirement satisfaction, perform semantic
+ * review, or become a general verification engine. `_Verified:` (the model's own prose note,
+ * checked structurally by `checkTaskVerification` in readyset-spec.ts) is UNCHANGED and stays
+ * exactly as load-bearing as before — this tool runs alongside it, not instead of it. The
+ * shape is:
+ *
+ *   readyset_verify() -> EvidenceRecord -> task references evidence -> Review interprets evidence
+ *
+ * never:
+ *
+ *   readyset_verify() -> "task is correct"
+ *
+ * `npm test` exiting 0 means "npm test executed successfully" — it does NOT mean "the
+ * implementation satisfies the requirement." A command that runs clean but tests the wrong
+ * thing is exactly as "verified" by this tool as one that actually covers the requirement;
+ * judging that distinction stays the separate Code-review turn's job, same as before this
+ * tool existed.
+ *
+ * Approval tier is `"exec"` (command execution) — confirmed against real omp source
+ * (`ToolDefinition.approval`'s doc comment: `"exec": code execution`; this is also the
+ * default when the field is omitted, set explicitly here to self-document rather than rely on
+ * the default silently). This goes through the SAME approval gate as any other write/exec
+ * tool call — `tools.approvalMode` in the user's own config governs it exactly like it
+ * governs the model's ordinary bash tool, per the same reasoning `grillRoundState`'s doc
+ * comment above lays out for `ctx.ui` dialogs (except this genuinely is a permission-gated
+ * tool call, not a UI dialog, so approval mode DOES apply here — this is real command
+ * execution, deliberately not exempted from it).
+ *
+ * Self-reported `_Verified:` and runtime-captured evidence are two independent signals and
+ * this tool never reconciles them — see the "Evidence" review section and the
+ * `findEvidenceConflicts` call in `takeReviewSnapshot` for where a mismatch (task marked done,
+ * latest evidence shows failure) is surfaced. v1 keeps that passive/observational only (a line
+ * in the review panel), not a blocking gate — see the package README/doc comments for why.
+ *
+ * `applyTurnPrompt` is deliberately NOT changed to mention or encourage this tool in v1 — the
+ * point of this iteration is to observe whether the model reaches for it naturally once it
+ * exists, not to force it via prompt instruction.
+ */
+function registerVerifyTool(pi: ExtensionAPI): void {
+	pi.registerTool({
+		name: "readyset_verify",
+		label: "Readyset: Verify",
+		description:
+			"Run a command and capture its REAL execution result (exit code, stdout, stderr, duration) as an " +
+			"immutable evidence record tied to a task -- for use during Apply, when you want a machine-captured " +
+			"record instead of just writing a `_Verified:` note yourself. This does NOT mark the task done, does " +
+			"NOT modify tasks.md or `_Verified:`, and does NOT judge correctness -- a captured exitCode 0 means " +
+			"the command ran and exited cleanly, not that the requirement is satisfied. You still update " +
+			"tasks.md and write your own `_Verified:` note (referencing the evidence id this returns is a good " +
+			"idea, but not required). Only meaningful during Apply, against the task currently being implemented.",
+		parameters: pi.zod.object({
+			taskId: pi.zod.string().describe("the task's id exactly as it appears in tasks.md (e.g. '2.1')"),
+			command: pi.zod.string().describe("the command to run, exactly as you'd type it in a shell -- pipes/&&/redirects are fine"),
+		}),
+		approval: "exec",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const changeId = activeVerifyChangeId;
+			if (!changeId) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"readyset_verify isn't attached to an active Apply turn right now, so there's nowhere to record " +
+								"this evidence. If you're implementing a task this turn, that's unexpected -- otherwise just run " +
+								"the command directly instead of through this tool.",
+						},
+					],
+				};
+			}
+
+			const cwd = (ctx as unknown as ReviewCtx).cwd;
+			const startedAt = new Date().toISOString();
+			const result = await runCommand(params.command, cwd, EVIDENCE_TIMEOUT_MS);
+			const stdoutCap = truncateForCapture(result.stdout, EVIDENCE_MAX_OUTPUT_BYTES);
+			const stderrCap = truncateForCapture(result.stderr, EVIDENCE_MAX_OUTPUT_BYTES);
+
+			const record = await persistEvidence(cwd, changeId, {
+				taskId: params.taskId,
+				command: params.command,
+				cwd,
+				startedAt,
+				durationMs: result.durationMs,
+				exitCode: result.exitCode,
+				timedOut: result.timedOut,
+				signal: result.signal,
+				stdout: stdoutCap.text,
+				stderr: stderrCap.text,
+				stdoutTruncated: stdoutCap.truncated,
+				stderrTruncated: stderrCap.truncated,
+			});
+
+			const outcome = result.timedOut
+				? `timed out after ${Math.round(EVIDENCE_TIMEOUT_MS / 1000)}s`
+				: result.exitCode === null
+					? "did not produce an exit code (process error -- see stderr in the evidence record)"
+					: `exited ${result.exitCode}`;
+
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Evidence ${record.id} recorded for task ${params.taskId}: \`${params.command}\` ${outcome} in ` +
+							`${result.durationMs}ms. This is a runtime-captured EXECUTION RESULT ONLY -- it does not by itself ` +
+							"mean the task is done or the requirement is satisfied. You still need to update tasks.md and " +
+							`write your own _Verified: note yourself (mentioning ${record.id} there is a good idea, but this ` +
+							"tool never touches tasks.md itself).",
+					},
+				],
+			};
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI) {
 	registerAskTool(pi);
+	registerVerifyTool(pi);
 	pi.registerCommand("readyset", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +

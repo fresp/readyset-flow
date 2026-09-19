@@ -981,11 +981,11 @@ await test("review gate pushes a full compiled document (all sections) to the ed
   assert.equal(fakeUiWrap.editorTextHistory.length, 1);
   const doc = fakeUiWrap.editorTextHistory[0];
   // table of contents lists every section with a status
-  for (const tocEntry of ["1. Exploration", "2. Proposal", "3. Design", "4. Specs (1)", "5. Tasks (1/1)", "6. Verification summary", "7. Code review", "8. Context log"]) {
+  for (const tocEntry of ["1. Exploration", "2. Proposal", "3. Design", "4. Specs (1)", "5. Tasks (1/1)", "6. Verification summary", "7. Runtime evidence", "8. Code review", "9. Context log"]) {
     assert.ok(doc.includes(tocEntry), `expected table of contents to include "${tocEntry}"`);
   }
   // each section heading appears again as its own header, and the spec file path is shown
-  for (const heading of ["EXPLORATION", "PROPOSAL", "DESIGN", "SPECS (1)", "specs/widgets/spec.md", "TASKS (1/1)", "VERIFICATION SUMMARY", "CODE REVIEW", "CONTEXT LOG"]) {
+  for (const heading of ["EXPLORATION", "PROPOSAL", "DESIGN", "SPECS (1)", "specs/widgets/spec.md", "TASKS (1/1)", "VERIFICATION SUMMARY", "RUNTIME EVIDENCE", "CODE REVIEW", "CONTEXT LOG"]) {
     assert.ok(doc.includes(heading), `expected document to include "${heading}"`);
   }
   assert.match(doc, /REDIRECT_URI stale/);

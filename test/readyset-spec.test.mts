@@ -15,6 +15,7 @@ import {
   readContext,
   checkTaskVerification,
   readReview,
+  taskCheckedStates,
 } from "../src/lib/readyset-spec.ts";
 
 let pass = 0;
@@ -317,6 +318,88 @@ await test("readReview: undefined when missing, content once written", async () 
   assert.equal(await readReview(cwd, "review-change"), undefined);
   await writeFile(paths.review, "## Findings\n\nNo blockers found.\n", "utf8");
   assert.match(await readReview(cwd, "review-change"), /No blockers found/);
+});
+
+await test("taskCheckedStates: maps task id -> checked/unchecked", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "states-change");
+  await writeFile(
+    paths.tasks,
+    ["- [x] 1.1 done", "- [ ] 1.2 not done", "- [x] 2.1 also done"].join("\n"),
+    "utf8",
+  );
+  const states = await taskCheckedStates(cwd, "states-change");
+  assert.equal(states.get("1.1"), true);
+  assert.equal(states.get("1.2"), false);
+  assert.equal(states.get("2.1"), true);
+  assert.equal(states.get("9.9"), undefined);
+});
+
+await test("taskCheckedStates: no tasks.md -> empty map", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "no-tasks-states");
+  const states = await taskCheckedStates(cwd, "no-tasks-states");
+  assert.equal(states.size, 0);
+});
+
+await test("archiveChange: ADDED-only delta produces no unappliedModifications warning", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "archive-added-only");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "widgets"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "widgets", "spec.md"),
+    "## Purpose\n\nwidgets\n\n## ADDED Requirements\n\n### Requirement: Spin\n\n#### Scenario: spins\n\n- **WHEN** spun\n- **THEN** it spins\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [x] 1.1 done\n", "utf8");
+
+  const result = await archiveChange(cwd, "archive-added-only");
+  assert.deepEqual(result.unappliedModifications, []);
+});
+
+await test("archiveChange: MODIFIED/REMOVED delta is flagged as unappliedModifications (append-only merge doesn't apply them)", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "archive-mod-removed");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "widgets"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "widgets", "spec.md"),
+    [
+      "## Purpose",
+      "",
+      "widgets",
+      "",
+      "## MODIFIED Requirements",
+      "",
+      "### Requirement: Spin",
+      "",
+      "#### Scenario: spins faster now",
+      "",
+      "- **WHEN** spun",
+      "- **THEN** it spins at configurable speed",
+      "",
+      "## REMOVED Requirements",
+      "",
+      "### Requirement: LegacyExport",
+      "",
+      "#### Scenario: removed",
+      "",
+      "- **WHEN** n/a",
+      "- **THEN** n/a",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [x] 1.1 done\n", "utf8");
+
+  const result = await archiveChange(cwd, "archive-mod-removed");
+  assert.equal(result.unappliedModifications.length, 2);
+  assert.ok(result.unappliedModifications.some((u) => u.verb === "MODIFIED" && u.requirement === "Spin"));
+  assert.ok(result.unappliedModifications.some((u) => u.verb === "REMOVED" && u.requirement === "LegacyExport"));
+  // and the merge itself is still exactly the same append-only behavior as before -- the old
+  // requirement text, if any existed, would remain untouched (nothing to assert here since
+  // there was no prior canonical spec in this test, covered by the existing append test above).
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
