@@ -1185,6 +1185,11 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
  * (`ctx.ui.custom` missing: RPC/ACP/print-headless contexts, or the overlay threw on open).
  * Loops internally on "Jump to section" so the caller always gets back a real gate decision
  * (approve/refine/discard/cancel), never an intermediate browsing state.
+ *
+ * Fail-closed by construction: "Discard" is the first option, and any falsy/missing
+ * selection (cancel, Esc, a host that resolves `undefined`) falls through to `undefined`,
+ * which the caller treats as discard. No approval path can be reached by default, by
+ * omission, or by a host-side stub resolving the first entry.
  */
 async function classicGateSelect(
 	ctx: ReviewCtx,
@@ -1194,11 +1199,11 @@ async function classicGateSelect(
 ): Promise<ReviewOverlayResult> {
 	for (;;) {
 		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
+			{ label: "Discard", description: "leave as proposed, do nothing (the safe default — nothing runs unless you pick an Approve option)" },
 			{ label: "Approve & Execute", description: `compact context first, then implement per tasks.md — ${taskSummary}` },
 			{ label: "Approve & Execute, keep context", description: "implement without compacting (keep the full Explore/Propose discussion in context)" },
 			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
 			{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" },
-			{ label: "Discard", description: "leave as proposed, do nothing" },
 		]);
 
 		if (choice === "Jump to section") {

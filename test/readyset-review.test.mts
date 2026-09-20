@@ -1124,6 +1124,34 @@ await test("Sidebar overlay opens automatically as the review gate when ctx.ui.c
   assert.equal(fakeUiWrap.selectQueue.length, 0, "nothing left unconsumed in the queue -- the run ended on the overlay's own cancel, not a follow-up Discard pick");
 });
 
+await test("classic gate is fail-closed: cancel/undefined at the gate runs nothing", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-27-failclosed.md", {
+    title: "Fail Closed",
+    status: "proposed",
+    created: "2026-01-27",
+    change_id: "fail-closed",
+  });
+  const dir = join(cwd, "readyset", "changes", "fail-closed");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-01-27 · Fail Closed"); // pick
+  fakeUiWrap.selectQueue.push(undefined); // cancel at the gate — must discard, run nothing
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 0, "a cancelled gate must fire no agent turn at all");
+  const tasksRaw = await readFile(join(dir, "tasks.md"), "utf8");
+  assert.ok(tasksRaw.includes("- [ ] 1.1"), "no task may be touched without an approval");
+});
+
 await test("RPC host: ui.custom exists but is a stub -- the review gate falls back to the select menu instead of silently discarding", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-17-rpc-gate.md", {
