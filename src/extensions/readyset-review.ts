@@ -674,6 +674,34 @@ const MAX_TURNS_PER_RUN = 10;
 const MAX_VERIFICATION_SENDBACKS = 2;
 
 /**
+ * A phase budget caps how much wall-clock work one labeled phase may consume before it must
+ * either hand something concrete back or stop. Distinct from TurnBudget (which counts fired
+ * agent turns): this watches elapsed time while a single turn runs, because a turn can churn
+ * for an unbounded number of tool calls without spending any more TurnBudget. The benchmark
+ * runs showed Explore/Product phases consuming millions of tokens in a single fired turn; a
+ * turn-count ceiling alone cannot see that.
+ */
+interface PhaseBudget {
+	/** Wall-clock ceiling for the phase, in milliseconds. */
+	readonly maxMs: number;
+	startedAt: number;
+}
+
+const DEFAULT_PHASE_BUDGET_MS = 20 * 60 * 1000;
+
+function startPhaseBudget(maxMs: number = DEFAULT_PHASE_BUDGET_MS): PhaseBudget {
+	return { maxMs, startedAt: Date.now() };
+}
+
+function phaseBudgetExceeded(budget: PhaseBudget): boolean {
+	return Date.now() - budget.startedAt > budget.maxMs;
+}
+
+function phaseBudgetElapsedMs(budget: PhaseBudget): number {
+	return Date.now() - budget.startedAt;
+}
+
+/**
  * Every triggered turn (Explore/Propose/Refine/Apply/Code-review) costs real tokens, and
  * several of them sit inside loops a user could drive indefinitely (repeated Refine, repeated
  * "Send back for verification"). This is a hard per-invocation ceiling on total turns fired —
@@ -1827,6 +1855,7 @@ export default function (pi: ExtensionAPI) {
 
 				const submodules = await listSubmodules(ctx.cwd);
 				ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
+				const exploreBudget = startPhaseBudget();
 				const exploreFired = await spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules));
 				if (!exploreFired) return;
 
@@ -1835,10 +1864,18 @@ export default function (pi: ExtensionAPI) {
 					ctx.cwd,
 					chosen.changeId,
 					"Explore",
-					explored
+					(explored
 						? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
-						: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.",
+						: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
+						` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
 				);
+				if (phaseBudgetExceeded(exploreBudget)) {
+					ctx.ui.notify(
+						`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
+							`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
+						"warning",
+					);
+				}
 				if (!explored) {
 					ctx.ui.notify(
 						`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
@@ -1848,6 +1885,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				ctx.ui.notify(`Proposing change "${chosen.changeId}" — this can take a while...`, "info");
+				const proposeBudget = startPhaseBudget();
 				const proposeFired = await spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen));
 				if (!proposeFired) return;
 				// Gate invariant (R2): a planning turn may only leave planning artifacts. The
@@ -1876,29 +1914,41 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
-				await appendContext(ctx.cwd, chosen.changeId, "Propose", "Propose turn ran; see proposal.md/design.md/specs/tasks.md.");
+				await appendContext(
+					ctx.cwd,
+					chosen.changeId,
+					"Propose",
+					`Propose turn ran; see proposal.md/design.md/specs/tasks.md. (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
+				);
+			if (phaseBudgetExceeded(proposeBudget)) {
+				ctx.ui.notify(
+					`Propose for "${chosen.changeId}" hit its phase budget (${Math.round(proposeBudget.maxMs / 60000)} min) — the artifacts exist but the turn ran long. ` +
+						"Continuing to the gate; runaway cost like this is recorded in CONTEXT.md so you can see it.",
+					"warning",
+				);
+			}
 
-				const reloaded = await loadBrainstorms(ctx.cwd);
-				await reconcileStatuses(ctx.cwd, reloaded);
-				const after = reloaded.find((b) => b.changeId === chosen.changeId);
+			const reloaded = await loadBrainstorms(ctx.cwd);
+			await reconcileStatuses(ctx.cwd, reloaded);
+			const after = reloaded.find((b) => b.changeId === chosen.changeId);
 
-				// reconcileStatuses/changeState only checks whether readyset/changes/<id>/ exists as a
-				// directory — and scaffoldChange above already created it before the turn ran. So a
-				// turn that wrote nothing at all still leaves a dir behind and isProposed() alone
-				// would wrongly look "finished". Check proposal.md actually has content too.
-				const wroteProposal = after ? (await validateChange(ctx.cwd, after.changeId)).issues.every((i) => !(i.file === "proposal.md" && i.problem === "missing")) : false;
+			// reconcileStatuses/changeState only checks whether readyset/changes/<id>/ exists as a
+			// directory — and scaffoldChange above already created it before the turn ran. So a
+			// turn that wrote nothing at all still leaves a dir behind and isProposed() alone
+			// would wrongly look "finished". Check proposal.md actually has content too.
+			const wroteProposal = after ? (await validateChange(ctx.cwd, after.changeId)).issues.every((i) => !(i.file === "proposal.md" && i.problem === "missing")) : false;
 
-				if (!after || !isProposed(after.status) || !wroteProposal) {
-					ctx.ui.notify(
-						`Propose for "${chosen.changeId}" doesn't look finished (readyset/changes/${chosen.changeId}/proposal.md ` +
-							"not found or empty) — check the transcript above for errors, then run /readyset again.",
-						"warning",
-					);
-					return;
-				}
+			if (!after || !isProposed(after.status) || !wroteProposal) {
+				ctx.ui.notify(
+					`Propose for "${chosen.changeId}" doesn't look finished (readyset/changes/${chosen.changeId}/proposal.md ` +
+						"not found or empty) — check the transcript above for errors, then run /readyset again.",
+					"warning",
+				);
+				return;
+			}
 
-				await reviewAndMaybeExecute(pi, reviewCtx, after, budget);
-			});
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget);
+		});
 		},
 	});
 }
