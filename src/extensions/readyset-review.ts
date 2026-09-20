@@ -393,9 +393,13 @@ function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: st
 		"resolved answer for something the user genuinely doesn't want to decide yet.\n" +
 		"- Offer at least two real options/approaches when there's more than one reasonable way in, with a short " +
 		"description of the trade-off on each option — don't just assert a pick.\n" +
-		"- Do real read-only repo research (Read/Grep/Glob, read-only git/shell commands) before or between " +
-		"rounds wherever it would sharpen a question or firm up a recommendation — don't ask the user something " +
-		"the repo already answers.\n" +
+		"- Do ONE focused pass of read-only repo research (Read/Grep/Glob, read-only git/shell commands) " +
+		"BEFORE round 1 — map the idea onto real files/modules/seams first, then carry those findings through " +
+		"every round. Do not re-research the same question in later rounds; research only genuinely new " +
+		"questions that round 1 couldn't have anticipated. The benchmark showed a single grilling session " +
+		"making 17 bash + 16 read calls spread across rounds for what one upfront pass covers — every " +
+		"repeated lookup re-pays the same context cost. Don't ask the user something the repo already " +
+		"answers.\n" +
 		"- Finding facts is your job, never the user's (mattpocock/skills' own rule for this — see " +
 		"src/skill/mattpocock-grilling.md in this package). A question about external platform behavior, API " +
 		"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
