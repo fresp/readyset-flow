@@ -441,9 +441,13 @@ function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: st
 				"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
 		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
 		"rules, so the file reads as though that skill wrote it: which option is decided (or explicitly " +
-		"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Then auto-derive " +
-		"(don't ask) the branch type with a one-line reason, and the lane from that branch type — full for " +
-		"feature/adjust/experimental, fast for bugfix/hotfix/refactor/chore/docs/test/release. Do ask directly " +
+		"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Then ask the user " +
+		"directly for the lane — propose one with a one-line reason (full for feature/adjust/experimental, " +
+		"fast for bugfix/hotfix/refactor/chore/docs/test/release), and take their pick. The lane decides how " +
+		"heavy the later phases run: fast means a lighter Explore folded into Propose, at most ~8 tasks, and " +
+		"no mutation-testing review — so a wrong lane changes cost, not just a label. Behavior-affecting " +
+		"ambiguities must still be asked either way; the lane trims volume, never the questions that change " +
+		"behavior. Also auto-derive (don't ask) the branch type with a one-line reason, and do ask directly " +
 		"(it's a workflow preference the content can't reveal): commit-only vs. commit + merge request per task.\n\n" +
 		"Once — and only once — every one of those is actually resolved or explicitly deferred, write the file " +
 		`to .ai/brainstorms/${today}-<slug>.md (kebab-case slug derived from the title) with exactly this shape:\n\n` +
@@ -1753,6 +1757,8 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 export interface ReadysetArgs {
 	all: boolean;
 	fast: boolean;
+	/** `--lane fast|full`: force the lane for this run, bypassing the brainstorm's recorded lane. */
+	lane?: string;
 	lang?: string;
 	model?: string;
 	fallbackModel?: string;
@@ -1816,7 +1822,13 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 		const token = tokens[i];
 		if (token === "--all") parsed.all = true;
 		else if (token === "--fast") parsed.fast = true;
-		else if (token === "--lang") parsed.lang = tokens[i + 1];
+		else if (token === "--lane") {
+			const value = (tokens[i + 1] ?? "").toLowerCase();
+			if (value === "fast" || value === "full") {
+				parsed.lane = value;
+				i++;
+			}
+		} else if (token === "--lang") parsed.lang = tokens[i + 1];
 		else if (token === "--model") parsed.model = tokens[i + 1];
 		else if (token === "--fallback-model") parsed.fallbackModel = tokens[i + 1];
 		else if (token === "--phase-model") {
@@ -1858,6 +1870,16 @@ export default function (pi: ExtensionAPI) {
 			// Standalone: bootstrap readyset/{changes,specs} ourselves if missing — there is no
 			// separate init step or CLI to run first.
 			await ensureReadysetRoot(ctx.cwd);
+
+			// --lane fast|full forces the lane for this run, bypassing the brainstorm's recorded
+			// lane. It is the operator's explicit answer to the same question grilling asks at
+			// close-out; a flag wins over the file for the same reason --model wins over config.
+			// Anything else is ignored (never a silent default: an unknown --lane value must not
+			// quietly run the wrong lane).
+			const laneOverride = parsedArgs.lane === "fast" || parsedArgs.lane === "full" ? parsedArgs.lane : undefined;
+			if (parsedArgs.lane !== undefined && laneOverride === undefined) {
+				ctx.ui.notify(`Ignoring --lane "${parsedArgs.lane}" — expected fast or full. Running on the brainstorm's recorded lane.`, "warning");
+			}
 
 			// --lang <language> (or, if no flag, readyset.language in ~/.omp/agent/config.yml) sets
 			// the language grilling's discussion (questions and replies) opens in from round 1,
@@ -1907,7 +1929,12 @@ export default function (pi: ExtensionAPI) {
 			const byLabel = new Map<string, BrainstormMeta>();
 			const options: ExtensionUISelectOption[] = items.map((b) => {
 				const label = `${b.created ?? "?"} · ${b.title}`;
-				const lane = b.laneSource === "default" ? "full lane (assumed)" : `${b.lane} lane`;
+				const effectiveLane = laneOverride ?? b.lane;
+				const lane = laneOverride
+					? `${effectiveLane} lane (--lane override)`
+					: b.laneSource === "default"
+						? "full lane (assumed)"
+						: `${b.lane} lane`;
 				const next = b.status === "archived" ? "done" : isProposed(b.status) ? "→ review" : "→ propose + review";
 				byLabel.set(label, b);
 				return { label, description: [next, lane, b.namespace].filter(Boolean).join(" · ") };
@@ -1937,6 +1964,21 @@ export default function (pi: ExtensionAPI) {
 
 			const chosen = byLabel.get(picked);
 			if (!chosen) return;
+
+			// resolveLane() in readyset-brainstorm.ts answers "what did the file say"; the run's
+			// lane additionally honors --lane (set above). From here on, effectiveLane is the
+			// only lane value this run may act on — read b.lane directly and you silently drop
+			// the operator's override.
+			const effectiveLane = laneOverride ?? chosen.lane;
+			if (laneOverride && laneOverride !== chosen.lane) {
+				ctx.ui.notify(
+					`Running "${chosen.changeId}" on the ${effectiveLane} lane (--lane override; the brainstorm records ${chosen.lane}). ` +
+						(effectiveLane === "fast"
+							? "Fast lane: lighter Explore folded into Propose, at most ~8 tasks, no mutation-testing review. Behavior questions are still asked."
+							: "Full lane: the complete Grill → Explore → Propose → Review → Execute pipeline."),
+					"info",
+				);
+			}
 
 			if (chosen.status === "archived") {
 				ctx.ui.notify(`Change "${chosen.changeId}" is already archived. Start a new brainstorm for follow-up work.`, "warning");

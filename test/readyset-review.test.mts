@@ -1763,6 +1763,11 @@ await test("parseReadysetArgs reads the raw argument string the way omp hands it
   assert.equal(parse("--model").model, undefined, "a flag with no value is undefined, not a crash");
   assert.equal(parse("just some words").idea, undefined, "plain words are not mistaken for an idea");
 
+  assert.equal(parse("--lane fast").lane, "fast");
+  assert.equal(parse("--lane FULL").lane, "full", "lane values are case-insensitive");
+  assert.equal(parse("--lane medium").lane, undefined, "an unknown lane is ignored, never a silent default");
+  assert.equal(parse("--lane").lane, undefined, "a bare --lane is ignored, not a crash");
+
   const phases = parse("--model big/main --phase-model explore=small/fast --phase-model grill=small/fast");
   assert.equal(phases.model, "big/main", "the run pin is unchanged");
   assert.deepEqual(
