@@ -163,7 +163,27 @@ function exploreTurnPrompt(b: BrainstormMeta, submodules: { name: string; path: 
 	);
 }
 
-function proposeTurnPrompt(b: BrainstormMeta): string {
+/**
+ * Fast-lane constraints, appended to the Propose prompt when the run's lane is fast. The
+ * baseline is explicit: the benchmark showed a 20-line change getting 3 grilling rounds, a
+ * 25KB EXPLORATION.md, ~80KB of planning docs, 23 tasks, and a mutation-testing review.
+ * Fast lane trims volume — Explore folded into Propose (no separate turn), at most ~8
+ * tasks, review without mutation testing — but never the behavior-affecting questions:
+ * grilling still asks them, and the T01/T10 wins came from exactly those questions.
+ */
+function fastLaneProposeSuffix(): string {
+	return (
+		"\n\nThis run is on the FAST lane: keep the planning tight. Explore was folded into this " +
+		"turn (no separate EXPLORATION.md turn ran), so ground the key facts yourself with a few " +
+		"targeted reads and note them inline. Write at most ~8 tasks, each independently " +
+		"verifiable. Do not pad proposal/design/specs beyond what the change needs — a short " +
+		"change gets a short plan. Behavior-affecting ambiguities are NOT trimmed: if the " +
+		"brainstorm left one open, decide it here with a stated reason or carry it forward " +
+		"explicitly, never silently."
+	);
+}
+
+function proposeTurnPrompt(b: BrainstormMeta, lane: "full" | "fast" = "full"): string {
 	const paths = changePaths("", b.changeId);
 	return (
 		`Create a Readyset change named "${b.changeId}" from the brainstorm at ${b.file}. ` +
@@ -189,7 +209,8 @@ function proposeTurnPrompt(b: BrainstormMeta): string {
 		"already decided; carry its Open Questions into the proposal rather than answering them silently.\n\n" +
 		"If EXPLORATION.md surfaced something the brainstorm didn't anticipate (a submodule it didn't mention, a config " +
 		"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it. Do not " +
-		"implement code in this turn — planning artifacts only."
+		"implement code in this turn — planning artifacts only." +
+		(lane === "fast" ? fastLaneProposeSuffix() : "")
 	);
 }
 
@@ -292,7 +313,7 @@ function compactBeforeExecuteGuidance(changeId: string): string {
  * mitigation, not a claim of independence. Do not re-add "fresh context" wording here
  * without a mechanism that actually provides it.
  */
-function codeReviewTurnPrompt(changeId: string): string {
+function codeReviewTurnPrompt(changeId: string, lane: "full" | "fast" = "full"): string {
 	const paths = changePaths("", changeId);
 	return (
 		`Critically review the implementation of Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, ` +
@@ -311,7 +332,11 @@ function codeReviewTurnPrompt(changeId: string): string {
 		"actually catch a failure, or are they vague/self-serving (e.g. 'looks correct' is not a verification); (3) any " +
 		"correctness bug, edge case, or regression risk you can see in the touched files, whether or not tasks.md " +
 		"mentioned it. Structure it as a findings list; if you genuinely find nothing, say so plainly rather than padding " +
-		"the file — but check hard before concluding that. Do not edit the implementation in this turn — findings only."
+		"the file — but check hard before concluding that. Do not edit the implementation in this turn — findings only." +
+		(lane === "fast"
+			? " Keep this review proportional: verify the WHEN/THEN scenarios against behavior and the scope contract, " +
+				"but skip mutation-testing-style probes (removing code to see if tests catch it) — that depth belongs to the full lane."
+			: "")
 	);
 }
 
@@ -1254,6 +1279,7 @@ async function reviewAndMaybeExecute(
 	initial: BrainstormMeta,
 	budget: TurnBudget,
 	phaseModels: Map<string, { model: string; source: string }> = new Map(),
+	reviewLane: "full" | "fast" = "full",
 ): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
@@ -1396,7 +1422,7 @@ async function reviewAndMaybeExecute(
 			"info",
 		);
 		const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-			spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId)),
+			spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane)),
 		);
 		if (!reviewFired) return;
 		const reviewContent = await readReview(ctx.cwd, chosen.changeId);
@@ -2027,7 +2053,7 @@ export default function (pi: ExtensionAPI) {
 
 			await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
 				if (isProposed(chosen.status)) {
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane);
 					return;
 				}
 
@@ -2075,43 +2101,57 @@ export default function (pi: ExtensionAPI) {
 
 				await scaffoldChange(ctx.cwd, chosen.changeId);
 
-				const submodules = await listSubmodules(ctx.cwd);
-				ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
+				// Fast lane folds Explore into Propose: no separate turn, no EXPLORATION.md turn.
+				// The full-lane path (separate grounding turn that must produce EXPLORATION.md)
+				// is unchanged below.
+				const isFastLane = effectiveLane === "fast";
+				let explored = false;
 				const exploreBudget = startPhaseBudget();
-				const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
-					spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
-				);
-				if (!exploreFired) return;
-
-				const explored = await hasExploration(ctx.cwd, chosen.changeId);
-				await appendContext(
-					ctx.cwd,
-					chosen.changeId,
-					"Explore",
-					(explored
-						? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
-						: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
-						` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
-				);
-				if (phaseBudgetExceeded(exploreBudget)) {
-					ctx.ui.notify(
-						`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
-							`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
-						"warning",
+				if (isFastLane) {
+					await appendContext(
+						ctx.cwd,
+						chosen.changeId,
+						"Explore",
+						"Skipped as a separate turn — fast lane folds grounding into Propose (a few targeted reads, noted inline).",
 					);
-				}
-				if (!explored) {
-					ctx.ui.notify(
-						`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
-							"grounding will be weaker than usual. Check the transcript above.",
-						"warning",
+				} else {
+					const submodules = await listSubmodules(ctx.cwd);
+					ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
+					const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
+						spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
 					);
+					if (!exploreFired) return;
+
+					explored = await hasExploration(ctx.cwd, chosen.changeId);
+					await appendContext(
+						ctx.cwd,
+						chosen.changeId,
+						"Explore",
+						(explored
+							? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
+							: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
+							` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
+					);
+					if (phaseBudgetExceeded(exploreBudget)) {
+						ctx.ui.notify(
+							`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
+								`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
+							"warning",
+						);
+					}
+					if (!explored) {
+						ctx.ui.notify(
+							`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
+								"grounding will be weaker than usual. Check the transcript above.",
+							"warning",
+						);
+					}
 				}
 
-				ctx.ui.notify(`Proposing change "${chosen.changeId}" — this can take a while...`, "info");
+				ctx.ui.notify(`Proposing change "${chosen.changeId}"${isFastLane ? " (fast lane — grounding folded in)" : ""} — this can take a while...`, "info");
 				const proposeBudget = startPhaseBudget();
 				const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
-					spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen)),
+					spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane)),
 				);
 				if (!proposeFired) return;
 				// Gate invariant (R2): a planning turn may only leave planning artifacts. The
@@ -2173,7 +2213,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane);
 		});
 		},
 	});

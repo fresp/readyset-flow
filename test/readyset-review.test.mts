@@ -327,8 +327,10 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
   assert.equal(fakePiWrap.calls.length, 4);
   assert.match(fakePiWrap.calls[0].prompt, /Explore the ground truth for the Readyset change "my-feature"/);
   assert.match(fakePiWrap.calls[1].prompt, /Create a Readyset change named "my-feature"/);
+  assert.ok(!/FAST lane/.test(fakePiWrap.calls[1].prompt), "full-lane Propose must not carry the fast-lane suffix");
   assert.match(fakePiWrap.calls[2].prompt, /Implement the Readyset change "my-feature"/);
   assert.match(fakePiWrap.calls[3].prompt, /Critically review the implementation of Readyset change "my-feature"/);
+  assert.ok(!/mutation-testing-style/.test(fakePiWrap.calls[3].prompt), "full-lane review keeps mutation-testing depth");
 
   // Brainstorm file should now say approved (markApproved happened before apply)
   const raw = await readFile(join(cwd, ".ai", "brainstorms", "2026-01-01-my-feature.md"), "utf8");
@@ -352,6 +354,78 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
     assert.match(archived, /## Propose —/);
     assert.match(archived, /## Apply —/);
     assert.match(archived, /## Code review —/);
+  }
+});
+
+await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and narrows review", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-28-fast.md", {
+    title: "Fast Fix",
+    status: "open",
+    created: "2026-01-28",
+    change_id: "fast-fix",
+    lane: "full", // recorded lane is full; the flag must override it
+  }, VALID_BRAINSTORM_BODY);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-01-28 · Fast Fix"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Archive now");
+
+  const dir = join(cwd, "readyset", "changes", "fast-fix");
+
+  // No Explore effect queued: the fast lane must never fire an Explore turn.
+  // Propose effect: writes valid artifacts
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(dir, "specs", "cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await writeFile(
+      join(dir, "specs", "cap", "spec.md"),
+      "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
+  });
+  // Apply effect
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+  });
+  // Code-review effect
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  // 3 turns, not 4: no Explore turn fired at all.
+  assert.equal(fakePiWrap.calls.length, 3);
+  assert.ok(!fakePiWrap.calls.some((c) => /Explore the ground truth/.test(c.prompt)), "fast lane must not fire Explore");
+  const propose = fakePiWrap.calls.find((c) => /Create a Readyset change/.test(c.prompt));
+  assert.ok(propose, "Propose still fires");
+  assert.match(propose.prompt, /FAST lane/, "fast-lane Propose carries the tight-planning suffix");
+  assert.match(propose.prompt, /at most ~8 tasks/, "fast-lane Propose caps the task count");
+  const review = fakePiWrap.calls.find((c) => /Critically review/.test(c.prompt));
+  assert.ok(review, "Code review still fires");
+  assert.match(review.prompt, /skip mutation-testing-style probes/, "fast-lane review narrows its depth");
+
+  // The override must be announced, since the file said full.
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /--lane override.*full/.test(n.message)),
+    "the --lane override over a differing recorded lane must notify",
+  );
+
+  // CONTEXT.md records the folded Explore, not a missing one.
+  const contextRaw = await readFile(
+    join(cwd, "readyset", "changes", "archive", "fast-fix", "CONTEXT.md"),
+    "utf8",
+  ).catch(() => undefined);
+  if (contextRaw !== undefined) {
+    assert.match(contextRaw, /fast lane folds grounding into Propose/);
   }
 });
 
