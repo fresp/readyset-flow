@@ -14,6 +14,7 @@ import {
   appendContext,
   readContext,
   checkTaskVerification,
+  checkPhaseViolations,
   readReview,
   taskCheckedStates,
 } from "../src/lib/readyset-spec.ts";
@@ -400,6 +401,51 @@ await test("archiveChange: MODIFIED/REMOVED delta is flagged as unappliedModific
   // and the merge itself is still exactly the same append-only behavior as before -- the old
   // requirement text, if any existed, would remain untouched (nothing to assert here since
   // there was no prior canonical spec in this test, covered by the existing append test above).
+});
+
+await test("checkPhaseViolations: clean planning state has no violations", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "clean");
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(cwd, ".ai", "brainstorms"), { recursive: true });
+  const violations = await checkPhaseViolations(cwd, "clean", [
+    "readyset/changes/clean/proposal.md",
+    ".ai/brainstorms/x.md",
+  ]);
+  assert.equal(violations.length, 0);
+});
+
+await test("checkPhaseViolations: product-code write during planning is a phase-write", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "leak");
+  const violations = await checkPhaseViolations(cwd, "leak", [
+    "readyset/changes/leak/proposal.md",
+    "src/ledger.mjs",
+    "test/balance-cache.test.mjs",
+  ]);
+  assert.equal(violations.length, 2);
+  assert.ok(violations.every((v) => v.kind === "phase-write"));
+  assert.ok(violations.some((v) => v.path === "src/ledger.mjs"));
+});
+
+await test("checkPhaseViolations: self-archive is detected even with no stray files", async () => {
+  const cwd = await freshCwd();
+  // scaffold then move away, the way T12 did by renaming the change dir itself
+  await scaffoldChange(cwd, "gone");
+  const { rename } = await import("node:fs/promises");
+  await ensureReadysetRoot(cwd);
+  await rename(join(cwd, "readyset", "changes", "gone"), join(cwd, "readyset", "changes", "archive", "2026-09-20-gone"));
+  const violations = await checkPhaseViolations(cwd, "gone", []);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].kind, "self-archive");
+});
+
+await test("checkPhaseViolations: a file with the change id as a prefix is still a violation", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "my-change");
+  // "readyset/changes/my-change-evil/x.md" must not pass the prefix check for "my-change"
+  const violations = await checkPhaseViolations(cwd, "my-change", ["readyset/changes/my-change-evil/x.md"]);
+  assert.equal(violations.length, 1);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

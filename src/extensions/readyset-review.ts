@@ -9,10 +9,13 @@ import {
 	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
 import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
 	appendContext,
 	archiveChange,
 	changePaths,
+	checkPhaseViolations,
 	checkTaskVerification,
 	ensureReadysetRoot,
 	findSpecFiles,
@@ -686,6 +689,27 @@ interface TurnBudget {
 
 function createTurnBudget(max: number = MAX_TURNS_PER_RUN): TurnBudget {
 	return { max, spent: 0 };
+}
+
+/**
+ * Runs `git status --porcelain` in the repo root and returns the repo-relative paths of every
+ * changed file (tracked modifications plus untracked files; renames are reported as their
+ * destination). Throws when git is unavailable or the cwd is not a repo — a planning turn in a
+ * non-repo has no git boundary to violate, so the caller treats that as "nothing to check",
+ * not as a violation.
+ */
+async function changedPathsSinceBaseline(cwd: string): Promise<string[]> {
+	const run = promisify(execFile);
+	const { stdout } = await run("git", ["status", "--porcelain", "-uall"], { cwd, timeout: 30000 });
+	const paths: string[] = [];
+	for (const line of stdout.split("\n")) {
+		if (line.length < 4) continue;
+		// Porcelain v1: XY + space + path, or "R  old -> new" for renames.
+		const rest = line.slice(3);
+		const arrow = rest.indexOf(" -> ");
+		paths.push(arrow === -1 ? rest : rest.slice(arrow + 4));
+	}
+	return paths.filter((p) => p !== "");
 }
 
 /** Fires a turn against the budget. Returns false (and notifies) without firing anything if
@@ -1826,6 +1850,32 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Proposing change "${chosen.changeId}" — this can take a while...`, "info");
 				const proposeFired = await spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen));
 				if (!proposeFired) return;
+				// Gate invariant (R2): a planning turn may only leave planning artifacts. The
+				// T11/T12 benchmark runs implemented the change out of the Propose turn and
+				// archived it themselves, shipping with no approval. That is checked here —
+				// structurally, from the working tree — before the gate is ever offered.
+				const violations = await checkPhaseViolations(
+					ctx.cwd,
+					chosen.changeId,
+					await changedPathsSinceBaseline(ctx.cwd).catch(() => []),
+				);
+				if (violations.length > 0) {
+					await appendContext(
+						ctx.cwd,
+						chosen.changeId,
+						"Propose",
+						`STOPPED — planning turn wrote outside its boundary: ${violations
+							.map((v) => `${v.path} (${v.detail})`)
+							.join("; ")}. No review gate is offered for this state.`,
+					);
+					ctx.ui.notify(
+						`Stopped: the Propose turn for "${chosen.changeId}" changed files outside the change ` +
+							`directory (${violations.map((v) => v.path).join(", ")}). Readyset never implements without approval, ` +
+							"so no review gate is offered — revert those files (or move them into the change dir) and run /readyset again.",
+						"error",
+					);
+					return;
+				}
 				await appendContext(ctx.cwd, chosen.changeId, "Propose", "Propose turn ran; see proposal.md/design.md/specs/tasks.md.");
 
 				const reloaded = await loadBrainstorms(ctx.cwd);

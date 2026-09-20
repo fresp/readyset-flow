@@ -17,7 +17,7 @@
  */
 
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
 
 export const READYSET_ROOT = "readyset";
@@ -116,6 +116,64 @@ export async function hasExploration(cwd: string, changeId: string): Promise<boo
 	const paths = changePaths(cwd, changeId);
 	const raw = await readFile(paths.exploration, "utf8").catch(() => undefined);
 	return !!raw && raw.trim().length > 0;
+}
+
+export type ViolationKind = "phase-write" | "self-archive";
+
+export interface PhaseViolation {
+	kind: ViolationKind;
+	/** Repo-relative path for a write, or the archive destination for a self-archive. */
+	path: string;
+	detail: string;
+}
+
+/**
+ * Phase-boundary invariant: while a planning turn (Explore or Propose) is in flight, nothing
+ * outside the change's own directory and `.ai/brainstorms/` may change. T12 on the benchmark
+ * ran a full implementation out of the Propose turn — editing src/, writing tests, writing
+ * REVIEW.md, and archiving the change itself — then shipped with no approval. Prompt text says
+ * "planning artifacts only"; this is the structural check that says it. Call it after a
+ * planning turn fires, before the next phase; a non-empty result means stop, do not offer the
+ * gate. Pure fs, no LLM involvement — it cannot be talked around.
+ */
+export async function checkPhaseViolations(
+	cwd: string,
+	changeId: string,
+	changedPaths: string[],
+): Promise<PhaseViolation[]> {
+	const violations: PhaseViolation[] = [];
+
+	for (const rawPath of changedPaths) {
+		const abs = join(cwd, rawPath);
+		const inChangeDir = abs.startsWith(join(cwd, READYSET_ROOT, "changes", changeId) + sep);
+		// BRAINSTORM_DIR (".ai/brainstorms") lives in readyset-brainstorm.ts; hard-coded here
+		// because readyset-brainstorm.ts imports from this file, so importing it back would be a
+		// cycle. Kept in sync by the phase-boundary test below.
+		const inBrainstorms = abs.startsWith(join(cwd, ".ai", "brainstorms") + sep);
+		// An archive move is checked separately below (it is a rename the model performed
+		// itself, not a path in a porcelain listing).
+		if (inChangeDir || inBrainstorms) continue;
+		violations.push({
+			kind: "phase-write",
+			path: rawPath,
+			detail: `file outside readyset/changes/${changeId}/ and .ai/brainstorms/ changed during a planning turn`,
+		});
+	}
+
+	// A change directory that moved into changes/archive/ without the extension firing
+	// archiveChange is a self-archive: the turn skipped the gate by finishing the workflow
+	// itself. In T12 the model archived to a dated name of its own choosing, so the check is
+	// "is the live change dir gone", not "does a specific archive path exist".
+	const paths = changePaths(cwd, changeId);
+	if (!(await isDir(paths.dir))) {
+		violations.push({
+			kind: "self-archive",
+			path: join(READYSET_ROOT, "changes", "archive"),
+			detail: `change directory readyset/changes/${changeId}/ no longer exists — it was archived or moved without an approval decision`,
+		});
+	}
+
+	return violations;
 }
 
 /**
