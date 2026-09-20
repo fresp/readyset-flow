@@ -15,6 +15,8 @@ This is the detailed reference. For the two-minute version, see the [README](../
   - [Grilling from outside omp](#grilling-from-outside-omp)
   - [Language](#language)
 - [Configure a model](#configure-a-model)
+  - [Per-phase models](#per-phase-models)
+- [The lane](#the-lane)
 - [The review gate](#the-review-gate)
 - [Uninstall](#uninstall)
 - [What it deliberately does not do](#what-it-deliberately-does-not-do)
@@ -82,13 +84,20 @@ A `/readyset` change moves through five stages — you only see the ones that st
 | Stage | What happens | Who can skip it |
 |---|---|---|
 | **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity until Decision/Seam/Scope/Acceptance Criteria resolve. | Skipped if a brainstorm already exists in `.ai/brainstorms/`. |
-| **2. Explore** | Reads the real repo and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm. |
-| **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in Explore's findings. | Never skipped. |
-| **4. Review gate** | Approve, **Refine**, or **Discard**. Nothing executes without a look first. | Never skipped — the gate Readyset exists to enforce. |
+| **2. Explore** | Reads the real repo and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm — **except on the fast lane**, which folds it into Propose. |
+| **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in Explore's findings, plus the `## Files This Change Will Touch` scope contract. | Never skipped. |
+| **4. Review gate** | Approve, **Refine**, or **Discard** — Discard is the default. Nothing executes without a deliberate approval first. | Never skipped — the gate Readyset exists to enforce. |
 | **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note, optionally backed by `readyset_verify` evidence. A separate **code-review** turn runs before archiving. | Never skipped. |
 
 **Refine** sends you back to Propose; a failed verification at Execute sends you back to the
 review gate — either way you land on a stage above, never off into an unrecoverable branch.
+
+Phase discipline is enforced, not just requested. After the Propose turn fires, Readyset snapshots
+the working tree and **stops the run with no gate offered** if anything outside
+`readyset/changes/<id>/` and `.ai/brainstorms/` changed — a planning turn may only leave planning
+artifacts. See [What it deliberately does not do](#what-it-deliberately-does-not-do) for the exact
+boundary of that check. Each of Explore and Propose also runs under a wall-clock budget (20 min by
+default); a breach warns visibly in `CONTEXT.md` rather than failing silently.
 
 ## Configure
 
@@ -230,7 +239,55 @@ pin failing before a turn starts, not a model going down mid-turn — for that, 
 `retry.fallbackChains`.
 
 Every run also has a hard turn budget (10 by default), shown as `agent turns this run: N/10` in
-the review panel — a guardrail against an unbounded Refine loop, not a cost estimate.
+the review panel — a guardrail against an unbounded Refine loop, not a cost estimate. It counts
+fired turns, so it does not bound the tool calls *inside* one turn; the per-phase wall-clock
+budgets (see [How it works](#how-it-works)) cover that gap.
+
+### Per-phase models
+
+`--model` pins one model for the whole run, so there is no way to spend a cheap model on the
+phases that don't need a strong one. `--phase-model <phase>=<spec>` (repeatable) and
+`readyset.model.phases.<phase>` in config fix that — resolved per phase as **flag > config > run
+pin**:
+
+```
+/readyset --phase-model grill=spark/minimax-m3 --phase-model explore=spark/minimax-m3 \
+  --idea "let users export their data as CSV"
+```
+
+```yaml
+readyset:
+  model:
+    default: anthropic/claude-opus-5
+    phases:
+      grill: spark/minimax-m3
+      explore: spark/minimax-m3
+```
+
+Covers `grill|explore|propose|apply|review`; **Refine rides the propose override**, since it
+re-proposes. An override that fails to resolve or pin warns and falls back to the run model — a
+phase model is a cost optimization, never a reason to stop the run.
+
+The `configure` wizard does **not** cover phase models (it stays limited to language, default
+model, and fallback chain) — `readyset.model.phases` is hand-edited YAML.
+
+## The lane
+
+A change runs on one of two lanes. The lane decides how heavy the later phases are, and it is a
+real run input — not just a label on the brainstorm picker.
+
+- **Full** (default) — the five stages as described above, including a separate Explore turn.
+- **Fast** — for a small, well-understood change. Explore is folded into Propose (no separate turn;
+  a few targeted reads, noted inline in `CONTEXT.md`), Propose carries a tight-planning suffix
+  (roughly 8 tasks, no padding), and the code-review turn skips mutation-testing-style probes.
+
+Grilling proposes a lane with a one-line reason and you confirm or override it; that decision is
+recorded on the brainstorm. `--lane fast|full` forces the lane for the run — the flag wins over the
+recorded lane, and the picker shows the effective lane so an override is visible before anything
+runs.
+
+The lane trims **volume**, never the questions that change behavior: grilling still asks everything
+whose answer would change what gets built on either lane.
 
 ## The review gate
 
@@ -239,10 +296,21 @@ Picks a brainstorm, then depending on its status:
 - **Not proposed yet** — fires **Explore** first (writes `EXPLORATION.md`, every `.gitmodules`
   submodule listed explicitly), then **Propose**, grounded in what Explore found. Drops straight
   into the review gate below.
-- **Already proposed** — the sidebar overlay opens automatically, with **Approve & Execute** /
-  **Refine** (loops into another revision) / **Discard** as CTAs inside it — Up/Down scroll the
-  open section's content, Left/Right jump between sections. Contexts without a real TUI fall back
-  to a classic select menu with the same three choices.
+- **Already proposed** — the sidebar overlay opens automatically, with **Approve & Execute** (or
+  **Approve & Execute, keep context**) / **Refine** (loops into another revision) / **Discard** as
+  CTAs inside it (`[A]`/`[K]`/`[R]`/`[D]`) — Up/Down scroll the open section's content, Left/Right
+  jump between sections. Contexts without a real TUI fall back to a classic select menu with the
+  same choices, **Discard listed first**: the gate is fail-closed, so nothing runs unless an
+  Approve option is deliberately picked. Cancelling fires no agent turn at all.
+- **Approve & Execute** compacts the planning context first — Explore/Propose history is already
+  persisted under `readyset/changes/<id>/`, so Apply re-reads the artifacts from disk instead of
+  paying for that history twice. Pick **keep context** when discussion nuance didn't make it into
+  the artifacts, so the model still has it. A failed or unavailable `ctx.compact` degrades to plain
+  execution.
+- The panel also shows the **scope check** — the working tree against `proposal.md`'s
+  `## Files This Change Will Touch` contract. Anything changed that the contract doesn't name is
+  listed as **OUT OF SCOPE** (paths under `readyset/` and `.ai/brainstorms/` are always in scope). An
+  absent contract reads as "no contract", not a silent pass. It **warns, never blocks**.
 - **Approve & Execute** implements the tasks. Each completed task needs an indented `_Verified:`
   note, or the gate sends it back. It can optionally call `readyset_verify({taskId, command})` to
   back that note with more than a self-report — the command runs for real, and an immutable record
@@ -275,6 +343,18 @@ opposite direction: an alias for `install`, to refresh the linked extension and 
   guarantee than it is. `validateBrainstormContent` (checked before Explore runs) uses the same
   wording for the same reason. The one check that *is* semantic is the code-review turn
   (`REVIEW.md`) — its panel line deliberately doesn't share that suffix.
+  - The unobservable-THEN check follows the same rule: it flags a requirement whose THEN names only
+    a code property, by looking for an externally checkable signal (exit code, stdout/stderr, HTTP
+    status, file content, a command result). It is signal words, not understanding — its job is
+    catching the *uncheckable* kind, not certifying the good kind.
+- The gate invariant (see [How it works](#how-it-works)) is a **boundary** check, not a full phase
+  audit: it catches a planning turn that wrote outside `readyset/changes/<id>/` and
+  `.ai/brainstorms/`, from the working tree, after the turn has already run. It cannot see what a
+  turn did inside those paths, and a repo whose working tree is not under git has no boundary to
+  check at all. What was already dirty before the change started is captured once and subtracted,
+  so unrelated WIP never counts against it.
+- The per-phase budgets (wall-clock) **warn, they do not kill** a phase. A model that is slow or
+  looping is recorded in `CONTEXT.md` and surfaced, not forcibly interrupted mid-turn.
 - `archiveChange` merges delta specs append-only — never a real diff-merge. Safe, but cruder than
   a schema-aware archiver; review the merged spec afterward.
 - Grilling's round cap is enforced in code only for rounds asked through `readyset_ask`. In the
@@ -298,14 +378,16 @@ Under `readyset/changes/<id>/`, in the order they get written:
 
 ```
 EXPLORATION.md   Explore phase findings — what was actually checked, and what was found
-proposal.md      Why / What Changes
+proposal.md      Why / What Changes, plus the `## Files This Change Will Touch` scope contract
 design.md        Context / Goals-Non-Goals / Decisions / Risks
 specs/**/spec.md ADDED/MODIFIED/REMOVED Requirements as WHEN/THEN scenarios
 tasks.md         checkbox tasks; each `- [x]` carries an indented `_Verified:` note
 evidence/E*.md   optional runtime-evidence records from `readyset_verify` — one per call,
                  numbered E001, E002, ...; never auto-created, never mutated once written
 CONTEXT.md       append-only audit trail — one entry per phase transition, written by the
-                 extension itself (not the model), so it can't be skipped or misremembered
+                 extension itself (not the model), so it can't be skipped or misremembered.
+                 Also carries the once-written pre-existing-dirty baseline the gate invariant
+                 and scope check subtract (see "What it deliberately does not do")
 REVIEW.md        code-review phase findings, written after implementation, before archive
 ```
 

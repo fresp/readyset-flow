@@ -6,6 +6,112 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.12.0
+
+A hardening release driven by end-to-end benchmarking (`/readyset` vs omp `/plan` vs Command Code
+plan mode, plus a 9-task paired run): phase discipline is now enforced structurally instead of by
+prompt text alone, the review gate fails closed, per-phase cost has real ceilings, and the docs say
+only what the measurements support. Every item below is a behavior or prompt change traced to a
+specific benchmark observation.
+
+### Gate integrity
+
+- **The Propose turn can no longer implement and ship the change.** Two benchmark runs (T11, T12)
+  wrote implementation code out of the Propose turn, archived the change themselves, and finished
+  with no approval — the prompt said "planning artifacts only", nothing enforced it. After Propose
+  fires, Readyset now snapshots the working tree (`git status --porcelain`) and stops with an error
+  if anything outside `readyset/changes/<id>/` and `.ai/brainstorms/` changed, or if the change
+  directory moved into `archive/` on its own. A violation writes a `STOPPED` entry to `CONTEXT.md`
+  naming the exact paths and **offers no review gate** — the run is over.
+- **The review gate is fail-closed.** "Discard" is now the first option in the classic menu, and
+  nothing runs unless an Approve option is deliberately picked. Previously "Approve & Execute" was
+  first and relied on falsy/missing selections falling through to discard — safe only while every
+  host resolves a selection explicitly. A test pins it: cancelling at the gate fires zero agent
+  turns and leaves `tasks.md` untouched.
+- **Phase budgets, and honest phase accounting in `CONTEXT.md`.** The turn budget counts fired
+  turns, but one turn can churn millions of tokens in tool calls without spending more budget
+  (T12's Explore alone was 51% of a 17.6M-token run). Each phase now has a wall-clock ceiling
+  (default 20 min); Explore and Propose record their elapsed time, and a breach warns visibly
+  instead of failing silently. `CONTEXT.md` entries can no longer claim a clean Propose when the
+  working tree says otherwise.
+
+### Cost
+
+- **Per-phase model overrides.** Grill+Explore produced 39% of fresh input at the worst
+  cost-per-value in the benchmark, and `--model` pinned one model for the whole run. New
+  `--phase-model <phase>=<spec>` (repeatable) and `readyset.model.phases.<phase>` config, resolved
+  per phase as flag > config > run pin, for `grill|explore|propose|apply|review` (Refine rides the
+  propose override). An override that fails to resolve warns and falls back to the run model — a
+  phase model is a cost optimization, never a reason to stop the run.
+- **Approve & Execute compacts by default.** Explore/Propose context dominated Apply and Review
+  cost (T01: max context 154k, ~76% of all tokens as cache reads) while everything those phases
+  produced is already persisted under `readyset/changes/<id>/` — Apply re-reads artifacts from
+  disk. **`Approve & Compact` is replaced by `Approve & Execute, keep context`**, the escape hatch
+  in the other direction; sidebar CTAs move from `A/C/R/D` to `A/K/R/D` (`compact` is still
+  accepted from older sidebar builds). A missing or failed `ctx.compact` degrades to plain
+  execution.
+- **Grilling researches once up front, not every round.** One session made 17 bash + 16 read calls
+  spread across rounds for what one upfront pass covers; rounds already batch up to 4 questions, so
+  the cost was per-round research, not round count. Rounds, options, and the no-passive-answer rule
+  are unchanged.
+
+### Claims, scope, and quality
+
+- **The scope contract.** Readyset diffs ran 2× the plan arm's lines, 0.89 files outside expected
+  scope vs 0.42, and one run grew an unasked-for 160-line file — `scope_discipline` was the one
+  dimension Readyset did not win. `proposal.md` must now carry a `## Files This Change Will Touch`
+  section; the gate checks the working tree against it and shows match / OUT OF SCOPE / unknown.
+  Paths under `readyset/` and `.ai/brainstorms/` are always in scope; an absent section is "no
+  contract", never a silent pass. It **warns, never blocks**.
+- **Unobservable acceptance criteria are flagged.** A run shipped "WHEN src/registry.ts is
+  inspected THEN it contains no direct filesystem calls" and validation passed it, though no test
+  could ever check it. `validateChange` now flags requirements whose THEN names only a code
+  property, with no externally checkable signal (exit code, stdout/stderr, HTTP status, file
+  content, command result). Still structural, and the summary keeps its `(structural check)`
+  suffix.
+- **The code review checks behavior, not the suite.** One run's own test asserted the bug it
+  introduced, so "do the tests pass" would confirm it. The review turn now checks scenario
+  conformance against the WHEN/THEN behavior — run the code, read the diff, exercise the endpoint
+  — and distrusts any expected value that could only have come from the implementation under
+  review.
+- **Grounding is documented as auditability, not quality.** Two independent benchmarks measured
+  Readyset's plans as no better grounded than a single read-only pass (~50% in blind judging,
+  twice). The README/GUIDE no longer imply otherwise: `EXPLORATION.md` is an auditable trail, and
+  the Propose prompt requires every repo claim to anchor to a numbered exploration entry or a
+  "verified during planning" note.
+- **"Fresh-context code review" was never true, and is no longer claimed.** The review turn shares
+  the session context — omp's extension API offers no subagent/detached-turn surface. README,
+  GUIDE, SKILL.md and code comments now say "separate turn with adversarial framing", which is the
+  actual mitigation.
+
+### The lane
+
+- **The lane is a real run input, and fast lane actually runs light.** Previously the lane only
+  filtered the brainstorm picker and labeled it — the workflow was identical either way. Grilling
+  now proposes a lane with a one-line reason and the user picks; `--lane fast|full` forces it for
+  the run (flag wins over the file); the picker shows the effective lane. Fast lane folds Explore
+  into Propose (no separate turn; targeted reads noted inline), caps Propose at a tight plan, and
+  skips mutation-testing-style review probes. Full lane is unchanged. The lane trims **volume**,
+  never the behavior-changing questions — the T01/T10 wins came from exactly those.
+
+### Fixes
+
+- **The gate invariant and scope check no longer flag pre-existing repo state as this change's
+  own.** The helper feeding both never diffed against a baseline — it was a raw `git status` read —
+  so any file dirty for unrelated reasons (a WIP edit elsewhere, an untracked scratch note) got
+  misattributed to the current change: a hard stop at the gate for a well-behaved run, or a false
+  OUT-OF-SCOPE warning on every gate render. What was already dirty is now captured once, right
+  after the change directory is scaffolded (first capture wins; never widened), stored inside
+  `CONTEXT.md` so it rides the existing append path and archives with the change. Old changes with
+  no baseline keep the old behavior rather than crashing.
+- **The baseline survives later `CONTEXT.md` writes.** The baseline JSON is now parsed between the
+  fence markers the writer itself created, instead of from the first `{` to the last `}` in the
+  rest of the file. That "last brace" scan would break the moment anything appended later contained
+  a `}` — and Refine appends raw user feedback verbatim, so *"make it return `{status:'ok'}`"*
+  silently emptied the baseline and restored the bug above for the rest of the run.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.11.2...0.12.0
+
 ## 0.11.2
 
 - **The review gate was silently discarded under omp's RPC host.** Readyset opened its review

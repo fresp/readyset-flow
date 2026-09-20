@@ -18,6 +18,10 @@ turns.
 Explore -> Propose -> (Review gate: Approve / Refine / Discard) -> Apply -> Code review -> Archive
 ```
 
+On the **fast lane** (a small, well-understood change) Explore is folded into Propose — no
+separate turn, just a few targeted reads noted inline in `CONTEXT.md` — and the code-review turn
+skips mutation-testing-style probes. Everything else is the same.
+
 Each phase exists to catch something the previous one is bad at catching on its own:
 
 1. **Explore** (`EXPLORATION.md`) — grounds the change in real repo state *before* any
@@ -26,7 +30,9 @@ Each phase exists to catch something the previous one is bad at catching on its 
    run relevant tests. Write one entry per thing actually checked: what you checked (exact
    file/command/commit) and what you found (the real value or output, not a paraphrase). "I
    checked X, found nothing relevant" is a legitimate entry — don't force a problem into
-   existence to have something to report.
+   existence to have something to report. In `proposal.md`/`design.md`, anchor every repo claim
+   to one of these entries (or a "verified during planning" note) — an unanchored claim is
+   indistinguishable from a guess.
 
    This phase exists because prose alone is not enough: an earlier version of Propose was
    told, in its own prompt, to check `.gitmodules` — and still silently dropped a submodule
@@ -36,10 +42,13 @@ Each phase exists to catch something the previous one is bad at catching on its 
 
 2. **Propose** (`proposal.md`, `design.md`, `specs/**/spec.md`, `tasks.md`) — the planning
    artifacts, grounded in Explore's findings rather than re-deriving them. See "File formats"
-   below for the required shape of each file.
+   below for the required shape of each file. This turn may **only** write planning artifacts
+   under `readyset/changes/<id>/` — writing implementation code here stops the run with no gate
+   offered.
 
 3. **Review gate** — a human decides: Approve & Execute, Refine (describe what's wrong, loops
-   back into another Propose-equivalent turn), or Discard. Nothing executes without this.
+   back into another Propose-equivalent turn), or Discard. Nothing executes without this, and
+   Discard is the default: the gate is fail-closed, so cancelling runs nothing.
 
 4. **Apply** — implements `tasks.md` one task at a time. A task is only checked off once
    something actually verified it (a test run, a curl, a script execution) — not once code
@@ -71,6 +80,9 @@ I actually looked at" attached does not belong in this file.
 **`proposal.md`**
 - `## Why` — 1-2 paragraphs on the problem.
 - `## What Changes` — bullet list of concrete changes.
+- `## Files This Change Will Touch` — exhaustive repo-relative list. This is the **scope
+  contract**: the review gate checks the working tree against it and flags anything changed that
+  isn't named. Omitting the section means "no contract", never "everything allowed".
 
 **`design.md`**
 - `## Context`
@@ -119,13 +131,20 @@ whether or not `tasks.md` mentioned it.
 
 **`CONTEXT.md`** — append-only, one `## <Phase> — <ISO timestamp>` entry per phase
 transition, written by the extension automatically. Never hand-edit this file; it's an audit
-trail, not a planning document.
+trail, not a planning document. It also carries a one-time `readyset-baseline-dirty` block —
+the repo paths that were already dirty before the change started — which the gate invariant and
+scope check subtract so unrelated WIP isn't blamed on this change.
 
 ## What Readyset deliberately does not do
 
 - `validateChange` is a shallow structural check (required sections exist, at least one
-  requirement+scenario, at least one task) — not a real schema validator. A "validate: pass"
-  in the review panel means structurally complete, not semantically correct.
+  requirement+scenario, at least one task, each requirement's THEN names an externally checkable
+  signal) — not a real schema validator. A "validate: pass" in the review panel means structurally
+  complete, not semantically correct.
+- The gate invariant is a boundary check, not a phase audit: it catches a Propose turn writing
+  outside `readyset/changes/<id>/`, from the working tree, after the turn has run. It can't see
+  what a turn did inside those paths.
+- Per-phase wall-clock budgets warn and record; they don't kill a phase mid-turn.
 - `archiveChange`'s spec merge is append-only, never a real diff-merge. Review the merged
   spec after archiving.
 - None of Readyset's own file-format or phase logic is a fork of, or stays compatible with, any

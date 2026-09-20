@@ -33,12 +33,20 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 /readyset --idea "let users export their data as CSV"
 ```
 
-- **Grill** interrogates the idea until it's unambiguous — a real Q&A, not a rubber stamp.
+- **Grill** interrogates the idea until it's unambiguous — a real Q&A, not a rubber stamp. It also
+  proposes a **lane** (`--lane fast|full` to force one): fast folds Explore into Propose, caps the
+  plan, and skips the heavier review probes; full is the workflow below.
 - **Explore** greps the actual repo before anything gets proposed, instead of assuming.
-- **Propose** writes a proposal, design, specs, and tasks — grounded in what Explore found.
-- **Review** stops for your Approve / Refine / Discard. Nothing executes without a look.
+- **Propose** writes a proposal, design, specs, and tasks — grounded in what Explore found, and
+  with a `## Files This Change Will Touch` scope contract the gate checks against.
+- **Review** stops for your Approve / Refine / Discard — **Discard is the default**, so nothing
+  executes without a deliberate look. Approve & Execute compacts first (Explore/Propose context is
+  already persisted to disk); "keep context" is the escape hatch.
 - **Execute** implements the tasks; each one needs a `_Verified:` note, and a separate
   code-review turn runs before the change is archived.
+
+Pin a cheaper model per phase with `--phase-model grill=... --phase-model explore=...` (see the
+[full guide](docs/GUIDE.md#per-phase-models)).
 
 Already have a brainstorm sitting in `.ai/brainstorms/`? Run `/readyset` with no `--idea` and pick
 it — Grill is skipped, since the ambiguity's already resolved.
