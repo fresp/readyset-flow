@@ -45,11 +45,12 @@ Each phase exists to catch something the previous one is bad at catching on its 
    something actually verified it (a test run, a curl, a script execution) — not once code
    was written that's expected to work. See "The `_Verified:` note" below.
 
-5. **Code review** (`REVIEW.md`) — a fresh turn, after Apply, before Archive. It is told
+5. **Code review** (`REVIEW.md`) — its own turn, after Apply, before Archive. It is told
    explicitly that its job is to find problems, not confirm the work — the turn that just
    implemented something is a poor judge of its own diff, since it already believes its
-   choices were correct. If this phase finds nothing, it says so plainly rather than padding
-   the file to look thorough.
+   choices were correct. (Not a fresh session — omp's extension API offers none — so the
+   adversarial framing is the mitigation.) If this phase finds nothing, it says so plainly
+   rather than padding the file to look thorough.
 
 6. **Archive** — moves the change to `readyset/changes/archive/<id>/` and merges its delta
    specs into `readyset/specs/` (append-only — never a real ADDED/MODIFIED/REMOVED diff-merge;

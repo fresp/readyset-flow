@@ -68,9 +68,10 @@ interface OverlayKeybindings {
  *   spec-driven-development tooling (Open Questions preserved, a gate before execution).
  * - mattpocock/skills prompting hygiene — Apply requires a machine-checkable `_Verified:`
  *   note under every completed task (checkTaskVerification()) before the gate lets you move
- *   on, and a separate Code-review turn (fresh context, adversarial framing, writes
- *   REVIEW.md) runs after implementation and before the archive offer, rather than trusting
- *   the same turn that wrote the code to also grade it. CONTEXT.md logs every phase
+ *   on, and a separate Code-review turn (its own turn with adversarial framing, writing
+ *   REVIEW.md — not a fresh session, which omp's extension API does not offer) runs after
+ *   implementation and before the archive offer, rather than trusting the same turn that
+ *   wrote the code to also grade it. CONTEXT.md logs every phase
  *   transition deterministically (appendContext(), not left to the model to remember).
  * See the package README for the full mapping.
  *
@@ -277,8 +278,15 @@ function compactBeforeExecuteGuidance(changeId: string): string {
  * Code-review turn — new in pipeline v2, fires after every task is done but before the
  * archive offer. This is the mattpocock/skills "review critically in a separate pass"
  * pattern: the same turn that just implemented the change is a poor judge of its own diff
- * (it already believes its choices were right), so review happens as its own fresh turn with
- * an explicitly adversarial framing, writing REVIEW.md rather than silently approving.
+ * (it already believes its choices were right), so review happens as its own turn with an
+ * explicitly adversarial framing, writing REVIEW.md rather than silently approving.
+ *
+ * Deliberately NOT a fresh session: omp's extension API offers no subagent/detached-turn
+ * surface (`newSession` swaps the user's live session mid-command — not usable here), so
+ * the review turn shares the session context. The adversarial framing and the check-each-
+ * WHEN/THEN-against-behavior instruction (see R12 direction in the prompt) are the
+ * mitigation, not a claim of independence. Do not re-add "fresh context" wording here
+ * without a mechanism that actually provides it.
  */
 function codeReviewTurnPrompt(changeId: string): string {
 	const paths = changePaths("", changeId);

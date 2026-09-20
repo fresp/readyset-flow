@@ -49,7 +49,7 @@ Prose is a request; a gate is a requirement.
 | Planning artifacts scatter across a chat | Each change gets its own `readyset/changes/<id>/` directory |
 | Review can be informal, or skipped under pressure | A review gate structurally separates proposal from execution |
 | "Done" is whatever the model claims | A required `_Verified:` note, optionally backed by captured runtime evidence |
-| Implementation and review share the same context | A fresh-context code-review pass runs after execution |
+| Implementation and review share the same context | A separate code-review turn — told to find problems, not confirm the work — runs after execution |
 | Change history is hard to reconstruct | Proposal, design, specs, tasks, exploration, review, and evidence accumulate as files |
 
 ## Design philosophy
@@ -81,7 +81,7 @@ A `/readyset` change moves through five stages — you only see the ones that st
 | **2. Explore** | Reads the real repo and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm. |
 | **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in Explore's findings. | Never skipped. |
 | **4. Review gate** | Approve, **Refine**, or **Discard**. Nothing executes without a look first. | Never skipped — the gate Readyset exists to enforce. |
-| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note, optionally backed by `readyset_verify` evidence. A fresh-context **code-review** pass runs before archiving. | Never skipped. |
+| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note, optionally backed by `readyset_verify` evidence. A separate **code-review** turn runs before archiving. | Never skipped. |
 
 **Refine** sends you back to Propose; a failed verification at Execute sends you back to the
 review gate — either way you land on a stage above, never off into an unrecoverable branch.
@@ -245,8 +245,8 @@ Picks a brainstorm, then depending on its status:
   of its exit code, stdout/stderr, and duration is persisted to `readyset/changes/<id>/evidence/`.
   The panel's **Runtime evidence** section lists those records and flags a **conflict** when a
   task is checked `[x]` but its latest evidence exited non-zero — surfaced passively, never
-  auto-blocking. Once every task is verifiably done, a separate **code review** turn runs (fresh
-  context, told to find problems) and writes `REVIEW.md`. Only then does Readyset offer to
+  auto-blocking. Once every task is verifiably done, a separate **code review** turn runs (told
+  to find problems, not confirm the work) and writes `REVIEW.md`. Only then does Readyset offer to
   archive — merging delta specs into `readyset/specs/` append-only, now warning explicitly if a
   delta held a MODIFIED/REMOVED requirement the merge couldn't apply.
 

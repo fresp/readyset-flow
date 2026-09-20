@@ -37,8 +37,8 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 - **Explore** greps the actual repo before anything gets proposed, instead of assuming.
 - **Propose** writes a proposal, design, specs, and tasks — grounded in what Explore found.
 - **Review** stops for your Approve / Refine / Discard. Nothing executes without a look.
-- **Execute** implements the tasks; each one needs a `_Verified:` note, and a fresh-context code
-  review runs before the change is archived.
+- **Execute** implements the tasks; each one needs a `_Verified:` note, and a separate
+  code-review turn runs before the change is archived.
 
 Already have a brainstorm sitting in `.ai/brainstorms/`? Run `/readyset` with no `--idea` and pick
 it — Grill is skipped, since the ambiguity's already resolved.
