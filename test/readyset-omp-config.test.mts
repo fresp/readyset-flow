@@ -8,9 +8,11 @@ import {
 	parseLanguageOverride,
 	parseModelOverride,
 	parseOmpDefaultModel,
+	parsePhaseModels,
 	parseYamlSubset,
 	readFallbackChain,
 	readFallbackModel,
+	readPhaseModels,
 	readPinnedModel,
 	readPreferredLanguage,
 } from "../src/lib/readyset-omp-config.ts";
@@ -275,6 +277,36 @@ await test("readFallbackModel (deprecated): still returns the chain's first entr
     model: "b",
     source: "readyset.model.fallbackChains in ~/.omp/agent/config.yml",
   });
+});
+
+await test("parsePhaseModels: reads readyset.model.phases keyed by phase", () => {
+  const raw = "readyset:\n  model:\n    default: big/main\n    phases:\n      explore: small/fast\n      Grill: small/fast\n";
+  assert.deepEqual(parsePhaseModels(raw), [
+    { phase: "explore", model: "small/fast" },
+    { phase: "grill", model: "small/fast" },
+  ]);
+});
+
+await test("parsePhaseModels: no phases key -> empty array", () => {
+  assert.deepEqual(parsePhaseModels("readyset:\n  model:\n    default: a\n"), []);
+});
+
+await test("parsePhaseModels: non-mapping phases value -> empty array", () => {
+  assert.deepEqual(parsePhaseModels("readyset:\n  model:\n    phases: just-a-string\n"), []);
+});
+
+await test("readPhaseModels: reads a real file and tags the source", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  model:\n    default: a\n    phases:\n      explore: b\n", "utf8");
+  assert.deepEqual(await readPhaseModels(configPath), {
+    entries: [{ phase: "explore", model: "b", source: "readyset.model.phases in ~/.omp/agent/config.yml" }],
+  });
+});
+
+await test("readPhaseModels: missing file -> empty entries, never throws", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  assert.deepEqual(await readPhaseModels(join(dir, "does-not-exist.yml")), { entries: [] });
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

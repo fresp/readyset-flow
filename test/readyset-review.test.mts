@@ -1734,6 +1734,19 @@ await test("parseReadysetArgs reads the raw argument string the way omp hands it
   assert.equal(parse('--model "a b"').model, "a b", "a quoted value stays one token");
   assert.equal(parse("--model").model, undefined, "a flag with no value is undefined, not a crash");
   assert.equal(parse("just some words").idea, undefined, "plain words are not mistaken for an idea");
+
+  const phases = parse("--model big/main --phase-model explore=small/fast --phase-model grill=small/fast");
+  assert.equal(phases.model, "big/main", "the run pin is unchanged");
+  assert.deepEqual(
+    phases.phaseModels,
+    [
+      { phase: "explore", model: "small/fast" },
+      { phase: "grill", model: "small/fast" },
+    ],
+    "--phase-model is repeatable and keeps phase names",
+  );
+  assert.equal(parse("--phase-model typo").phaseModels, undefined, "a flag with no = is ignored, not a crash");
+  assert.equal(parse("--phase-model Explore=small/fast").phaseModels?.[0].phase, "explore", "phase names are lowercased");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

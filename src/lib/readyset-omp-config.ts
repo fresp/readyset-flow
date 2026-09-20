@@ -180,6 +180,21 @@ export function parseModelOverride(raw: string): string | undefined {
 	return typeof nested === "string" && nested !== "" ? nested : undefined;
 }
 
+/** Readyset's per-phase model overrides: `readyset.model.phases.<phase>` where phase is one
+ *  of `grill|explore|propose|apply|review` (case-insensitive). Returns the entries found;
+ *  empty when none are set. Unknown phase names are kept — the caller warns rather than
+ *  silently changing behavior. */
+export function parsePhaseModels(raw: string): { phase: string; model: string }[] {
+	const doc = parseYamlSubset(raw);
+	const phases = getPath(doc, "readyset.model.phases");
+	if (typeof phases !== "object" || phases === null || Array.isArray(phases)) return [];
+	const out: { phase: string; model: string }[] = [];
+	for (const [phase, model] of Object.entries(phases as Record<string, YamlValue>)) {
+		if (typeof model === "string" && model !== "") out.push({ phase: phase.toLowerCase(), model });
+	}
+	return out;
+}
+
 /** Readyset's own fallback chain: `readyset.model.fallbackChains` (an ordered list, current
  *  shape) or a bare `readyset.fallbackModel: <spec>` (legacy shape — treated as a one-element
  *  chain). Returns every entry found; empty when neither is set. */
@@ -271,6 +286,21 @@ export async function readFallbackChain(configPath: string = OMP_CONFIG_PATH): P
 export async function readFallbackModel(configPath: string = OMP_CONFIG_PATH): Promise<ResolvedModelDefault> {
 	const { chain, source } = await readFallbackChain(configPath);
 	return { model: chain[0], source: chain.length > 0 ? source : undefined };
+}
+
+export interface ResolvedPhaseModels {
+	/** Every per-phase override found, each tagged with where it came from. */
+	entries: { phase: string; model: string; source: string }[];
+}
+
+/** Reads `readyset.model.phases.<phase>` (or `configPath`, for tests) for per-phase model
+ *  overrides. Never throws — a missing file or missing key just means "no overrides". */
+export async function readPhaseModels(configPath: string = OMP_CONFIG_PATH): Promise<ResolvedPhaseModels> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { entries: [] };
+	return {
+		entries: parsePhaseModels(raw).map((e) => ({ ...e, source: "readyset.model.phases in ~/.omp/agent/config.yml" })),
+	};
 }
 
 export interface ResolvedLanguageDefault {

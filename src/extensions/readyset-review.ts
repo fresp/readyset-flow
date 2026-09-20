@@ -26,7 +26,7 @@ import {
 	scaffoldChange,
 	validateChange,
 } from "../lib/readyset-spec.ts";
-import { readFallbackChain, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
+import { readFallbackChain, readPhaseModels, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
 import {
 	ReviewSidebarOverlay,
 	type OverlaySection,
@@ -530,6 +530,73 @@ interface ReviewCtx {
  * attempt to duplicate that. `fallbackSource` labels the whole chain (it's read from one place
  * in config, or is a single `--fallback-model` flag value), not each entry individually.
  */
+/**
+ * Runs `fn` with a phase-specific model override for one labeled phase. The run's pinned model
+ * is captured from ctx.models.current() and restored afterward, so an override only affects the
+ * turns fired inside `fn`. An override that fails to pin warns and runs the phase on the pinned
+ * model instead — it is a cost optimization, never a reason to stop the run.
+ *
+ * Unknown phase labels are a caller bug, not a user typo: `phase` here is always one of the
+ * extension's own labels (grill|explore|propose|apply|review), so an unrecognized one throws
+ * rather than silently running the phase on the wrong model.
+ */
+export async function withPhaseModel<T>(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	phase: string,
+	overrides: Map<string, { model: string; source: string }>,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const knownPhases = ["grill", "explore", "propose", "apply", "review"];
+	if (!knownPhases.includes(phase)) {
+		throw new Error(`unknown phase "${phase}" — expected one of ${knownPhases.join("|")}`);
+	}
+	const override = overrides.get(phase);
+	if (!override) return fn();
+
+	const setModel = (pi as unknown as { setModel?: (spec: unknown) => unknown }).setModel?.bind(pi);
+	const models = ctx.models;
+	if (!setModel || !models?.current) {
+		ctx.ui.notify(
+			`Phase model "${override.model}" for ${phase} (from ${override.source}) was given, but this omp build doesn't expose pi.setModel/ctx.models.current — running ${phase} on the run's model.`,
+			"warning",
+		);
+		return fn();
+	}
+	const resolved = models.resolve ? models.resolve(override.model) : override.model;
+	if (resolved === undefined || resolved === null) {
+		ctx.ui.notify(
+			`Phase model "${override.model}" for ${phase} (from ${override.source}) didn't resolve to any available model — running ${phase} on the run's model.`,
+			"warning",
+		);
+		return fn();
+	}
+	const pinned = models.current();
+	let applied: unknown;
+	try {
+		applied = await setModel(resolved);
+	} catch {
+		applied = false;
+	}
+	if (applied === false) {
+		ctx.ui.notify(
+			`Phase model "${override.model}" for ${phase} (from ${override.source}) couldn't be applied (usually: no API key) — running ${phase} on the run's model.`,
+			"warning",
+		);
+		return fn();
+	}
+	ctx.ui.notify(`Phase model for ${phase}: "${override.model}" (from ${override.source}).`, "info");
+	try {
+		return await fn();
+	} finally {
+		try {
+			await setModel(pinned);
+		} catch {
+			ctx.ui.notify(`Couldn't restore the run model after the ${phase} phase — check /model if it looks off.`, "warning");
+		}
+	}
+}
+
 export async function withPinnedModel<T>(
 	pi: ExtensionAPI,
 	ctx: ReviewCtx,
@@ -1128,14 +1195,24 @@ async function classicGateSelect(
  * re-invoking the command either.
  *
  * Whenever `ctx.ui.custom` is available, the sidebar overlay opens automatically at the top of
- * every loop iteration — it IS the review gate, with Approve & Execute / Approve & Compact /
+ * every loop iteration — it IS the review gate, with Approve & Execute / Keep context /
  * Refine / Discard as CTAs baked into it, not a "Sidebar view" choice offered on a separate menu
  * the user had to pick first. `classicGateSelect` is the fallback for contexts without a real
- * TUI, and also covers the (rare) case where the overlay itself throws on open. Approve & Compact
- * runs `ctx.compact()` before falling through to the same Apply flow Approve & Execute uses —
- * see the "compact" branch below and `ReviewCtx.compact`'s doc comment.
+ * TUI, and also covers the (rare) case where the overlay itself throws on open. Approve &
+ * Execute runs `ctx.compact()` before falling through to the Apply flow — see the compact
+ * branch below and `ReviewCtx.compact`'s doc comment.
+ *
+ * `phaseModels` carries the run's per-phase model overrides (grill|explore|propose|apply|
+ * review); the Explore/Propose caller passes its own map, this loop passes the same map on
+ * for Refine/Apply/Code-review so an override covers its phase wherever that phase fires.
  */
-async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: BrainstormMeta, budget: TurnBudget): Promise<void> {
+async function reviewAndMaybeExecute(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	initial: BrainstormMeta,
+	budget: TurnBudget,
+	phaseModels: Map<string, { model: string; source: string }> = new Map(),
+): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
 
@@ -1188,12 +1265,14 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 				continue;
 			}
 			ctx.ui.notify(`Revising "${chosen.changeId}"...`, "info");
-			const refineFired = await spendTurn(
-				pi,
-				ctx,
-				budget,
-				"Refine",
-				refineTurnPrompt(chosen.changeId, feedback, snapshot.validated.issues.map((i) => `${i.file}: ${i.problem}`)),
+			const refineFired = await withPhaseModel(pi, ctx, "propose", phaseModels, () =>
+				spendTurn(
+					pi,
+					ctx,
+					budget,
+					"Refine",
+					refineTurnPrompt(chosen.changeId, feedback, snapshot.validated.issues.map((i) => `${i.file}: ${i.problem}`)),
+				),
 			);
 			if (!refineFired) return;
 			await appendContext(ctx.cwd, chosen.changeId, "Refine", `User feedback: ${feedback}`);
@@ -1211,7 +1290,9 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			activeVerifyChangeId = chosen.changeId;
 			let applyFired: boolean;
 			try {
-				applyFired = await spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId));
+				applyFired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
+					spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId)),
+				);
 			} finally {
 				activeVerifyChangeId = undefined;
 			}
@@ -1269,7 +1350,9 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			`Implementation complete: ${finalStatus?.done ?? "?"}/${finalStatus?.total ?? "?"} tasks. Running code review...`,
 			"info",
 		);
-		const reviewFired = await spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId));
+		const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
+			spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId)),
+		);
 		if (!reviewFired) return;
 		const reviewContent = await readReview(ctx.cwd, chosen.changeId);
 		await appendContext(
@@ -1633,6 +1716,16 @@ export interface ReadysetArgs {
 	model?: string;
 	fallbackModel?: string;
 	idea?: string;
+	/**
+	 * Per-phase model overrides: `[{ phase, model }]` where phase is one of
+	 * `grill|explore|propose|apply|review` (case-insensitive) and model is a spec in the
+	 * same format as `--model`. Resolution order per phase: `--phase-model` entry >
+	 * `readyset.model.phases.<phase>` in config > the run's pinned `--model`/default.
+	 * Grill+Explore ran on the strongest model by default and produced the worst
+	 * input-per-value ratio in the benchmark (39% of fresh input for research/Q&A); a
+	 * lighter model is usually fine there and cuts cost without touching quality.
+	 */
+	phaseModels?: { phase: string; model: string }[];
 }
 
 /**
@@ -1677,6 +1770,7 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 	if (current !== "") tokens.push(current);
 
 	const parsed: ReadysetArgs = { all: false, fast: false };
+	const phaseModels: { phase: string; model: string }[] = [];
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i];
 		if (token === "--all") parsed.all = true;
@@ -1684,12 +1778,24 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 		else if (token === "--lang") parsed.lang = tokens[i + 1];
 		else if (token === "--model") parsed.model = tokens[i + 1];
 		else if (token === "--fallback-model") parsed.fallbackModel = tokens[i + 1];
+		else if (token === "--phase-model") {
+			// `--phase-model <phase>=<spec>` (e.g. `--phase-model explore=cliproxy/glm-5.2`);
+			// repeatable, one phase per flag. Unknown phases are rejected at use time, not
+			// here, so a typo degrades to a warning rather than silently changing behavior.
+			const pair = tokens[i + 1] ?? "";
+			const eq = pair.indexOf("=");
+			if (eq > 0) {
+				phaseModels.push({ phase: pair.slice(0, eq).toLowerCase(), model: pair.slice(eq + 1) });
+				i++;
+			}
+		}
 		else if (token === "--idea") {
 			const rest = tokens.slice(i + 1).join(" ").trim();
 			if (rest !== "") parsed.idea = rest;
 			break;
 		}
 	}
+	if (phaseModels.length > 0) parsed.phaseModels = phaseModels;
 	return parsed;
 }
 
@@ -1806,6 +1912,12 @@ export default function (pi: ExtensionAPI) {
 			// that invoked it. The original model is restored once this run finishes, whether it
 			// completes, stops early (Discard, budget exhausted), or throws. Flag wins over config.
 			//
+			// --phase-model <phase>=<spec> (repeatable) or readyset.model.phases.<phase> in config
+			// overrides the pinned model for one phase only (grill|explore|propose|apply|review).
+			// The run's pinned model is restored between phases. An override that fails to pin
+			// warns and falls back to the run default — a phase model is a cost optimization, not
+			// a correctness requirement, so it must never stop the run.
+			//
 			// --fallback-model <spec> (a single spec, not a chain) or readyset.model.fallbackChains
 			// (an ordered list, tried in turn until one pins — legacy readyset.fallbackModel still
 			// works too, as a one-element chain) is tried if pinning the resolved model above fails
@@ -1816,6 +1928,15 @@ export default function (pi: ExtensionAPI) {
 			const pinnedModel = modelFromFlag ?? resolvedConfigModel?.model;
 			const pinnedModelSource = modelFromFlag ? "--model flag" : (resolvedConfigModel?.source ?? "");
 
+			const resolvedConfigPhases = await readPhaseModels();
+			const phaseModelOverrides = new Map<string, { model: string; source: string }>();
+			for (const e of resolvedConfigPhases.entries) {
+				if (!phaseModelOverrides.has(e.phase)) phaseModelOverrides.set(e.phase, { model: e.model, source: e.source });
+			}
+			for (const e of parsedArgs.phaseModels ?? []) {
+				phaseModelOverrides.set(e.phase, { model: e.model, source: "--phase-model flag" });
+			}
+
 			const fallbackFromFlag = parsedArgs.fallbackModel;
 			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
 			const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
@@ -1823,7 +1944,7 @@ export default function (pi: ExtensionAPI) {
 
 			await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
 				if (isProposed(chosen.status)) {
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides);
 					return;
 				}
 
@@ -1874,7 +1995,9 @@ export default function (pi: ExtensionAPI) {
 				const submodules = await listSubmodules(ctx.cwd);
 				ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
 				const exploreBudget = startPhaseBudget();
-				const exploreFired = await spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules));
+				const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
+					spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
+				);
 				if (!exploreFired) return;
 
 				const explored = await hasExploration(ctx.cwd, chosen.changeId);
@@ -1904,7 +2027,9 @@ export default function (pi: ExtensionAPI) {
 
 				ctx.ui.notify(`Proposing change "${chosen.changeId}" — this can take a while...`, "info");
 				const proposeBudget = startPhaseBudget();
-				const proposeFired = await spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen));
+				const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
+					spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen)),
+				);
 				if (!proposeFired) return;
 				// Gate invariant (R2): a planning turn may only leave planning artifacts. The
 				// T11/T12 benchmark runs implemented the change out of the Propose turn and
@@ -1965,7 +2090,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides);
 		});
 		},
 	});
