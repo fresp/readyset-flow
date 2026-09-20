@@ -1124,6 +1124,39 @@ await test("Sidebar overlay opens automatically as the review gate when ctx.ui.c
   assert.equal(fakeUiWrap.selectQueue.length, 0, "nothing left unconsumed in the queue -- the run ended on the overlay's own cancel, not a follow-up Discard pick");
 });
 
+await test("RPC host: ui.custom exists but is a stub -- the review gate falls back to the select menu instead of silently discarding", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-17-rpc-gate.md", {
+    title: "RPC Gate",
+    status: "proposed",
+    created: "2026-01-17",
+    change_id: "rpc-gate",
+  });
+  const dir = join(cwd, "readyset", "changes", "rpc-gate");
+  await mkdir(dir, { recursive: true });
+  await writeFile(dir + "/proposal.md", "## Why\n\nrpc gate proposal\n", "utf8");
+  await writeFile(dir + "/tasks.md", "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  let customCalls = 0;
+  // Exactly what omp's RPC host does (rpc-mode.ts: "Custom UI not supported in RPC mode").
+  const ui = { ...fakeUiWrap.ui, async custom() { customCalls++; return undefined; } };
+
+  fakeUiWrap.selectQueue.push("2026-01-17 · RPC Gate"); // picker
+  fakeUiWrap.selectQueue.push("Discard"); // the classic gate menu must be what's shown
+
+  const ctx = { cwd, mode: "rpc", ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(customCalls, 0, "ui.custom must not be used outside the TUI");
+  assert.equal(fakeUiWrap.selectPrompts.length, 2, "picker + the classic review gate menu");
+  assert.match(fakeUiWrap.selectPrompts[1], /^Review change "rpc-gate"/);
+  assert.equal(fakeUiWrap.selectQueue.length, 0);
+});
+
 await test("--idea skips the picker entirely and fires a grill turn as the first message (not fire-and-wait)", async () => {
   const cwd = await freshRepo();
 

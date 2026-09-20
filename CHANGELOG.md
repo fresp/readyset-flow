@@ -6,6 +6,20 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.11.2
+
+- **The review gate was silently discarded under omp's RPC host.** Readyset opened its review
+  overlay whenever `ctx.ui.custom` existed as a function. omp's RPC mode does define it, but only
+  as a stub that resolves `undefined` straight away ("Custom UI not supported in RPC mode"), and
+  Readyset read that `undefined` as Esc, i.e. Discard. So a `/readyset` driven over RPC (an editor
+  integration, an orchestrator, a benchmark harness) wrote proposal/design/specs/tasks and then
+  stopped without ever asking for approval or executing anything. The overlay is now used only
+  when `ctx.mode` is `"tui"` (or absent on older omp builds, which were TUI-only); every other
+  host gets the classic Approve & Execute / Approve & Compact / Refine / Discard menu through
+  `ctx.ui.select`, which RPC forwards to the client. Found by running `/readyset` headless in an
+  end-to-end benchmark against omp 18.2.0; covered by a new test that stubs `ui.custom` exactly as
+  the RPC host does.
+
 ## 0.11.1
 
 Host-integration fixes — all of these were invisible to the test suite as it stood, because the

@@ -409,6 +409,8 @@ function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: st
 
 interface ReviewCtx {
 	cwd: string;
+	/** Host run mode ("tui" | "rpc" | "json" | "print"). Custom overlays are TUI-only -- see reviewAndMaybeExecute. */
+	mode?: string;
 	ui: {
 		select: (prompt: string, options: ExtensionUISelectOption[], opts?: { helpText?: string }) => Promise<string | undefined>;
 		input?: (prompt: string) => Promise<string | undefined>;
@@ -1060,7 +1062,12 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 			? `${snapshot.counted.done}/${snapshot.counted.total} tasks ticked`
 			: "tasks.md not found yet";
 
-		const hasSidebar = typeof ctx.ui.custom === "function";
+		// `ui.custom` existing is not enough: omp's RPC host implements it as a stub that resolves
+		// `undefined` immediately ("Custom UI not supported in RPC mode"), which this loop would read
+		// as Esc == Discard -- silently throwing the gate away before the user ever sees it. omp's own
+		// ExtensionContext docs say to guard custom components with `mode === "tui"`. `mode` is
+		// optional here only for older omp builds that don't expose it (those were TUI-only anyway).
+		const hasSidebar = typeof ctx.ui.custom === "function" && (ctx.mode === undefined || ctx.mode === "tui");
 		let choice: ReviewOverlayResult;
 		if (hasSidebar) {
 			try {
