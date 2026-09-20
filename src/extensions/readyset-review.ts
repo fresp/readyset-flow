@@ -16,6 +16,7 @@ import {
 	archiveChange,
 	changePaths,
 	checkPhaseViolations,
+	checkScope,
 	checkTaskVerification,
 	ensureReadysetRoot,
 	findSpecFiles,
@@ -101,8 +102,13 @@ interface OverlayKeybindings {
 
 const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (create directories as needed):
 
-- proposal.md — must have a "## Why" section (1-2 paragraphs on the problem) and a
-  "## What Changes" section (bullet list of concrete changes).
+- proposal.md — must have a "## Why" section (1-2 paragraphs on the problem), a
+  "## What Changes" section (bullet list of concrete changes), and a "## Files This Change
+  Will Touch" section: an exhaustive repo-relative path list of every existing file Apply is
+  allowed to modify plus every new file it may create. This is the scope contract the gate
+  and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
+  arm's, and T12 grew an unasked-for 160-line bench file). A file not on this list may not
+  be written during Apply without asking first.
 - design.md — "## Context", "## Goals / Non-Goals", "## Decisions" (numbered, each with
   Rationale and Alternatives considered), "## Risks / Trade-offs".
 - specs/<capability-slug>/spec.md — "## Purpose", then "## ADDED Requirements" with one
@@ -860,6 +866,7 @@ interface ReviewSnapshot {
 	counted: { done: number; total: number } | undefined;
 	validated: Awaited<ReturnType<typeof validateChange>>;
 	verification: Awaited<ReturnType<typeof checkTaskVerification>>;
+	scope: Awaited<ReturnType<typeof checkScope>>;
 	explored: boolean;
 	reviewed: boolean;
 	/** Runtime evidence (readyset_verify) — independent of, and never reconciled with,
@@ -876,6 +883,9 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const progress = await getProgress(ctx.cwd, chosen.changeId);
 	const validated = await validateChange(ctx.cwd, chosen.changeId);
 	const verification = await checkTaskVerification(ctx.cwd, chosen.changeId);
+	// Scope is checked against the working tree, not the plan: anything the repo already
+	// shows as changed that the contract doesn't name is flagged here, in the gate.
+	const scope = await checkScope(ctx.cwd, chosen.changeId, await changedPathsSinceBaseline(ctx.cwd).catch(() => []));
 	const explored = await hasExploration(ctx.cwd, chosen.changeId);
 	const review = await readReview(ctx.cwd, chosen.changeId);
 	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
@@ -884,6 +894,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
 		validated,
 		verification,
+		scope,
 		explored,
 		reviewed: !!review,
 		evidenceTotal,
@@ -1149,6 +1160,11 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 			? `runtime evidence: ${snapshot.evidenceTotal} record(s)${snapshot.evidenceConflicts.length > 0 ? ` -- ${snapshot.evidenceConflicts.length} conflict(s): task done but evidence shows failure` : ""}`
 			: "runtime evidence: none",
 		snapshot.reviewed ? "code review: done — see REVIEW.md" : "code review: not run yet",
+		snapshot.scope.noContract
+			? "scope: no 'Files This Change Will Touch' contract in proposal.md — scope unknown"
+			: snapshot.scope.outside.length > 0
+				? `scope: OUT OF SCOPE already changed in the tree: ${snapshot.scope.outside.join(", ")}`
+				: "scope: working tree matches the contract",
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -1250,7 +1266,10 @@ async function reviewAndMaybeExecute(
 		// "Approve & Execute, keep context" skips the compact for the case where discussion
 		// nuance didn't make it into the artifacts. A missing ctx.compact (older omp build)
 		// or a failed compaction degrades to plain Approve & Execute rather than blocking
-		// the user from proceeding at all. "compact" is kept as an accepted result for
+		// the user from proceeding at all. A scope mismatch (out-of-contract files already
+		// changed in the tree) likewise warns, never blocks: it is shown in the gate panel
+		// so approval happens with eyes open, not stopped for work the user can see. "compact"
+		// is kept as an accepted result for
 		// older sidebar builds that still return it (defensive; the current overlay no
 		// longer offers it).
 		if (choice === "approve" || choice === "compact") {

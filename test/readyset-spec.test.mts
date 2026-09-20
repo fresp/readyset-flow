@@ -15,6 +15,8 @@ import {
   readContext,
   checkTaskVerification,
   checkPhaseViolations,
+  readScopeContract,
+  checkScope,
   readReview,
   taskCheckedStates,
 } from "../src/lib/readyset-spec.ts";
@@ -446,6 +448,49 @@ await test("checkPhaseViolations: a file with the change id as a prefix is still
   // "readyset/changes/my-change-evil/x.md" must not pass the prefix check for "my-change"
   const violations = await checkPhaseViolations(cwd, "my-change", ["readyset/changes/my-change-evil/x.md"]);
   assert.equal(violations.length, 1);
+});
+
+await test("readScopeContract: parses the Files section, bullets and bare paths", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "scoped");
+  await writeFile(
+    paths.proposal,
+    ["# P", "", "## Why", "", "x", "", "## Files This Change Will Touch", "", "- src/a.ts", "test/b.test.mjs", "- prose without a path", "", "## What Changes", "", "- y"].join("\n"),
+    "utf8",
+  );
+  const contract = await readScopeContract(cwd, "scoped");
+  assert.deepEqual(contract.files, ["src/a.ts", "test/b.test.mjs"]);
+});
+
+await test("readScopeContract: absent section -> no contract, not an empty allowlist", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "unscoped");
+  await writeFile(paths.proposal, "# P\n\n## Why\n\nx\n", "utf8");
+  const contract = await readScopeContract(cwd, "unscoped");
+  assert.equal(contract.files, undefined);
+});
+
+await test("checkScope: in-contract paths and the workspace dirs pass; the rest is outside", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "check");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- src/a.ts\n", "utf8");
+  const result = await checkScope(cwd, "check", [
+    "src/a.ts",
+    "readyset/changes/check/proposal.md",
+    ".ai/brainstorms/x.md",
+    "src/unlisted.ts",
+    "bench/scratch.mjs",
+  ]);
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.outside, ["src/unlisted.ts", "bench/scratch.mjs"]);
+});
+
+await test("checkScope: no contract -> noContract true, never a silent pass", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "nocontract");
+  const result = await checkScope(cwd, "nocontract", ["src/a.ts"]);
+  assert.equal(result.noContract, true);
+  assert.deepEqual(result.outside, []);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

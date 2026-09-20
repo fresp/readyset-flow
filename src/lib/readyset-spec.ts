@@ -208,6 +208,73 @@ export interface ValidateResult {
 	issues: ValidationIssue[];
 }
 
+export interface ScopeContract {
+	/** Repo-relative paths from the "## Files This Change Will Touch" section, or undefined when the section is absent. */
+	files: string[] | undefined;
+	/** Raw section body, for display in the gate. */
+	raw: string | undefined;
+}
+
+/**
+ * Reads the scope contract from proposal.md's "## Files This Change Will Touch" section. A
+ * bullet or plain line naming a repo-relative path counts; prose lines that name no path do
+ * not. Returns `files: undefined` when the section is absent entirely (older changes, or a
+ * Propose turn that predates the contract) — callers treat that as "no contract", never as
+ * "everything allowed".
+ */
+export async function readScopeContract(cwd: string, changeId: string): Promise<ScopeContract> {
+	const paths = changePaths(cwd, changeId);
+	const raw = await readFile(paths.proposal, "utf8").catch(() => undefined);
+	if (raw === undefined) return { files: undefined, raw: undefined };
+	const match = raw.match(/^##[ \t]*Files This Change Will Touch[ \t]*\r?$/im);
+	if (!match || match.index === undefined) return { files: undefined, raw: undefined };
+	const rest = raw.slice(match.index + match[0].length);
+	const nextHeading = rest.match(/^##[ \t]/m);
+	const body = (nextHeading && nextHeading.index !== undefined ? rest.slice(0, nextHeading.index) : rest).trim();
+	if (!body) return { files: [], raw: body };
+	const files: string[] = [];
+	for (const line of body.split(/\r?\n/)) {
+		// Bullet ("- src/x.ts") or bare path ("src/x.ts"); strip inline commentary after " -- ".
+		const stripped = line
+			.replace(/^\s*[-*+]\s+/, "")
+			.replace(/\s+--\s+.*$/, "")
+			.trim()
+			.replace(/^[`'"]+|[`'".,;:]+$/g, "");
+		if (!stripped || /\s/.test(stripped)) continue;
+		if (/^(src|test|tests|bin|examples|lib|docs|scripts|assets|resources|config)\//.test(stripped) || /^[\w.-]+\.(mjs|js|ts|mts|json|md|ya?ml|mjs)$/.test(stripped)) {
+			files.push(stripped.replace(/^\.\//, ""));
+		}
+	}
+	return { files, raw: body };
+}
+
+export interface ScopeCheck {
+	/** Repo-relative paths outside the contract. Empty when everything is in scope. */
+	outside: string[];
+	/** True when there is no contract at all (section absent) — not a pass, an unknown. */
+	noContract: boolean;
+}
+
+/**
+ * Checks changed repo paths against the scope contract. Paths under readyset/ itself (the
+ * change's own artifacts) and .ai/brainstorms/ are always in scope — they are the planning
+ * workspace, not product code. Everything else must be named in the contract; an absent
+ * contract is reported as noContract, never silently treated as a pass.
+ */
+export async function checkScope(cwd: string, changeId: string, changedPaths: string[]): Promise<ScopeCheck> {
+	const contract = await readScopeContract(cwd, changeId);
+	if (contract.files === undefined) return { outside: [], noContract: true };
+	const allowed = new Set(contract.files.map((f) => join(cwd, f)));
+	const outside: string[] = [];
+	for (const rawPath of changedPaths) {
+		const abs = join(cwd, rawPath);
+		if (abs.startsWith(join(cwd, READYSET_ROOT) + sep)) continue;
+		if (abs.startsWith(join(cwd, ".ai", "brainstorms") + sep)) continue;
+		if (!allowed.has(abs)) outside.push(rawPath);
+	}
+	return { outside, noContract: false };
+}
+
 /** Every markdown file directly under specs/**\/spec.md (any capability, any depth). */
 /** Recursively finds every `spec.md` under a specs directory (`specs/<capability>/spec.md`,
  *  possibly nested deeper). Exported for callers that want to display or enumerate a change's
