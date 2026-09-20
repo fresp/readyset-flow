@@ -298,7 +298,12 @@ function codeReviewTurnPrompt(changeId: string): string {
 		"Write " +
 		paths.review +
 		" covering: (1) does the implementation actually match every requirement's WHEN/THEN scenarios, or does it narrow, " +
-		"skip, or half-implement any of them; (2) are the _Verified: notes credible — do they describe something that would " +
+		"skip, or half-implement any of them — and check this against the BEHAVIOR (run the code, read the diff, " +
+		"exercise the endpoint), never against the suite the Apply turn itself wrote: a test that asserts the " +
+		"implementation's own wrong behavior proves nothing (a real case: a test that locked in " +
+		"`process.emitWarning(msg, { code })` without `type: 'DeprecationWarning'`, asserting the bug). " +
+		"Distrust any test whose expected value could only have come from the implementation under review — " +
+		"re-derive the expectation from the spec scenario, not from the code; (2) are the _Verified: notes credible — do they describe something that would " +
 		"actually catch a failure, or are they vague/self-serving (e.g. 'looks correct' is not a verification); (3) any " +
 		"correctness bug, edge case, or regression risk you can see in the touched files, whether or not tasks.md " +
 		"mentioned it. Structure it as a findings list; if you genuinely find nothing, say so plainly rather than padding " +
