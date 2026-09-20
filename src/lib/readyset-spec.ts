@@ -219,15 +219,33 @@ export interface DirtyBaseline {
 /** Marker line that opens the baseline entry inside CONTEXT.md. */
 export const BASELINE_MARKER = "<!-- readyset-baseline-dirty -->";
 
+/** Opening fence the writer uses for the baseline JSON, and the closing fence it pairs with. */
+const BASELINE_FENCE_OPEN = "```json";
+const BASELINE_FENCE_CLOSE = "```";
+
+/**
+ * Reads the baseline out of CONTEXT.md, scoped to the fence the writer itself created.
+ *
+ * Deliberately NOT "first `{` to last `}` in the rest of the file": CONTEXT.md is append-only
+ * and the baseline is written once, before Explore even runs — every later phase entry lands
+ * *after* the marker, and the Refine branch appends raw user feedback verbatim. A `}` in that
+ * feedback (e.g. "make it return `{status: 'ok'}`") would become the outer brace, the slice
+ * would span unrelated text, JSON.parse would throw, and readDirtyBaseline would silently
+ * fall back to an empty set — quietly reverting to the pre-04cf4bb false-positive bug for the
+ * rest of the run. Parsing between the fence markers is immune to whatever is appended later.
+ */
 function parseBaselineEntry(raw: string): DirtyBaseline | undefined {
 	const idx = raw.indexOf(BASELINE_MARKER);
 	if (idx === -1) return undefined;
 	const after = raw.slice(idx + BASELINE_MARKER.length);
-	const start = after.indexOf("{");
-	const end = after.lastIndexOf("}");
-	if (start === -1 || end === -1 || end <= start) return undefined;
+	const fenceStart = after.indexOf(BASELINE_FENCE_OPEN);
+	if (fenceStart === -1) return undefined;
+	const bodyStart = fenceStart + BASELINE_FENCE_OPEN.length;
+	const fenceEnd = after.indexOf(BASELINE_FENCE_CLOSE, bodyStart);
+	if (fenceEnd === -1) return undefined;
+	const body = after.slice(bodyStart, fenceEnd).trim();
 	try {
-		const parsed: unknown = JSON.parse(after.slice(start, end + 1));
+		const parsed: unknown = JSON.parse(body);
 		if (parsed === null || typeof parsed !== "object") return undefined;
 		const paths = (parsed as { paths?: unknown }).paths;
 		const capturedAt = (parsed as { capturedAt?: unknown }).capturedAt;

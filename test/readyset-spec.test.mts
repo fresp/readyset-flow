@@ -576,5 +576,30 @@ await test("baseline entry survives inside CONTEXT.md without breaking context r
   assert.deepEqual([...(await readDirtyBaseline(cwd, "ctxbase"))], ["a.txt"]);
 });
 
+await test("baseline survives later CONTEXT.md content containing braces (e.g. Refine feedback)", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "braces");
+  // Real runtime order: baseline is captured right after scaffoldChange, before Explore even
+  // runs — every later entry lands after it.
+  await ensureDirtyBaseline(cwd, "braces", ["unrelated.txt"]);
+  // Simulates appendContext("Refine", `User feedback: ${feedback}`) where the feedback itself
+  // contains a brace — unsanitized user input in the actual code path.
+  await appendContext(cwd, "braces", "Refine", "User feedback: make it return {status: 'ok'}");
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "braces"))], ["unrelated.txt"]);
+});
+
+await test("baseline parse is scoped to its own fence, not the last brace in the file", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "fence");
+  await ensureDirtyBaseline(cwd, "fence", ["a.txt"]);
+  await appendContext(
+    cwd,
+    "fence",
+    "Propose",
+    "explored {nested: {deep: '{'}} and found } stray } braces",
+  );
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "fence"))], ["a.txt"]);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
