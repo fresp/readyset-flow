@@ -23,8 +23,12 @@ This is the detailed reference. For the two-minute version, see the [README](../
 
 ## Why "Readyset"
 
-The name is the point: a plan you can trust is anchored to the real state of the repo — real file
-contents, real commit hashes, real test runs — not assumptions. Readyset fuses three sources:
+The name is the point: a plan you can audit is anchored to the real state of the repo — real file
+contents, real commit hashes, real test runs — not assumptions. That is a claim about evidence,
+not about quality: two independent benchmarks measured Readyset's plans as no better grounded
+than a single read-only pass (grounding ~50% in blind judging, twice). What EXPLORATION.md
+provides is an auditable trail — every repo claim in proposal/design/specs/tasks should point
+back to a numbered exploration entry, so a reviewer can check each one. Readyset fuses three sources:
 
 - **omp `/plan`'s grounding discipline** — cite real files/line numbers/commit hashes, catch
   actual drift. The harshest habit of the three, and the easiest to skip under pressure — so it's
@@ -45,7 +49,7 @@ Prose is a request; a gate is a requirement.
 | Without a dedicated workflow | With Readyset |
 |---|---|
 | An idea can jump straight into implementation | Idea passes through Grill → Explore → Propose → Review → Execute |
-| Repo grounding depends on whatever the current turn checks | Explore is a dedicated phase, logged to `EXPLORATION.md` |
+| Repo grounding depends on whatever the current turn checks | Explore is a dedicated phase, logged to `EXPLORATION.md` — an auditable trail, not a quality guarantee (see "Why Readyset") |
 | Planning artifacts scatter across a chat | Each change gets its own `readyset/changes/<id>/` directory |
 | Review can be informal, or skipped under pressure | A review gate structurally separates proposal from execution |
 | "Done" is whatever the model claims | A required `_Verified:` note, optionally backed by captured runtime evidence |
