@@ -332,6 +332,38 @@ function splitRequirementBlocks(raw: string): RequirementBlock[] {
 }
 
 /**
+ * A THEN is observable when at least one of its lines names something checkable from outside
+ * the code: an exit code, stdout/stderr text, an HTTP status, a file's content, a command's
+ * real result — not a property of the source ("contains", "is inspected", "has no direct
+ * calls"). A real UC2 run shipped "WHEN src/registry.ts is inspected THEN it contains no
+ * direct filesystem calls" and the check passed it; no test or run could ever observe that.
+ * This is still structural (it matches signal words, it does not understand the requirement),
+ * so a vague-but-well-worded THEN can slip through — the bar is catching the uncheckable
+ * kind, not certifying the good kind.
+ */
+function hasObservableThen(body: string): boolean {
+	const lines = body.split(/\r?\n/);
+	let sawThen = false;
+	for (const line of lines) {
+		if (/\*\*WHEN\*\*/i.test(line)) sawThen = false;
+		if (/\*\*THEN\*\*/i.test(line)) sawThen = true;
+		if (!sawThen) continue;
+		const lower = line.toLowerCase();
+		if (
+			/\b(exit( code|s)?\b|exit\()/.test(lower) ||
+			/stdout|stderr|output\b/.test(lower) ||
+			/http\b|\bstatus\b|\b200\b|\b201\b|\b400\b|\b403\b|\b404\b|\b409\b|\b429\b|\b500\b|\b503\b/.test(lower) ||
+			/file\b|writes? to|creates?|deletes?|contains the line|matches\b/.test(lower) ||
+			/returns?\b|responds?\b|prints?\b|emits?\b|exits?\b|fails?\b|passes?\b|succeeds?\b|lists?\b/.test(lower) ||
+			/`[^`]+`\s*(is|are|equals?|contains?|shows?|prints?|returns?)/.test(line)
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Structural validation — not a real schema check (see file header), but scoped per
  * requirement rather than per file (see `splitRequirementBlocks`). Verifies:
  *   - proposal.md exists with a "## Why" and a "## What Changes" section
@@ -378,6 +410,13 @@ export async function validateChange(cwd: string, changeId: string): Promise<Val
 				const hasThen = /\*\*THEN\*\*/im.test(req.body);
 				if (!hasWhen || !hasThen) {
 					issues.push({ file: specFile, problem: `Requirement "${req.name}" has no WHEN/THEN scenario` });
+					continue;
+				}
+				if (!hasObservableThen(req.body)) {
+					issues.push({
+						file: specFile,
+						problem: `Requirement "${req.name}" has a THEN that no test or run could observe — describe an externally checkable behavior (exit code, stdout, HTTP status, file content), not a code property`,
+					});
 				}
 			}
 		}

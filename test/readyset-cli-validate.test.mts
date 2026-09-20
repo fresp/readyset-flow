@@ -48,7 +48,7 @@ await test("readyset-flow validate: passes (exit 0) for a structurally valid cha
 	await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
 	await writeFile(
 		join(dir, "specs", "cap", "spec.md"),
-		"## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** b\n",
+		"## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
 		"utf8",
 	);
 	await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");

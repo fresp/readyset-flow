@@ -88,7 +88,7 @@ await test("validateChange: full valid artifact passes", async () => {
   await mkdir(join(paths.specsDir, "my-capability"), { recursive: true });
   await writeFile(
     join(paths.specsDir, "my-capability", "spec.md"),
-    "## Purpose\n\nfoo\n\n## ADDED Requirements\n\n### Requirement: Does the thing\n\n#### Scenario: happy path\n\n- **WHEN** the user does X\n- **THEN** Y happens\n",
+    "## Purpose\n\nfoo\n\n## ADDED Requirements\n\n### Requirement: Does the thing\n\n#### Scenario: happy path\n\n- **WHEN** the user does X\n- **THEN** the command exits 0 and prints the result\n",
     "utf8",
   );
   await writeFile(paths.tasks, "## Tasks\n\n- [ ] 1.1 do the thing\n", "utf8");
@@ -124,7 +124,7 @@ await test("validateChange: one requirement with a scenario no longer hides a si
   await writeFile(
     join(paths.specsDir, "cap", "spec.md"),
     "## Purpose\n\nx\n\n## ADDED Requirements\n\n" +
-      "### Requirement: Has a scenario\n\n#### Scenario: ok\n\n- **WHEN** a\n- **THEN** b\n\n" +
+      "### Requirement: Has a scenario\n\n#### Scenario: ok\n\n- **WHEN** a\n- **THEN** the command exits 0\n\n" +
       "### Requirement: Missing its scenario\n\nnothing here but prose\n",
     "utf8",
   );
@@ -491,6 +491,46 @@ await test("checkScope: no contract -> noContract true, never a silent pass", as
   const result = await checkScope(cwd, "nocontract", ["src/a.ts"]);
   assert.equal(result.noContract, true);
   assert.deepEqual(result.outside, []);
+});
+
+await test("validateChange: inspection-only THEN is flagged as unobservable", async () => {
+  // The real UC2 miss: "WHEN src/registry.ts is inspected THEN it contains no direct
+  // filesystem calls" passed validation, but no test or run could ever observe it.
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "unobservable");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "cap"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n" +
+      "### Requirement: No fs in registry\n\n#### Scenario: code inspection\n\n- **WHEN** src/registry.ts is inspected\n- **THEN** it contains no direct filesystem calls\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "unobservable");
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.issues.some((i) => i.problem.includes('"No fs in registry"') && i.problem.includes("no test or run could observe")),
+    `expected an unobservable-THEN issue, got: ${JSON.stringify(result.issues)}`,
+  );
+});
+
+await test("validateChange: observable THENs still pass (exit, stdout, status, file)", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "observable");
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "cap"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n" +
+      "### Requirement: Fails loud\n\n#### Scenario: bad input\n\n- **WHEN** the flag is missing\n- **THEN** the command exits 2 and prints usage to stderr\n\n" +
+      "### Requirement: Writes the file\n\n#### Scenario: happy path\n\n- **WHEN** the sync runs\n- **THEN** `state.json` is created with the new record\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "observable");
+  assert.deepEqual(result.issues, []);
+  assert.equal(result.ok, true);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
