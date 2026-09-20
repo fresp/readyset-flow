@@ -135,27 +135,27 @@ await test("cancel (Esc) still works even though PageUp/PageDown are checked fir
 	assert.ok(cancelled, "Esc should still close the overlay");
 });
 
-await test("renders a CTA bar with Approve/Approve & Compact/Refine/Discard and the task summary, above the nav hint", () => {
+await test("renders a CTA bar with Approve/Keep context/Refine/Discard and the task summary, above the nav hint", () => {
 	const lines = renderSidebarLayout("Title", sections(), 0, 0, 100, 20, "7/9 tasks ticked", "sections", 0, identity, identity, identity);
 	const ctaLine = lines.at(-2);
 	assert.ok(ctaLine?.includes("Approve & Execute"), "CTA bar should show Approve & Execute");
 	assert.ok(ctaLine?.includes("7/9 tasks ticked"), "CTA bar should include the live task summary");
-	assert.ok(ctaLine?.includes("Approve & Compact"), "CTA bar should show Approve & Compact");
+	assert.ok(ctaLine?.includes("Keep context"), "CTA bar should show Keep context");
 	assert.ok(ctaLine?.includes("Refine"), "CTA bar should show Refine");
 	assert.ok(ctaLine?.includes("Discard"), "CTA bar should show Discard");
 	assert.ok(lines.at(-1)?.includes("Esc cancel"), "nav hint stays on its own line below the CTA bar");
 });
 
-await test("A/C/R/D keystrokes act as the sidebar's own CTAs -- approve/compact/refine/discard -- without going through a select() menu", () => {
+await test("A/K/R/D keystrokes act as the sidebar's own CTAs -- approve/keep-context/refine/discard -- without going through a select() menu", () => {
 	const noKeybindings = { matches: () => false } as any;
 
 	let resultA: unknown;
 	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultA = r)).handleInput("a");
 	assert.equal(resultA, "approve");
 
-	let resultC: unknown;
-	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultC = r)).handleInput("c");
-	assert.equal(resultC, "compact");
+	let resultK: unknown;
+	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultK = r)).handleInput("k");
+	assert.equal(resultK, "keep-context");
 
 	let resultR: unknown;
 	new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "0/1 tasks ticked", (r) => (resultR = r)).handleInput("R");
@@ -197,8 +197,8 @@ await test("Left/Right cycle the highlighted CTA (with wraparound) once focus is
 	const overlay = new ReviewSidebarOverlay(fakeTheme, noKeybindings, "Title", sections(), "3/5 tasks ticked", () => {});
 	overlay.handleInput("\t"); // focus the CTA bar (starts on Approve)
 
-	overlay.handleInput("\x1b[C"); // Right -> Approve & Compact
-	assert.ok(overlay.render(100).at(-2)?.includes("\u203a [C] Approve & Compact"));
+	overlay.handleInput("\x1b[C"); // Right -> Keep context
+	assert.ok(overlay.render(100).at(-2)?.includes("\u203a [K] Keep context"));
 
 	overlay.handleInput("\x1b[C"); // Right -> Refine
 	assert.ok(overlay.render(100).at(-2)?.includes("\u203a [R] Refine"));
@@ -219,7 +219,7 @@ await test("Enter confirms whichever CTA is highlighted, acting as a real select
 	const overlay = new ReviewSidebarOverlay(fakeTheme, confirmOnly, "Title", sections(), "3/5 tasks ticked", (r) => (result = r));
 
 	overlay.handleInput("\t"); // focus the CTA bar (Approve)
-	overlay.handleInput("\x1b[C"); // Right -> Approve & Compact
+	overlay.handleInput("\x1b[C"); // Right -> Keep context
 	overlay.handleInput("\x1b[C"); // Right -> Refine
 	overlay.handleInput("some-enter-byte-sequence"); // stands in for the real Enter sequence; the stub matches by name, not bytes
 

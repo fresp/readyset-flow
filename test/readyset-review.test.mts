@@ -1105,8 +1105,8 @@ await test("Sidebar overlay opens automatically as the review gate when ctx.ui.c
       assert.ok(Array.isArray(rendered) && rendered.length > 0, "overlay factory should produce a real Component with render()");
       assert.ok(rendered.some(l => l.includes("Proposal")), "overlay should include the Proposal section heading");
       assert.ok(
-        rendered.some(l => l.includes("Approve & Execute") && l.includes("Approve & Compact") && l.includes("Refine") && l.includes("Discard")),
-        "overlay should render its own Approve/Approve & Compact/Refine/Discard CTA bar",
+        rendered.some(l => l.includes("Approve & Execute") && l.includes("Keep context") && l.includes("Refine") && l.includes("Discard")),
+        "overlay should render its own Approve/Keep context/Refine/Discard CTA bar",
       );
       overlay.handleInput?.("\x1b");
       return resolved;
@@ -1484,7 +1484,7 @@ await test("readyset_ask: round cap is enforced in code -- stops opening the dia
   assert.equal(askDialogCallCount, callsAtCap, "askDialog should not be called again once the cap is hit");
 });
 
-await test("Approve & Compact calls ctx.compact() with internalGuidance + suppressContinuation before Apply, same destination as Approve & Execute", async () => {
+await test("Approve & Execute compacts first: ctx.compact() with internalGuidance + suppressContinuation before Apply", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-20-compact.md", {
     title: "Compact Test",
@@ -1502,7 +1502,7 @@ await test("Approve & Compact calls ctx.compact() with internalGuidance + suppre
   const fakeUiWrap = makeFakeUi();
 
   fakeUiWrap.selectQueue.push("2026-01-20 · Compact Test"); // pick
-  fakeUiWrap.selectQueue.push("Approve & Compact");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
   fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
 
   // Apply turn effect
@@ -1537,12 +1537,57 @@ await test("Approve & Compact calls ctx.compact() with internalGuidance + suppre
   assert.match(fakePiWrap.calls[1].prompt, /Critically review the implementation of Readyset change "compact-test"/);
 });
 
-await test("Approve & Compact degrades to a plain Approve & Execute when ctx.compact isn't available", async () => {
+await test("Approve & Execute, keep context skips compact but still runs Apply and Code review", async () => {
   const cwd = await freshRepo();
-  await writeBrainstorm(cwd, "2026-01-21-nocompact.md", {
-    title: "No Compact Test",
+  await writeBrainstorm(cwd, "2026-01-21-keepctx.md", {
+    title: "Keep Context Test",
     status: "proposed",
     created: "2026-01-21",
+    change_id: "keep-context-test",
+  });
+  const dir = join(cwd, "readyset", "changes", "keep-context-test");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nkeep context test\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-01-21 · Keep Context Test"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  // With a compact-capable ctx, "keep context" must NOT call it — but Apply/Code review fire.
+  const compactCalls: unknown[] = [];
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    async compact(opts: unknown) {
+      compactCalls.push(opts);
+    },
+  };
+  await handler("", ctx);
+
+  assert.equal(compactCalls.length, 0, "keep-context must not compact");
+  assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire");
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "keep-context-test"/);
+});
+
+await test("Approve & Execute degrades to plain execution when ctx.compact isn't available", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-22-nocompact.md", {
+    title: "No Compact Test",
+    status: "proposed",
+    created: "2026-01-22",
     change_id: "no-compact-test",
   });
   const dir = join(cwd, "readyset", "changes", "no-compact-test");
@@ -1554,8 +1599,8 @@ await test("Approve & Compact degrades to a plain Approve & Execute when ctx.com
   const handler = await loadHandler(fakePiWrap.pi);
   const fakeUiWrap = makeFakeUi();
 
-  fakeUiWrap.selectQueue.push("2026-01-21 · No Compact Test"); // pick
-  fakeUiWrap.selectQueue.push("Approve & Compact");
+  fakeUiWrap.selectQueue.push("2026-01-22 · No Compact Test"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
   fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
 
   fakePiWrap.queueEffect(async () => {
@@ -1573,7 +1618,7 @@ await test("Approve & Compact degrades to a plain Approve & Execute when ctx.com
     fakeUiWrap.notifications.some((n) => /Compact isn't available in this context/.test(n.message)),
     "should warn that it's proceeding without compacting",
   );
-  assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire, same as a plain Approve & Execute");
+  assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "no-compact-test"/);
 });
 

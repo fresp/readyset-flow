@@ -227,6 +227,35 @@ function applyTurnPrompt(changeId: string): string {
  * them isn't load-bearing for Apply, which re-reads those files from disk regardless of what's
  * left in context (see `applyTurnPrompt`).
  */
+
+/**
+ * Runs ctx.compact() before Apply with the Readyset-specific internal guidance. The benchmark
+ * showed Explore/Propose context dominating Apply and Review token cost (T01: max context
+ * 154k, ~76% of all tokens as cache reads), and everything those phases produced is already
+ * persisted under readyset/changes/<id>/ — so compacting here is safe (Apply re-reads the
+ * artifacts from disk), and skipping it just pays for the same history twice. A missing
+ * ctx.compact (older omp build) or a failed compaction degrades to plain Approve & Execute
+ * rather than blocking the user from proceeding at all.
+ */
+async function compactBeforeApply(ctx: ReviewCtx, changeId: string): Promise<void> {
+	if (typeof ctx.compact !== "function") {
+		ctx.ui.notify("Compact isn't available in this context — approving without it.", "warning");
+		return;
+	}
+	ctx.ui.notify(`Compacting context before executing "${changeId}"...`, "info");
+	try {
+		await ctx.compact({
+			internalGuidance: compactBeforeExecuteGuidance(changeId),
+			suppressContinuation: true,
+		});
+	} catch (err) {
+		ctx.ui.notify(
+			`Compact failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.`,
+			"warning",
+		);
+	}
+}
+
 function compactBeforeExecuteGuidance(changeId: string): string {
 	const paths = changePaths("", changeId);
 	return (
@@ -1070,8 +1099,8 @@ async function classicGateSelect(
 ): Promise<ReviewOverlayResult> {
 	for (;;) {
 		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
-			{ label: "Approve & Execute", description: `implement per tasks.md, then report progress — ${taskSummary}` },
-			{ label: "Approve & Compact", description: "compact context first (proposal/design/specs/tasks are already on disk), then implement" },
+			{ label: "Approve & Execute", description: `compact context first, then implement per tasks.md — ${taskSummary}` },
+			{ label: "Approve & Execute, keep context", description: "implement without compacting (keep the full Explore/Propose discussion in context)" },
 			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
 			{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" },
 			{ label: "Discard", description: "leave as proposed, do nothing" },
@@ -1082,7 +1111,7 @@ async function classicGateSelect(
 			continue; // stay in the loop; re-show this same menu after they're done browsing
 		}
 		if (choice === "Approve & Execute") return "approve";
-		if (choice === "Approve & Compact") return "compact";
+		if (choice === "Approve & Execute, keep context") return "keep-context";
 		if (choice === "Refine") return "refine";
 		if (choice === "Discard") return "discard";
 		return undefined; // cancelled (no choice)
@@ -1134,32 +1163,17 @@ async function reviewAndMaybeExecute(pi: ExtensionAPI, ctx: ReviewCtx, initial: 
 
 		if (!choice || choice === "discard") return;
 
-		// "compact" is Approve & Execute's sibling — same destination, but ctx.compact() runs
-		// first (see ReviewCtx.compact's doc comment for why this is the same public API native
-		// /plan's own "Approve and compact context" calls, and compactBeforeExecuteGuidance's doc
-		// comment for why it's safe here: everything Explore/Propose produced is already
-		// persisted under readyset/changes/<id>/). `suppressContinuation: true` because this
-		// function dispatches the Apply turn itself right below, same as plan-mode does after its
-		// own compact-before-execute. Falls through to the ordinary "approve" branch either way —
-		// a missing ctx.compact (older omp build) or a failed compaction degrades to a plain
-		// Approve & Execute rather than blocking the user from proceeding at all.
-		if (choice === "compact") {
-			if (typeof ctx.compact === "function") {
-				ctx.ui.notify(`Compacting context before executing "${chosen.changeId}"...`, "info");
-				try {
-					await ctx.compact({
-						internalGuidance: compactBeforeExecuteGuidance(chosen.changeId),
-						suppressContinuation: true,
-					});
-				} catch (err) {
-					ctx.ui.notify(
-						`Compact failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.`,
-						"warning",
-					);
-				}
-			} else {
-				ctx.ui.notify("Compact isn't available in this context — approving without it.", "warning");
-			}
+		// "Approve & Execute" compacts first (see compactBeforeApply for why this is safe
+		// for a Readyset change specifically: everything Explore/Propose produced is already
+		// persisted under readyset/changes/<id>/, and Apply re-reads those files from disk).
+		// "Approve & Execute, keep context" skips the compact for the case where discussion
+		// nuance didn't make it into the artifacts. A missing ctx.compact (older omp build)
+		// or a failed compaction degrades to plain Approve & Execute rather than blocking
+		// the user from proceeding at all. "compact" is kept as an accepted result for
+		// older sidebar builds that still return it (defensive; the current overlay no
+		// longer offers it).
+		if (choice === "approve" || choice === "compact") {
+			await compactBeforeApply(ctx, chosen.changeId);
 			choice = "approve";
 		}
 

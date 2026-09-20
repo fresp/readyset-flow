@@ -106,25 +106,23 @@ export interface OverlaySection {
 }
 
 /**
- * "approve"/"compact"/"refine"/"discard" when the user picks one of the CTAs baked into the
- * sidebar footer (see `handleInput` below); `undefined` when they cancel with Esc instead --
- * the caller (`reviewAndMaybeExecute` in readyset-review.ts) treats a cancel exactly like an
- * explicit "discard" (both just leave the change as proposed and return), so this is a
- * distinction the overlay preserves for clarity/logging, not one the gate logic depends on.
- * "compact" is Approve & Execute's sibling: same destination (Apply fires next either way), but
- * the caller runs `ctx.compact()` first -- see readyset-review.ts's `reviewAndMaybeExecute` for
- * why that's safe for a Readyset change specifically (everything Explore/Propose produced is
- * already persisted under readyset/changes/<id>/, so nothing material is lost by summarizing
- * away the conversation that produced it).
+ * "approve" (compact first, then Apply), "keep-context" (Apply without compacting), "refine" /
+ * "discard" when the user picks one of the CTAs baked into the sidebar footer (see
+ * `handleInput` below); `undefined` when they cancel with Esc instead -- the caller
+ * (`reviewAndMaybeExecute` in readyset-review.ts) treats a cancel exactly like an explicit
+ * "discard" (both just leave the change as proposed and return), so this is a distinction
+ * the overlay preserves for clarity/logging, not one the gate logic depends on.
+ * "keep-context" exists for the case where discussion nuance didn't make it into the
+ * artifacts.
  */
-export type ReviewOverlayResult = "approve" | "compact" | "refine" | "discard" | undefined;
+export type ReviewOverlayResult = "approve" | "compact" | "keep-context" | "refine" | "discard" | undefined;
 
 /** The four CTAs, in on-screen left-to-right / Left-Right-cycling order. Shared between
  *  `renderCtaBar` (display) and `ReviewSidebarOverlay.handleInput` (Left/Right cycling, Enter
  *  confirming `CTA_ACTIONS[actionIndex]`) so the two can never drift out of sync. */
-const CTA_ACTIONS = ["approve", "compact", "refine", "discard"] as const;
+const CTA_ACTIONS = ["approve", "keep-context", "refine", "discard"] as const;
 type CtaAction = (typeof CTA_ACTIONS)[number];
-const CTA_KEYS: Record<CtaAction, string> = { approve: "A", compact: "C", refine: "R", discard: "D" };
+const CTA_KEYS: Record<CtaAction, string> = { approve: "A", "keep-context": "K", refine: "R", discard: "D" };
 
 const MIN_SIDEBAR_WIDTH = 22;
 const MAX_SIDEBAR_WIDTH = 36;
@@ -175,7 +173,7 @@ function sidebarParts(heading: string, status: string): { heading: string; statu
 function renderCtaBar(taskSummary: string, focus: "sections" | "actions", actionIndex: number, width: number): string {
 	const labels: Record<CtaAction, string> = {
 		approve: `Approve & Execute — ${taskSummary}`,
-		compact: "Approve & Compact",
+		"keep-context": "Keep context",
 		refine: "Refine",
 		discard: "Discard",
 	};
@@ -335,9 +333,9 @@ export class ReviewSidebarOverlay implements Component {
 			return;
 		}
 
-		// Direct-execute CTA shortcuts -- Approve & Execute / Approve & Compact / Refine / Discard
+		// Direct-execute CTA shortcuts -- Approve & Execute / Keep context / Refine / Discard
 		// live in the sidebar itself now (see the module doc comment and `ReviewOverlayResult`),
-		// so a/c/r/d fire immediately regardless of `#focus`, no need to Tab onto the CTA bar
+		// so a/k/r/d fire immediately regardless of `#focus`, no need to Tab onto the CTA bar
 		// first. Checked before the section-nav early return below so they still work even with
 		// zero sections -- a change with no renderable sections shouldn't make Approve/Discard
 		// unreachable.
@@ -345,8 +343,8 @@ export class ReviewSidebarOverlay implements Component {
 			this.#done("approve");
 			return;
 		}
-		if (data === "c" || data === "C") {
-			this.#done("compact");
+		if (data === "k" || data === "K") {
+			this.#done("keep-context");
 			return;
 		}
 		if (data === "r" || data === "R") {
