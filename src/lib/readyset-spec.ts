@@ -197,6 +197,80 @@ export async function readContext(cwd: string, changeId: string): Promise<string
 	return readFile(paths.context, "utf8").catch(() => undefined);
 }
 
+/**
+ * The set of repo-relative paths that were already dirty *before* this change's own planning
+ * turns ever ran, so later `git status` reads can subtract them. Without this, any file that
+ * is dirty for unrelated reasons (a WIP edit elsewhere, an untracked scratch note) gets
+ * misattributed to the current change — hard-stopping a well-behaved run at the gate
+ * invariant, or painting a false OUT-OF-SCOPE warning on every gate render.
+ *
+ * Stored as a marker entry inside CONTEXT.md rather than a separate dotfile: CONTEXT.md
+ * already has a deterministic append path (this file's own appendContext), it rides along
+ * automatically when the change is archived, and no new file can leak into the change dir
+ * as something validateChange or findSpecFiles might trip over.
+ */
+export interface DirtyBaseline {
+	/** Repo-relative paths that were dirty when the baseline was captured. */
+	paths: string[];
+	/** ISO timestamp of the capture. */
+	capturedAt: string;
+}
+
+/** Marker line that opens the baseline entry inside CONTEXT.md. */
+export const BASELINE_MARKER = "<!-- readyset-baseline-dirty -->";
+
+function parseBaselineEntry(raw: string): DirtyBaseline | undefined {
+	const idx = raw.indexOf(BASELINE_MARKER);
+	if (idx === -1) return undefined;
+	const after = raw.slice(idx + BASELINE_MARKER.length);
+	const start = after.indexOf("{");
+	const end = after.lastIndexOf("}");
+	if (start === -1 || end === -1 || end <= start) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(after.slice(start, end + 1));
+		if (parsed === null || typeof parsed !== "object") return undefined;
+		const paths = (parsed as { paths?: unknown }).paths;
+		const capturedAt = (parsed as { capturedAt?: unknown }).capturedAt;
+		if (!Array.isArray(paths) || !paths.every((p): p is string => typeof p === "string")) return undefined;
+		if (typeof capturedAt !== "string") return undefined;
+		return { paths, capturedAt };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Captures the currently-dirty paths as this change's baseline — but only if no baseline
+ * exists yet. A later, dirtier tree must not widen what counts as pre-existing, so the
+ * first capture wins and every later call is a no-op. Returns the stored baseline.
+ */
+export async function ensureDirtyBaseline(cwd: string, changeId: string, currentDirty: string[]): Promise<DirtyBaseline> {
+	const paths = changePaths(cwd, changeId);
+	const existing = await readFile(paths.context, "utf8").catch(() => undefined);
+	if (existing !== undefined) {
+		const parsed = parseBaselineEntry(existing);
+		if (parsed !== undefined) return parsed;
+	}
+	const baseline: DirtyBaseline = { paths: [...currentDirty].sort(), capturedAt: new Date().toISOString() };
+	const entry = `\n\n${BASELINE_MARKER}\n\`\`\`json\n${JSON.stringify(baseline)}\n\`\`\`\n`;
+	const next =
+		existing === undefined ? `# Context log\n${entry}` : `${existing.trimEnd()}\n${entry}`;
+	await writeFile(paths.context, next, "utf8");
+	return baseline;
+}
+
+/**
+ * Reads this change's dirty baseline. Returns an empty set when there is none (a change that
+ * predates this mechanism) or when it cannot be parsed — callers then fall back to the old
+ * unbaselined behavior rather than crashing.
+ */
+export async function readDirtyBaseline(cwd: string, changeId: string): Promise<Set<string>> {
+	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
+	if (raw === undefined) return new Set();
+	const parsed = parseBaselineEntry(raw);
+	return new Set(parsed?.paths ?? []);
+}
+
 export interface ValidationIssue {
 	file: string;
 	problem: string;

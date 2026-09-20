@@ -15,6 +15,8 @@ import {
   readContext,
   checkTaskVerification,
   checkPhaseViolations,
+  ensureDirtyBaseline,
+  readDirtyBaseline,
   readScopeContract,
   checkScope,
   readReview,
@@ -531,6 +533,47 @@ await test("validateChange: observable THENs still pass (exit, stdout, status, f
   const result = await validateChange(cwd, "observable");
   assert.deepEqual(result.issues, []);
   assert.equal(result.ok, true);
+});
+
+await test("ensureDirtyBaseline/readDirtyBaseline: round-trip, idempotent, missing -> empty", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "base");
+
+  // Missing baseline reads as empty, never throws.
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "base"))], []);
+
+  // First capture wins.
+  const stored = await ensureDirtyBaseline(cwd, "base", ["unrelated.txt", "notes/scratch.md"]);
+  assert.deepEqual(stored.paths, ["notes/scratch.md", "unrelated.txt"]);
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "base"))], ["notes/scratch.md", "unrelated.txt"]);
+
+  // A later, dirtier tree must not widen what counts as pre-existing.
+  const again = await ensureDirtyBaseline(cwd, "base", ["unrelated.txt", "notes/scratch.md", "src/new.ts"]);
+  assert.deepEqual(again.paths, ["notes/scratch.md", "unrelated.txt"]);
+});
+
+await test("checkPhaseViolations through a baseline: pre-existing dirt is not a violation", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "filter");
+  await ensureDirtyBaseline(cwd, "filter", ["unrelated.txt"]);
+  const baseline = await readDirtyBaseline(cwd, "filter");
+  // The extension subtracts the baseline from the current dirty set; simulate that here.
+  const current = ["unrelated.txt", "src/ledger.mjs"];
+  const authored = current.filter((p) => !baseline.has(p));
+  const violations = await checkPhaseViolations(cwd, "filter", authored);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].path, "src/ledger.mjs");
+});
+
+await test("baseline entry survives inside CONTEXT.md without breaking context reads", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "ctxbase");
+  await appendContext(cwd, "ctxbase", "Explore", "did some exploration");
+  await ensureDirtyBaseline(cwd, "ctxbase", ["a.txt"]);
+  const raw = await readContext(cwd, "ctxbase");
+  assert.ok(raw?.includes("## Explore —"), "phase entries must survive the baseline append");
+  assert.ok(raw?.includes("<!-- readyset-baseline-dirty -->"), "baseline marker must be present");
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "ctxbase"))], ["a.txt"]);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

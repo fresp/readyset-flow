@@ -18,11 +18,13 @@ import {
 	checkPhaseViolations,
 	checkScope,
 	checkTaskVerification,
+	ensureDirtyBaseline,
 	ensureReadysetRoot,
 	findSpecFiles,
 	getProgress,
 	hasExploration,
 	listSubmodules,
+	readDirtyBaseline,
 	readReview,
 	scaffoldChange,
 	validateChange,
@@ -873,12 +875,13 @@ function createTurnBudget(max: number = MAX_TURNS_PER_RUN): TurnBudget {
 
 /**
  * Runs `git status --porcelain` in the repo root and returns the repo-relative paths of every
- * changed file (tracked modifications plus untracked files; renames are reported as their
- * destination). Throws when git is unavailable or the cwd is not a repo — a planning turn in a
- * non-repo has no git boundary to violate, so the caller treats that as "nothing to check",
- * not as a violation.
+ * currently dirty file (tracked modifications plus untracked files; renames are reported as
+ * their destination). Despite the old name, this never diffed against a baseline — it is just
+ * the raw current-dirty read; the subtraction happens in `pathsChangedThisRun`. Throws when
+ * git is unavailable or the cwd is not a repo — a planning turn in a non-repo has no git
+ * boundary to violate, so callers treat that as "nothing to check", not as a violation.
  */
-async function changedPathsSinceBaseline(cwd: string): Promise<string[]> {
+async function currentDirtyPaths(cwd: string): Promise<string[]> {
 	const run = promisify(execFile);
 	const { stdout } = await run("git", ["status", "--porcelain", "-uall"], { cwd, timeout: 30000 });
 	const paths: string[] = [];
@@ -890,6 +893,20 @@ async function changedPathsSinceBaseline(cwd: string): Promise<string[]> {
 		paths.push(arrow === -1 ? rest : rest.slice(arrow + 4));
 	}
 	return paths.filter((p) => p !== "");
+}
+
+/**
+ * What this run itself changed: current dirty paths minus whatever was already dirty before
+ * this change's planning turns ever ran (the baseline captured at scaffold time). Without
+ * the subtraction, any file dirty for unrelated reasons — a WIP edit elsewhere, an
+ * untracked scratch note — gets misattributed to the current change.
+ */
+async function pathsChangedThisRun(cwd: string, changeId: string): Promise<string[]> {
+	const [current, baseline] = await Promise.all([
+		currentDirtyPaths(cwd).catch(() => [] as string[]),
+		readDirtyBaseline(cwd, changeId),
+	]);
+	return current.filter((p) => !baseline.has(p));
 }
 
 /** Fires a turn against the budget. Returns false (and notifies) without firing anything if
@@ -931,7 +948,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const verification = await checkTaskVerification(ctx.cwd, chosen.changeId);
 	// Scope is checked against the working tree, not the plan: anything the repo already
 	// shows as changed that the contract doesn't name is flagged here, in the gate.
-	const scope = await checkScope(ctx.cwd, chosen.changeId, await changedPathsSinceBaseline(ctx.cwd).catch(() => []));
+	const scope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
 	const explored = await hasExploration(ctx.cwd, chosen.changeId);
 	const review = await readReview(ctx.cwd, chosen.changeId);
 	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
@@ -2053,6 +2070,9 @@ export default function (pi: ExtensionAPI) {
 
 			await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
 				if (isProposed(chosen.status)) {
+					// Defensive: a change that predates the baseline mechanism has no capture
+					// yet. This never overwrites an existing baseline (first capture wins).
+					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
 					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane);
 					return;
 				}
@@ -2100,6 +2120,11 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				await scaffoldChange(ctx.cwd, chosen.changeId);
+				// Capture what was already dirty before this change's own planning turns ever
+				// run, so the gate invariant and scope check subtract it rather than blaming
+				// this change for unrelated repo state. First capture wins; later, dirtier
+				// trees must not widen it.
+				await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
 
 				// Fast lane folds Explore into Propose: no separate turn, no EXPLORATION.md turn.
 				// The full-lane path (separate grounding turn that must produce EXPLORATION.md)
@@ -2161,7 +2186,7 @@ export default function (pi: ExtensionAPI) {
 				const violations = await checkPhaseViolations(
 					ctx.cwd,
 					chosen.changeId,
-					await changedPathsSinceBaseline(ctx.cwd).catch(() => []),
+					await pathsChangedThisRun(ctx.cwd, chosen.changeId),
 				);
 				if (violations.length > 0) {
 					await appendContext(
