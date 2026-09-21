@@ -22,6 +22,7 @@ import {
   parseContractLine,
   checkScope,
   checkScopeRefs,
+  hasBeenApplied,
   readReview,
   taskCheckedStates,
   appendPhaseEvent,
@@ -702,6 +703,54 @@ await test("checkScope: a (delete) path is in scope", async () => {
   const result = await checkScope(cwd, "delscope", ["src/gone.ts", "src/other.ts"]);
   assert.equal(result.noContract, false);
   assert.deepEqual(result.outside, ["src/other.ts"]);
+});
+
+await test("checkScopeRefs: a contract entry that is a directory is not reported dangling", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "dirrefs");
+  await mkdir(join(cwd, "src", "lib"), { recursive: true });
+  await writeFile(
+    paths.proposal,
+    "# P\n\n## Files This Change Will Touch\n\n- src/lib/\n- src/missing/no-such-dir/\n",
+    "utf8",
+  );
+  const result = await checkScopeRefs(cwd, "dirrefs");
+  assert.equal(result.noContract, false);
+  // src/lib/ is a real directory (exists), src/missing/no-such-dir/ is not.
+  assert.deepEqual(result.missing, ["src/missing/no-such-dir/"]);
+});
+
+await test("checkScope: a directory contract entry matches anything under it by prefix", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "dirscope");
+  await mkdir(join(cwd, "src", "lib"), { recursive: true });
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- src/lib/\n", "utf8");
+  const result = await checkScope(cwd, "dirscope", ["src/lib/thing.ts", "src/lib/nested/deep.ts", "src/other.ts"]);
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.outside, ["src/other.ts"]);
+});
+
+await test("hasBeenApplied: false before Apply, true once applied or a task is done", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "applied");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  assert.equal(await hasBeenApplied(cwd, "applied"), false);
+
+  // A done task alone is enough (tasks.md already reflects Apply).
+  await writeFile(paths.tasks, "- [x] 1.1 x\n", "utf8");
+  assert.equal(await hasBeenApplied(cwd, "applied"), true);
+
+  // The phase log alone is enough too, even with no tasks ticked.
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  await appendPhaseEvent(cwd, "applied", {
+    phase: "apply",
+    edge: "end",
+    at: new Date().toISOString(),
+    lane: "full",
+    laneSource: "brainstorm",
+    outcome: "applied",
+  });
+  assert.equal(await hasBeenApplied(cwd, "applied"), true);
 });
 
 await test("validateChange: inspection-only THEN is flagged as unobservable", async () => {

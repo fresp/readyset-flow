@@ -25,6 +25,7 @@ import {
 	ensureReadysetRoot,
 	findSpecFiles,
 	getProgress,
+	hasBeenApplied,
 	hasExploration,
 	listSubmodules,
 	type PhaseEvent,
@@ -286,7 +287,10 @@ function applyTurnPrompt(changeId: string): string {
 }
 
 interface CompactBoundaryResult {
-	outcome: "compacted" | "skipped-below-threshold" | "skipped-flag" | "unavailable" | "failed";
+	/** `skipped-keep-context` is never returned by `compactForPhase`; the gate's keep-context
+	 *  branch records it directly as the Apply boundary's compact outcome (it skipped compaction
+	 *  by the user's own choice, not by mode/threshold). */
+	outcome: "compacted" | "skipped-below-threshold" | "skipped-flag" | "skipped-keep-context" | "unavailable" | "failed";
 	beforePercent?: number;
 	afterPercent?: number;
 }
@@ -304,6 +308,9 @@ interface CompactBoundaryResult {
  * `compaction.*`/`modelRoles` settings have no model key), so this wrapper is the only supported
  * way to influence the model the summary is produced on. A missing `ctx.compact` or a throw
  * degrades to a plain continue — a cost optimization must never block the run.
+ *
+ * One outcome in the union, `skipped-keep-context`, is never produced here: the gate's
+ * keep-context branch records it directly as the Apply boundary's compact event.
  */
 async function compactForPhase(
 	pi: ExtensionAPI,
@@ -968,6 +975,18 @@ function createTurnBudget(max: number = MAX_TURNS_PER_RUN): TurnBudget {
 }
 
 /**
+ * True when this run can fire one more turn AND still leave `reserve` turns for the phases that
+ * must not be starved. `spendTurn` only checks `spent >= max`, so a repair/reconcile turn fired
+ * when `spent === max - 1` would consume the last unit; the code-review `spendTurn` then returns
+ * false and the run ends with no REVIEW.md and no archive offer. Callers pass the number of later
+ * phases that must still get a turn: 2 for contract repair (Apply + Review), 1 for scope
+ * reconciliation (Review).
+ */
+function turnsAvailableFor(budget: TurnBudget, reserve: number): boolean {
+	return budget.max - budget.spent > reserve;
+}
+
+/**
  * Runs `git status --porcelain` in the repo root and returns the repo-relative paths of every
  * currently dirty file (tracked modifications plus untracked files; renames are reported as
  * their destination). Despite the old name, this never diffed against a baseline — it is just
@@ -1004,8 +1023,9 @@ async function pathsChangedThisRun(cwd: string, changeId: string): Promise<strin
 }
 
 /** Final Apply diff size for the bench: files changed and lines added/deleted, from
- *  `git diff --numstat` over the run's own changed paths, with untracked new files counted by their
- *  line count. Excludes readyset/ (planning artifacts) and .ai/brainstorms/**
+ *  `git diff HEAD --numstat` (so staged changes count), falling back to plain `git diff` when there
+ *  is no HEAD (a fresh repo), over the run's own changed paths, with untracked new files counted by
+ *  their line count. Excludes readyset/ (planning artifacts) and .ai/brainstorms/**
  *  (.ai/brainstorms) so the number reflects product code. Returns zeros when git is unavailable. */
 async function applyDiffStats(cwd: string, changedPaths: string[]): Promise<{ files: number; added: number; deleted: number }> {
 	const product = changedPaths.filter(
@@ -1015,7 +1035,14 @@ async function applyDiffStats(cwd: string, changedPaths: string[]): Promise<{ fi
 	const run = promisify(execFile);
 	let files = 0, added = 0, deleted = 0;
 	try {
-		const { stdout } = await run("git", ["diff", "--numstat", "--", ...product], { cwd, timeout: 30000 });
+		let stdout: string;
+		try {
+			({ stdout } = await run("git", ["diff", "HEAD", "--numstat", "--", ...product], { cwd, timeout: 30000 }));
+		} catch {
+			// A repo with no commits yet has no HEAD: `git diff HEAD` errors ("unknown revision"),
+			// so fall back to the plain working-tree diff.
+			({ stdout } = await run("git", ["diff", "--numstat", "--", ...product], { cwd, timeout: 30000 }));
+		}
 		for (const line of stdout.split("\n")) {
 			if (line.trim() === "") continue;
 			const [a, d] = line.split("\t");
@@ -1093,6 +1120,12 @@ function contractRepairPrompt(problems: string[]): string {
  * `record` is the caller's `recordPhase` (the handler's factory-local one, or the module-scope loop
  * one) so the event carries the run's lane/laneSource. Returns the post-repair refs so the caller
  * does not re-check.
+ *
+ * Once the change has been applied (`hasBeenApplied`), the contract is read with post-Apply
+ * semantics and the repair turn never fires: a `(new)` file Apply created and a `(delete)` file it
+ * removed would otherwise look wrong, and "repairing" them would strip correct markers. Remaining
+ * problems only warn. When not applied, the turn is additionally reserved — it fires only if Apply
+ * and Review would still each get a turn (`turnsAvailableFor(budget, 2)`).
  */
 async function runContractRepair(
 	pi: ExtensionAPI,
@@ -1102,13 +1135,24 @@ async function runContractRepair(
 	phaseModels: Map<string, { model: string; source: string }>,
 	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string }) => Promise<void>,
 ): Promise<Awaited<ReturnType<typeof checkScopeRefs>>> {
-	const before = await checkScopeRefs(ctx.cwd, changeId);
+	const applied = await hasBeenApplied(ctx.cwd, changeId);
+	const appliedRefs = applied ? { afterApply: true as const } : {};
+	const beforeRaw = await checkScopeRefs(ctx.cwd, changeId, appliedRefs);
+	const before = applied ? { ...beforeRaw, newButExists: [] } : beforeRaw;
 	const problems = scopeRefProblems(before);
 	if (problems.length === 0) return before; // nothing to repair: no event, no turn
 
-	if (budget.spent >= budget.max) {
+	if (applied) {
 		ctx.ui.notify(
-			`The scope contract for "${changeId}" has ${problems.length} problem(s), but this run has no turn left to repair them — showing them in the gate instead.`,
+			`The scope contract for "${changeId}" has ${problems.length} problem(s), but this change has already been applied — not firing a repair turn (it would strip correct (new)/(delete) markers). Showing them in the gate instead.`,
+			"warning",
+		);
+		return before;
+	}
+
+	if (!turnsAvailableFor(budget, 2)) {
+		ctx.ui.notify(
+			`The scope contract for "${changeId}" has ${problems.length} problem(s), but repairing them now would starve Apply/Review of their turns — keeping the turn and showing them in the gate instead.`,
 			"warning",
 		);
 		await record("contract-repair", "end", { outcome: "skipped-budget" });
@@ -1131,10 +1175,11 @@ async function runContractRepair(
 		);
 		await appendContext(ctx.cwd, changeId, "Contract repair", `Repair turn wrote outside the change dir: ${violations.map((v) => `${v.path} (${v.detail})`).join("; ")}.`);
 		await record("contract-repair", "end", { model: phaseModels.get("propose")?.model, outcome: "partial" });
-		return checkScopeRefs(ctx.cwd, changeId);
+		return checkScopeRefs(ctx.cwd, changeId, appliedRefs);
 	}
 
-	const after = await checkScopeRefs(ctx.cwd, changeId);
+	const afterRaw = await checkScopeRefs(ctx.cwd, changeId, appliedRefs);
+	const after = applied ? { ...afterRaw, newButExists: [] } : afterRaw;
 	const remaining = scopeRefProblems(after).length;
 	const fixed = problems.length - remaining;
 	await appendContext(
@@ -1169,8 +1214,11 @@ function scopeReconcilePrompt(changeId: string, paths: string[]): string {
  * Bounded, one-shot post-Apply scope reconciliation: if Apply touched files outside the contract
  * and they have no `## Scope deviations` entry, fire ONE turn (riding the apply phase model) that
  * reverts each or records a justification, then re-check. Never loops — at most one reconciliation
- * per Apply, and none at all when every outside path is already justified. A turn-needing result is
- * recorded as an `appendContext` entry and a `scope-reconcile` phase event with drift counts.
+ * per Apply, and none at all when every outside path is already justified. The turn is reserved for
+ * the code review: it fires only if the review turn would still have a budget unit
+ * (`turnsAvailableFor(budget, 1)`), otherwise the drift is recorded and warned at the archive
+ * prompt. A turn-needing result is recorded as an `appendContext` entry and a `scope-reconcile`
+ * phase event with drift counts.
  * Returns the drift counts so the caller can warn about what remains, exactly as 0.13.0 did.
  */
 async function runScopeReconciliation(
@@ -1188,9 +1236,9 @@ async function runScopeReconciliation(
 	if (unjustified.length === 0) {
 		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: 0 };
 	}
-	if (budget.spent >= budget.max) {
+	if (!turnsAvailableFor(budget, 1)) {
 		ctx.ui.notify(
-			`"${changeId}" touched ${unjustified.length} file(s) outside its scope contract, but this run has no turn left to reconcile them — showing them at the archive prompt instead.`,
+			`"${changeId}" touched ${unjustified.length} file(s) outside its scope contract, but reconciling them now would starve the code-review turn of its turn — keeping the turn and showing them at the archive prompt instead.`,
 			"warning",
 		);
 		await record("scope-reconcile", "end", { outcome: "skipped-budget", counts: { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length } });
@@ -1269,7 +1317,12 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	// Scope is checked against the working tree, not the plan: anything the repo already
 	// shows as changed that the contract doesn't name is flagged here, in the gate.
 	const scope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
-	const scopeRefs = await checkScopeRefs(ctx.cwd, chosen.changeId);
+	// Post-Apply the gate reopens with the change already implemented: a `(new)` file that Apply
+	// created now exists and a `(delete)` file is gone, so the contract must be read with
+	// post-Apply semantics or every one of them reads as a false NEW-BUT-EXISTS/DELETE-BUT-MISSING.
+	const applied = await hasBeenApplied(ctx.cwd, chosen.changeId);
+	const scopeRefsRaw = await checkScopeRefs(ctx.cwd, chosen.changeId, applied ? { afterApply: true } : {});
+	const scopeRefs = applied ? { ...scopeRefsRaw, newButExists: [] } : scopeRefsRaw;
 	const explored = await hasExploration(ctx.cwd, chosen.changeId);
 	const review = await readReview(ctx.cwd, chosen.changeId);
 	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
@@ -1757,10 +1810,18 @@ async function reviewAndMaybeExecute(
 		// so approval happens with eyes open, not stopped for work the user can see. "compact"
 		// is kept as an accepted result for older sidebar builds that still return it (defensive;
 		// the current overlay no longer offers it).
-		if (choice === "approve" || choice === "compact") {
-			// Capture the pre-normalization value: the overlay/gate menu offers only `approve`
-			// and `compact` for execution, and `compact` means "approve, keep context".
-			const rawChoice = choice;
+		if (choice === "keep-context") {
+			// Apply without compacting: the compact boundary is still recorded, marked as skipped,
+			// so every gate path leaves a balanced pair of phase events (gate start/end, and a
+			// compact boundary for the Apply boundary either way).
+			await recordPhase(chosen.changeId, "compact", "end", {
+				model: phaseModels.get("apply")?.model,
+				outcome: "skipped-keep-context",
+				boundary: "apply",
+			});
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context" });
+			choice = "approve"; // fall through to Apply, skipping compaction
+		} else if (choice === "approve" || choice === "compact") {
 			const compactResult = await compactForPhase(
 				pi,
 				ctx,
@@ -1779,7 +1840,10 @@ async function reviewAndMaybeExecute(
 				context: { beforePercent: compactResult.beforePercent, afterPercent: compactResult.afterPercent },
 			});
 			choice = "approve";
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: rawChoice === "compact" ? "approve-keep-context" : "approve" });
+			// The recorded outcome names the action the user took. The legacy `"compact"` result
+			// (from older sidebar builds) means "approve, keep context" in 0.12.0's note, but the
+			// gate treats it as a plain approve here, so both record `approve`.
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve" });
 		}
 
 		if (choice === "refine") {

@@ -2395,14 +2395,18 @@ await test("T4: an exhausted budget skips the repair and still reaches the gate"
     fakeUiWrap.selectPrompts.some((p) => /Review change/.test(p)),
     "the run still reached the review gate",
   );
-  assert.equal(fakePiWrap.calls.length, 10, "exactly the turn budget of model turns fired, never more");
-  // Observed behavior: the Refine turn consumes the last budget unit and `spendTurn` returns
-  // false, so the handler `return`s before the repair helper's pre-check runs — the repair never
-  // fires, and no `skipped-budget` event is written. The load-bearing guarantee (warn + reach the
-  // gate + never loop) is asserted above; this pins the exact presence so a change in ordering
-  // here is caught rather than hidden behind an `||`.
-  assert.equal(repairEnds.filter((e) => e.outcome === "skipped-budget").length, 0, "no repair turn fires once the budget is spent");
-  assert.equal(repairEnds.length, 5, "five repair turns ran before the budget was exhausted");
+  assert.equal(fakePiWrap.calls.length, 10, "10 model turns fired total (6 Refine + 4 repair), never more than the budget");
+  // New semantics (turn reserves): the repair only fires when 2 turns would still remain for
+  // Apply + Review, so it stops firing at spent=9 (10-9=1, not > 2) and records skipped-budget
+  // instead — the reserve keeps Apply/Review from being starved. The loop itself halts when the
+  // 10-turn budget is fully spent.
+  const skipped = repairEnds.filter((e) => e.outcome === "skipped-budget");
+  assert.equal(skipped.length, 2, "the last two gate iterations reserved turns and skipped the repair");
+  assert.equal(repairEnds.length, 6, "four repair turns ran, then two skipped-budget events");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /starve Apply\/Review/.test(n.message) && n.level === "warning"),
+    "the reserve notify names Apply/Review retention",
+  );
 });
 
 await test("T5: Refine triggers the repair again", async () => {
@@ -2669,8 +2673,8 @@ await test("S4: an exhausted budget skips reconciliation and keeps the warning",
   assert.equal(recEnds[0].outcome, "skipped-budget");
   assert.equal(recEnds[0].counts?.unjustifiedAfter, 1);
   assert.ok(
-    fakeUiWrap.notifications.some((n) => /no turn left to reconcile/.test(n.message) && n.level === "warning"),
-    "a no-turn-left warning fired",
+    fakeUiWrap.notifications.some((n) => /starve the code-review turn/.test(n.message) && n.level === "warning"),
+    "a reserve warning names the code-review turn's retention",
   );
   // Observed behavior (pinned, not `||`): the 9 Refine turns plus the Apply turn spend the full
   // budget, so once Apply completes there is no turn left for the review turn either — the run
@@ -3083,6 +3087,359 @@ await test("C8: the compaction call runs under the phase model when an override 
   assert.ok(explore, "the Explore compact event is recorded");
   assert.equal(explore.outcome, "compacted");
   assert.equal(explore.model, "cheap/model", "the compact event names the phase model it ran under");
+});
+
+// --- Turn reserves (task 1) --------------------------------------------------------------------
+
+await test("R1: the repair turn is reserved for Apply/Review, so a nearly-spent run still reaches code review", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-06-01-reserve1.md", {
+    title: "Reserve One",
+    status: "proposed",
+    created: "2026-06-01",
+    change_id: "reserve1",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeReconcileChange(cwd, "reserve1"); // contract: src/keep.ts (resolvable)
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-06-01 · Reserve One"); // pick
+  // 8 Refine rounds: the first 7 keep the contract resolvable (one turn each, no repair), the 8th
+  // makes it dangling — at that point spent reaches 8, so the repair's reserve-2 check skips it
+  // and leaves exactly the two turns Apply and Review need.
+  for (let i = 0; i < 8; i++) {
+    fakeUiWrap.selectQueue.push("Refine");
+    fakeUiWrap.inputQueue.push(`round ${i}`);
+  }
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+
+  for (let i = 0; i < 7; i++) {
+    fakePiWrap.queueEffect(async () => {
+      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
+    });
+  }
+  // Round 8: introduce a dangling contract line so the repair wants a turn at spent=8.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(
+      join(dir, "proposal.md"),
+      "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n- src/missing.ts\n",
+      "utf8",
+    );
+  });
+  // Apply: complete the task.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  // Review.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "reserve1");
+  const repairEnds = events.filter((e) => e.phase === "contract-repair" && e.edge === "end");
+  // The repair either never fired, or it recorded skipped-budget; either way no turn was taken.
+  assert.equal(repairEnds.filter((e) => e.outcome !== "skipped-budget").length, 0, "no repair turn fired at the reserve boundary");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /starve Apply\/Review/i.test(n.message) && n.level === "warning"),
+    "the reserve notify names Apply/Review retention",
+  );
+  assert.ok(events.some((e) => e.phase === "apply" && e.edge === "end" && e.outcome === "applied"), "Apply ran and applied");
+  assert.ok(
+    events.some((e) => e.phase === "review" && e.edge === "end" && e.outcome === "review-written"),
+    "the reserved turn let code review run and write REVIEW.md",
+  );
+  assert.equal(fakePiWrap.calls.length, 10, "the run used every turn but never exceeded the budget");
+});
+
+await test("R2: reconciliation reserves the code-review turn and still writes REVIEW.md", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-06-02-reserve2.md", {
+    title: "Reserve Two",
+    status: "proposed",
+    created: "2026-06-02",
+    change_id: "reserve2",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeReconcileChange(cwd, "reserve2");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-06-02 · Reserve Two"); // pick
+  // 8 Refine rounds consume 8 turns (the contract stays resolvable, so no repair turns fire).
+  for (let i = 0; i < 8; i++) {
+    fakeUiWrap.selectQueue.push("Refine");
+    fakeUiWrap.inputQueue.push(`round ${i}`);
+  }
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  for (let i = 0; i < 8; i++) {
+    fakePiWrap.queueEffect(async () => {
+      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
+    });
+  }
+  // Apply (turn 9): complete the task and drift outside the contract.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
+  });
+  // Review (turn 10): the reserved turn.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "reserve2");
+  const recEnds = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "end");
+  assert.equal(recEnds.length, 1, "one reconciliation end event");
+  assert.equal(recEnds[0].outcome, "skipped-budget", "reconciliation reserved the review turn");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /starve the code-review turn/i.test(n.message) && n.level === "warning"),
+    "the reserve notify names the code-review turn",
+  );
+  assert.ok(
+    events.some((e) => e.phase === "review" && e.edge === "end" && e.outcome === "review-written"),
+    "the reserved turn let code review run",
+  );
+  assert.equal(fakePiWrap.calls.length, 10, "never more than the turn budget");
+});
+
+// --- Post-Apply contract semantics (task 2) ----------------------------------------------------
+
+// Drives a change through Apply with a `(new)` file Apply creates and a `(delete)` file Apply
+// removes, then reopens the gate by re-invoking the handler. Returns the wrapper handles so the
+// test can inspect both runs' panels/documents.
+async function runApplyThenReopen(changeId: string) {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, `2026-07-01-${changeId}.md`, {
+    title: "Post Apply",
+    status: "proposed",
+    created: "2026-07-01",
+    change_id: changeId,
+  });
+  const dir = await writeProposedChange(cwd, changeId, ["- src/keep.ts", "- src/created.ts (new)", "- src/gone.ts (delete)"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+  await writeFile(join(cwd, "src", "gone.ts"), "export const gone = 1;\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push(`2026-07-01 · Post Apply`); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute"); // gate
+  fakeUiWrap.selectQueue.push("Address findings first"); // archive prompt (do NOT archive)
+
+  // Apply: create the (new) file and delete the (delete) file.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "created.ts"), "export const fresh = true;\n", "utf8");
+    await rm(join(cwd, "src", "gone.ts"), { force: true });
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+  return { cwd, dir, handler, fakePiWrap, fakeUiWrap, ctx };
+}
+
+await test("P1: reopening the gate after Apply uses post-Apply contract semantics (no false MISSING/EXISTS)", async () => {
+  const { cwd, handler, fakePiWrap, fakeUiWrap, ctx } = await runApplyThenReopen("postapply1");
+
+  // Re-run: pick the change again and reach the gate, then discard.
+  fakeUiWrap.selectQueue.push("2026-07-01 · Post Apply");
+  fakeUiWrap.selectQueue.push("Discard");
+  await handler("", ctx);
+
+  const panelText = fakeUiWrap.widgetHistory.flat().join("\n");
+  const docText = fakeUiWrap.editorTextHistory.join("\n");
+  const all = `${panelText}\n${docText}`;
+  assert.ok(!/NEW-BUT-EXISTS/.test(all), "the reopened gate never shows a false NEW-BUT-EXISTS for the (new) file Apply created");
+  assert.ok(!/DELETE-BUT-MISSING/.test(all), "the reopened gate never shows a false DELETE-BUT-MISSING for the (delete) file Apply removed");
+  assert.ok(cwd.length > 0, "repo used");
+});
+
+await test("P2: Refine after Apply fires no contract-repair turn", async () => {
+  const { dir, handler, fakePiWrap, fakeUiWrap, ctx } = await runApplyThenReopen("postapply2");
+
+  // Re-run: pick again, Refine at the gate, then Discard.
+  fakeUiWrap.selectQueue.push("2026-07-01 · Post Apply");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("tweak it");
+  fakeUiWrap.selectQueue.push("Discard");
+  const callsBefore = fakePiWrap.calls.length;
+  fakePiWrap.queueEffect(async () => {
+    // The refine turn leaves a genuinely dangling unmarked path alongside the (new)/(delete)
+    // markers Apply already satisfied — so problems exist, and the applied guard must warn and
+    // still refuse to fire a repair turn (one would strip the correct markers).
+    await writeFile(
+      join(dir, "proposal.md"),
+      "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n- src/created.ts (new)\n- src/gone.ts (delete)\n- src/missing.ts\n",
+      "utf8",
+    );
+  });
+  await handler("", ctx);
+
+  const newCalls = fakePiWrap.calls.slice(callsBefore).map((c) => c.prompt);
+  assert.ok(
+    !newCalls.some((p) => /scope contract in proposal\.md is wrong/.test(p)),
+    "no contract-repair prompt fired on a Refine after Apply",
+  );
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /already been applied — not firing a repair turn/.test(n.message) && n.level === "warning"),
+    "the applied guard warns instead of firing the repair turn",
+  );
+});
+
+// --- Balanced gate phase events (task 3) -------------------------------------------------------
+
+await test("G1: every gate path closes its boundary, with the outcome matching the action", async () => {
+  // Gate picks that should be recorded: approve (empty-input Refine excepted) / keep-context /
+  // refine / discard. Each is driven in its own short run against a *proposed* change.
+  const cases: { label: string; picks: string[]; yes: string; outcome: string; extra?: (events: Awaited<ReturnType<typeof readPhaseEvents>>) => void }[] = [
+    {
+      label: "approve",
+      picks: ["Approve & Execute", "Not yet"],
+      yes: "yes",
+      outcome: "approve",
+    },
+    {
+      label: "keep-context",
+      picks: ["Approve & Execute, keep context", "Not yet"],
+      yes: "yes",
+      outcome: "approve-keep-context",
+      extra: (events) => {
+        const compact = events.find((e) => e.phase === "compact" && e.edge === "end" && e.boundary === "apply");
+        assert.ok(compact, "keep-context records a compact boundary event");
+        assert.equal(compact?.outcome, "skipped-keep-context");
+      },
+    },
+    {
+      label: "refine",
+      picks: ["Refine", "Discard"],
+      yes: "refine",
+      outcome: "refine",
+    },
+    {
+      label: "discard",
+      picks: ["Discard"],
+      yes: "discard",
+      outcome: "discard",
+    },
+  ];
+
+  for (const c of cases) {
+    const cwd = await freshRepo();
+    await writeBrainstorm(cwd, `2026-08-01-gate-${c.label}.md`, {
+      title: `Gate ${c.label}`,
+      status: "proposed",
+      created: "2026-08-01",
+      change_id: `gate-${c.label}`,
+    });
+    const dir = await writeProposedChange(cwd, `gate-${c.label}`, ["- src/keep.ts"]);
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+
+    const fakePiWrap = makeFakePi(cwd);
+    const handler = await loadHandler(fakePiWrap.pi);
+    const fakeUiWrap = makeFakeUi();
+    fakeUiWrap.selectQueue.push(`2026-08-01 · Gate ${c.label}`);
+    for (const pick of c.picks) fakeUiWrap.selectQueue.push(pick);
+    if (c.label === "refine") fakeUiWrap.inputQueue.push("please change");
+
+    // For approve / keep-context, Apply + Review turns run before the archive prompt.
+    if (c.yes === "yes") {
+      fakePiWrap.queueEffect(async () => {
+        await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+      });
+      fakePiWrap.queueEffect(async () => {
+        await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+      });
+    } else if (c.label === "refine") {
+      fakePiWrap.queueEffect(async () => {
+        await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n", "utf8");
+      });
+    }
+
+    const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+    await handler("", ctx);
+
+    const events = await readPhaseEvents(cwd, `gate-${c.label}`);
+    const starts = events.filter((e) => e.phase === "gate" && e.edge === "start");
+    const ends = events.filter((e) => e.phase === "gate" && e.edge === "end");
+    // Refine loops back to the gate, so count a balanced pair per iteration, not a single one.
+    assert.equal(starts.length, ends.length, `${c.label}: every gate start has a matching end`);
+    assert.ok(ends.length >= 1, `${c.label}: at least one gate end was recorded`);
+    assert.ok(
+      ends.some((e) => e.outcome === c.outcome),
+      `${c.label}: a gate end with outcome ${c.outcome} exists`,
+    );
+    c.extra?.(events);
+  }
+});
+
+// --- Diff stats see staged changes (task 4) ----------------------------------------------------
+
+await test("D1: the apply diff stats count fully staged (git add-ed) changes", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  // Commit a baseline so HEAD exists and a staged modification shows up against it.
+  await writeFile(join(cwd, "README.md"), "baseline\n", "utf8");
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"], { cwd });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd });
+
+  await writeBrainstorm(cwd, "2026-09-01-staged.md", {
+    title: "Staged",
+    status: "proposed",
+    created: "2026-09-01",
+    change_id: "staged",
+  });
+  const dir = await writeProposedChange(cwd, "staged", ["- src/keep.ts"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"], { cwd });
+  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "keep"], { cwd });
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-09-01 · Staged");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  // Apply: modify src/keep.ts and STAGE it, leaving nothing unstaged.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\nexport const more = 3;\n", "utf8");
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "src/keep.ts"], { cwd });
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "staged");
+  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
+  assert.ok(applyEnd, "an apply end event exists");
+  assert.equal(applyEnd.outcome, "applied");
+  assert.ok((applyEnd.diff?.files ?? 0) >= 1, "the staged file is counted (git diff --numstat would report 0)");
+  assert.ok((applyEnd.diff?.added ?? 0) >= 1, "the staged added lines are counted");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

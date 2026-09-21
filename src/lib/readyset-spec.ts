@@ -16,7 +16,7 @@
  * reason documented there).
  */
 
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
 
@@ -49,7 +49,7 @@ export function changePaths(cwd: string, changeId: string): ChangePaths {
 
 async function exists(path: string): Promise<boolean> {
 	try {
-		await readFile(path);
+		await stat(path);
 		return true;
 	} catch {
 		return false;
@@ -58,7 +58,6 @@ async function exists(path: string): Promise<boolean> {
 
 async function isDir(path: string): Promise<boolean> {
 	try {
-		const { stat } = await import("node:fs/promises");
 		return (await stat(path)).isDirectory();
 	} catch {
 		return false;
@@ -377,6 +376,20 @@ export async function readPhaseEvents(cwd: string, changeId: string): Promise<Ph
 	return events;
 }
 
+/**
+ * True once this change has actually been applied at least once: the phase log has an `apply`
+ * `end` event with outcome `"applied"`, or tasks.md already has one or more done tasks. Used to
+ * switch contract checks to post-Apply semantics when the gate reopens after Apply (e.g. "Address
+ * findings first" then /readyset again, or Refine after Apply) — otherwise every `(new)` file the
+ * change created reads NEW-BUT-EXISTS and every `(delete)` file reads DELETE-BUT-MISSING.
+ */
+export async function hasBeenApplied(cwd: string, changeId: string): Promise<boolean> {
+	const events = await readPhaseEvents(cwd, changeId);
+	if (events.some((e) => e.phase === "apply" && e.edge === "end" && e.outcome === "applied")) return true;
+	const progress = await getProgress(cwd, changeId);
+	return (progress?.done ?? 0) > 0;
+}
+
 export interface ValidationIssue {
 	file: string;
 	problem: string;
@@ -581,19 +594,32 @@ export interface ScopeCheck {
  * change's own artifacts) and .ai/brainstorms/ are always in scope — they are the planning
  * workspace, not product code. Everything else must be named in the contract; an absent
  * contract is reported as noContract, never silently treated as a pass.
+ *
+ * A contract entry ending in `/`, or one that is an existing directory, means "anything under
+ * it" and matches by prefix (in addition to an exact match on the normalized entry).
  */
 export async function checkScope(cwd: string, changeId: string, changedPaths: string[]): Promise<ScopeCheck> {
 	const contract = await readScopeContract(cwd, changeId);
 	if (contract.files === undefined) return { outside: [], noContract: true };
 	// New files are in scope too — Apply is allowed to create anything the contract names as
 	// `(new)`, not just modify files that already exist.
-	const allowed = new Set([...contract.files, ...contract.newFiles, ...contract.deleteFiles].map((f) => join(cwd, f)));
+	const entries = [...contract.files, ...contract.newFiles, ...contract.deleteFiles];
+	const allowed = new Set(entries.map((f) => join(cwd, f)));
+	// A trailing `/` (or a real directory on disk) widens the entry to a prefix match.
+	const prefixes = new Set<string>();
+	for (const entry of entries) {
+		const normalized = entry.replace(/\/+$/, "");
+		if (entry.endsWith("/") || (await isDir(join(cwd, normalized)))) prefixes.add(normalized);
+	}
 	const outside: string[] = [];
 	for (const rawPath of changedPaths) {
 		const abs = join(cwd, rawPath);
 		if (abs.startsWith(join(cwd, READYSET_ROOT) + sep)) continue;
 		if (abs.startsWith(join(cwd, ".ai", "brainstorms") + sep)) continue;
-		if (!allowed.has(abs)) outside.push(rawPath);
+		if (allowed.has(abs)) continue;
+		const rel = rawPath.replace(/\/+$/, "");
+		if ([...prefixes].some((prefix) => rel === prefix || rel.startsWith(`${prefix}/`))) continue;
+		outside.push(rawPath);
 	}
 	return { outside, noContract: false };
 }

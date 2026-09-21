@@ -11,17 +11,12 @@ only had that much change in it.
 A quality-and-cost pass driven by the `v0.12` full-matrix benchmark (12 tasks × 3 reps × 2 arms).
 It tightens the one dimension Readyset still didn't win — scope discipline — at the two places it
 was still unchecked, closes the largest objective gap in the report (dangling file references), and
-cuts the biggest number in the cost breakdown (prep-phase tokens). Nothing here changes what the
-gate blocks on; where a check is added it warns, as the scope contract already did.
+targets the biggest number in the cost breakdown (prep-phase tokens) (expected, pending the
+next benchmark). Nothing here changes what the gate blocks on; where a check is added it warns, as the
+scope contract already did.
 
 ### Added
 
-- **Dangling file references in the scope contract are now flagged.** Readyset named files it would
-  modify that didn't exist at **0.53/run vs 0.03/run** for `/plan` — the largest relative gap of any
-  objective metric in the v0.12 report. A `## Files This Change Will Touch` path that isn't marked
-  `(new)` and doesn't exist on disk is now reported as `scope refs: DANGLING …` in the gate panel
-  and listed in a new **Scope** section of the review document. Advisory, like the OUT-OF-SCOPE
-  check: it flags, it never blocks.
 - **Files the change will create must be marked `(new)`.** The section already listed existing
   files and to-be-created files together with nothing distinguishing them, which is why an
   existence check needs a marker. A trailing `(new)` (e.g. `- src/lib/thing.ts (new)`) now marks a
@@ -41,16 +36,20 @@ gate blocks on; where a check is added it warns, as the scope contract already d
   the phase model and an outcome. readyset-bench's compile step can now split results by lane and
   attribute session tokens/wall time to phases by timestamp. Advisory only — the existing
   human-readable phase entries are unchanged and additional.
-- **Dangling contract references are repaired once, automatically, before the gate.** 0.13.0 only
-  *flagged* a `## Files This Change Will Touch` path that didn't exist; the v0.12 data showed
-  warnings alone barely move model behavior, so after the Propose turn (and after every Refine turn)
-  Readyset now fires **at most one** repair turn that rewrites only that section to fix the
-  offending paths, re-checks the planning boundary, and re-checks the contract. The check now
-  reports three kinds — dangling, `(new)` on a file that already exists, and `(delete)` on a file
-  that doesn't — and the gate panel and review document show all three. A `(delete)` marker is now
-  understood (a `(delete)` path must exist before Apply and is allowed to be gone afterward). The
-  repair never loops and is skipped when the run has no turn budget left; whatever remains still
-  only warns. Recorded in `CONTEXT.md` and as a `contract-repair` phase event.
+- **Dangling contract references are flagged and repaired once, automatically, before the gate.**
+  Readyset named files it would modify that didn't exist at **0.53/run vs 0.03/run** for `/plan` — the
+  largest relative gap of any objective metric in the v0.12 report. A `## Files This Change Will
+  Touch` path that isn't marked `(new)` and doesn't exist is now flagged as
+  `scope refs: DANGLING …` in the gate panel and listed in a new **Scope** section of the review
+  document. The v0.12 data showed warnings alone barely move model behavior, so after the Propose
+  turn (and after every Refine turn) Readyset now fires **at most one** repair turn that rewrites
+  only that section to fix the offending paths, re-checks the planning boundary, and re-checks the
+  contract. The check reports three kinds — dangling, `(new)` on a file that already exists, and
+  `(delete)` on a file that doesn't — and the gate panel and review document show all three. A
+  `(delete)` marker is now understood (a `(delete)` path must exist before Apply and is allowed to
+  be gone afterward). The repair never loops and is skipped when the run has no turn budget left;
+  whatever remains still only warns. Recorded in `CONTEXT.md` and as a `contract-repair` phase
+  event.
 - **Apply is accountable to the scope contract, and pushed toward minimal diffs.** The v0.12
   benchmark showed Readyset's diffs still ran far larger than `/plan`'s — lines changed **246 vs
   107**, code files changed **5.6 vs 4.4**, files outside expected scope **0.72 vs 0.39** — and the
