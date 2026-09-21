@@ -336,14 +336,14 @@ export function parseContractLine(line: string): ContractLine | undefined {
 	if (!match) return undefined;
 	const first = match[1];
 	const commentary = match[2];
-	if (!looksLikePath(first)) return undefined;
 	const path = first
 		.replace(/^[`'"]+/, "") // opening backtick/quote
 		.replace(/[`'"]+$/, "") // closing backtick/quote
 		.replace(/[.,;:]+$/, "") // trailing sentence punctuation
 		.replace(/^\.\//, ""); // a leading "./" is noise, not part of the repo-relative path
+	if (!looksLikePath(path)) return undefined;
 	if (!path || path === "." || path === "..") return undefined;
-	return { path, isNew: /\(\s*new\s*\)/i.test(commentary) };
+	return { path, isNew: /\(\s*new\b[^)]*\)/i.test(commentary) };
 }
 
 // The previous implementation gated paths on a hard-coded directory whitelist
@@ -360,6 +360,11 @@ const EXTENSIONLESS_FILES: Record<string, true> = {
 	LICENSE: true, CODEOWNERS: true,
 };
 
+/** Common prose slash-words that are not paths. Compared case-insensitively. */
+const PROSE_SLASH_WORDS: Record<string, true> = {
+	"n/a": true, "and/or": true, "either/or": true, "input/output": true, "read/write": true,
+};
+
 /**
  * Language-agnostic "is this token a file path?" test.
  */
@@ -368,17 +373,19 @@ function looksLikePath(token: string): boolean {
 	if (/\s/.test(token)) return false;
 	if (token.includes("://")) return false;
 	if (token.startsWith("#")) return false; // an ATX heading is never a path
+	if (PROSE_SLASH_WORDS[token.toLowerCase()]) return false; // "N/A", "and/or", ...
 	if (EXTENSIONLESS_FILES[token]) return true;
 	const base = token.slice(token.lastIndexOf("/") + 1);
 	if (base.startsWith(".") && base.length > 1) return true; // dotfile: .gitignore, .env.example
+	// A directory separator between path characters: "app/handler.go", ".github/workflows/ci.yml",
+	// and extensionless files inside a directory ("bin/readyset-flow", "scripts/deploy").
+	if (/^[\w.-]+\/[\w.-]/.test(token)) return true;
+	// A root-level token must be "name.ext" with a 2+ char stem: reject "e.g"/"i.e", accept "go.mod".
 	const dot = base.lastIndexOf(".");
 	if (dot <= 0) return false;
 	const stem = base.slice(0, dot);
 	const ext = base.slice(dot + 1);
-	// "name.ext" with a 2+ char stem: rejects "e.g"/"i.e", accepts "go.mod".
-	if (stem.length >= 2 && ext.length >= 1) return true;
-	// A directory separator between path characters: "app/handler.go", ".github/workflows/ci.yml".
-	return token.includes("/");
+	return stem.length >= 2 && ext.length >= 1;
 }
 
 /**

@@ -502,6 +502,9 @@ await test("parseContractLine: numbered list items and (new) after other comment
   assert.deepEqual(parseContractLine("1) src/y.ts"), { path: "src/y.ts", isNew: false });
   assert.deepEqual(parseContractLine("- src/c.ts -- helper (new)"), { path: "src/c.ts", isNew: true });
   assert.deepEqual(parseContractLine("- src/z.ts: (new)"), { path: "src/z.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- src/y.ts (new, helper)"), { path: "src/y.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- src/x.ts (NEW file)"), { path: "src/x.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- src/z.ts (renewed)"), { path: "src/z.ts", isNew: false });
 });
 
 await test("parseContractLine: tokens that are not paths are skipped", async () => {
@@ -518,6 +521,14 @@ await test("parseContractLine: extensionless files, dotfiles and stray punctuati
   assert.equal(parseContractLine("- **src/a.ts**")?.path, "src/a.ts");
   assert.equal(parseContractLine("- go.mod")?.path, "go.mod");
   assert.equal(parseContractLine("- build.gradle.kts")?.path, "build.gradle.kts");
+  assert.deepEqual(parseContractLine("- `Makefile`"), { path: "Makefile", isNew: false });
+  assert.deepEqual(parseContractLine("- Makefile:"), { path: "Makefile", isNew: false });
+  assert.equal(parseContractLine("- e.g., the handler"), undefined);
+  assert.equal(parseContractLine("- a.go"), undefined);
+  assert.deepEqual(parseContractLine("- bin/readyset-flow"), { path: "bin/readyset-flow", isNew: false });
+  assert.deepEqual(parseContractLine("- scripts/deploy"), { path: "scripts/deploy", isNew: false });
+  assert.equal(parseContractLine("- N/A"), undefined);
+  assert.equal(parseContractLine("- and/or tests"), undefined);
 });
 
 await test("readScopeContract: parses the Files section, bullets and bare paths", async () => {
