@@ -459,15 +459,15 @@ await test("checkPhaseViolations: a file with the change id as a prefix is still
 });
 
 await test("parseContractLine: the reproduction section parses completely", async () => {
-  assert.deepEqual(parseContractLine("- app/handler.go"), { path: "app/handler.go", isNew: false });
-  assert.deepEqual(parseContractLine("- packages/core/index.ts"), { path: "packages/core/index.ts", isNew: false });
-  assert.deepEqual(parseContractLine("- .github/workflows/ci.yml"), { path: ".github/workflows/ci.yml", isNew: false });
-  assert.deepEqual(parseContractLine("- src/a.ts (new)"), { path: "src/a.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- `src/b.ts` (new)"), { path: "src/b.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- src/c.ts (new) -- helper"), { path: "src/c.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- src/d.ts — modified"), { path: "src/d.ts", isNew: false });
-  assert.deepEqual(parseContractLine("- Makefile"), { path: "Makefile", isNew: false });
-  assert.deepEqual(parseContractLine("- src/e.tsx"), { path: "src/e.tsx", isNew: false });
+  assert.deepEqual(parseContractLine("- app/handler.go"), { path: "app/handler.go", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- packages/core/index.ts"), { path: "packages/core/index.ts", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- .github/workflows/ci.yml"), { path: ".github/workflows/ci.yml", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/a.ts (new)"), { path: "src/a.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- `src/b.ts` (new)"), { path: "src/b.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/c.ts (new) -- helper"), { path: "src/c.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/d.ts — modified"), { path: "src/d.ts", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- Makefile"), { path: "Makefile", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/e.tsx"), { path: "src/e.tsx", isNew: false , isDelete: false });
 });
 
 await test("readScopeContract: the reproduction section keeps every path and splits (new)", async () => {
@@ -489,6 +489,7 @@ await test("readScopeContract: the reproduction section keeps every path and spl
       "- src/d.ts — modified",
       "- Makefile",
       "- src/e.tsx",
+      "- src/old.ts (delete)",
       "",
       "## What Changes",
       "",
@@ -499,22 +500,38 @@ await test("readScopeContract: the reproduction section keeps every path and spl
   const contract = await readScopeContract(cwd, "repro");
   assert.deepEqual(contract.files, ["app/handler.go", "packages/core/index.ts", ".github/workflows/ci.yml", "src/d.ts", "Makefile", "src/e.tsx"]);
   assert.deepEqual(contract.newFiles, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+  assert.deepEqual(contract.deleteFiles, ["src/old.ts"]);
 });
 
 await test("parseContractLine: numbered list items and (new) after other commentary", async () => {
-  assert.deepEqual(parseContractLine("1. src/x.ts"), { path: "src/x.ts", isNew: false });
-  assert.deepEqual(parseContractLine("1) src/y.ts"), { path: "src/y.ts", isNew: false });
-  assert.deepEqual(parseContractLine("- src/c.ts -- helper (new)"), { path: "src/c.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- src/z.ts: (new)"), { path: "src/z.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- src/y.ts (new, helper)"), { path: "src/y.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- src/x.ts (NEW file)"), { path: "src/x.ts", isNew: true });
-  assert.deepEqual(parseContractLine("- src/z.ts (renewed)"), { path: "src/z.ts", isNew: false });
+  assert.deepEqual(parseContractLine("1. src/x.ts"), { path: "src/x.ts", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("1) src/y.ts"), { path: "src/y.ts", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/c.ts -- helper (new)"), { path: "src/c.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/z.ts: (new)"), { path: "src/z.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/y.ts (new, helper)"), { path: "src/y.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/x.ts (NEW file)"), { path: "src/x.ts", isNew: true , isDelete: false });
+  assert.deepEqual(parseContractLine("- src/z.ts (renewed)"), { path: "src/z.ts", isNew: false , isDelete: false });
 });
 
 await test("parseContractLine: tokens that are not paths are skipped", async () => {
   for (const line of ["- prose without a path", "**Existing files:**", "None", "- https://example.com/x", "- e.g.", "- i.e", "- .", "- ..", ""]) {
     assert.equal(parseContractLine(line), undefined);
   }
+});
+
+await test("parseContractLine: (delete)/(deleted)/(remove)/(removed) markers", async () => {
+  assert.deepEqual(parseContractLine("- src/gone.ts (delete)"), { path: "src/gone.ts", isNew: false, isDelete: true });
+  assert.deepEqual(parseContractLine("- src/gone.ts (deleted)"), { path: "src/gone.ts", isNew: false, isDelete: true });
+  assert.deepEqual(parseContractLine("- src/gone.ts (remove)"), { path: "src/gone.ts", isNew: false, isDelete: true });
+  assert.deepEqual(parseContractLine("- src/gone.ts (removed)"), { path: "src/gone.ts", isNew: false, isDelete: true });
+  assert.equal(parseContractLine("- src/gone.ts (deletion)")?.isDelete, false, "a different word is not a delete marker");
+  assert.deepEqual(parseContractLine("- src/a.ts"), { path: "src/a.ts", isNew: false, isDelete: false });
+});
+
+await test("parseContractLine: (new) and (delete) are mutually exclusive", async () => {
+  const line = parseContractLine("- src/a.ts (new) (delete)");
+  assert.equal(line?.isNew, true, "(new) wins when both markers appear");
+  assert.equal(line?.isDelete, false);
 });
 
 await test("parseContractLine: extensionless files, dotfiles and stray punctuation", async () => {
@@ -525,12 +542,12 @@ await test("parseContractLine: extensionless files, dotfiles and stray punctuati
   assert.equal(parseContractLine("- **src/a.ts**")?.path, "src/a.ts");
   assert.equal(parseContractLine("- go.mod")?.path, "go.mod");
   assert.equal(parseContractLine("- build.gradle.kts")?.path, "build.gradle.kts");
-  assert.deepEqual(parseContractLine("- `Makefile`"), { path: "Makefile", isNew: false });
-  assert.deepEqual(parseContractLine("- Makefile:"), { path: "Makefile", isNew: false });
+  assert.deepEqual(parseContractLine("- `Makefile`"), { path: "Makefile", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- Makefile:"), { path: "Makefile", isNew: false , isDelete: false });
   assert.equal(parseContractLine("- e.g., the handler"), undefined);
   assert.equal(parseContractLine("- a.go"), undefined);
-  assert.deepEqual(parseContractLine("- bin/readyset-flow"), { path: "bin/readyset-flow", isNew: false });
-  assert.deepEqual(parseContractLine("- scripts/deploy"), { path: "scripts/deploy", isNew: false });
+  assert.deepEqual(parseContractLine("- bin/readyset-flow"), { path: "bin/readyset-flow", isNew: false , isDelete: false });
+  assert.deepEqual(parseContractLine("- scripts/deploy"), { path: "scripts/deploy", isNew: false , isDelete: false });
   assert.equal(parseContractLine("- N/A"), undefined);
   assert.equal(parseContractLine("- and/or tests"), undefined);
 });
@@ -642,6 +659,48 @@ await test("checkScopeRefs: no contract -> noContract true, empty missing", asyn
   const result = await checkScopeRefs(cwd, "refsnocontract");
   assert.equal(result.noContract, true);
   assert.deepEqual(result.missing, []);
+});
+
+await test("checkScopeRefs: (new) that already exists is newButExists, not missing", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "nbe");
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "exists.ts"), "x", "utf8");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- src/exists.ts (new)\n- src/created.ts (new)\n", "utf8");
+  const result = await checkScopeRefs(cwd, "nbe");
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.newButExists, ["src/exists.ts"]);
+  assert.deepEqual(result.deleteButMissing, []);
+});
+
+await test("checkScopeRefs: (delete) that is missing is deleteButMissing, and afterApply ignores it", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "dbm");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- src/gone.ts (delete)\n", "utf8");
+  const before = await checkScopeRefs(cwd, "dbm");
+  assert.deepEqual(before.deleteButMissing, ["src/gone.ts"]);
+  const after = await checkScopeRefs(cwd, "dbm", { afterApply: true });
+  assert.deepEqual(after.deleteButMissing, []);
+  assert.deepEqual(after.missing, []);
+});
+
+await test("checkScopeRefs: no contract -> all three lists empty, noContract true", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "refsnocontract2");
+  const result = await checkScopeRefs(cwd, "refsnocontract2");
+  assert.equal(result.noContract, true);
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.newButExists, []);
+  assert.deepEqual(result.deleteButMissing, []);
+});
+
+await test("checkScope: a (delete) path is in scope", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "delscope");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- src/gone.ts (delete)\n- src/rogue.ts\n", "utf8");
+  const result = await checkScope(cwd, "delscope", ["src/gone.ts", "src/other.ts"]);
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.outside, ["src/other.ts"]);
 });
 
 await test("validateChange: inspection-only THEN is flagged as unobservable", async () => {

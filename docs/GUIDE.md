@@ -316,11 +316,18 @@ Picks a brainstorm, then depending on its status:
   `## Files This Change Will Touch` contract. Anything changed that the contract doesn't name is
   listed as **OUT OF SCOPE** (paths under `readyset/` and `.ai/brainstorms/` are always in scope). An
   absent contract reads as "no contract", not a silent pass. It **warns, never blocks**.
-  - The contract is also checked for **dangling references**: a path that isn't marked `(new)` and
-    doesn't exist on disk is a file the plan claims it will modify that isn't there, shown as
-    `scope refs: DANGLING …` and listed in the review document's **Scope** section. Mark files the
-    change will *create* with `(new)` (e.g. `- src/lib/thing.ts (new)`) so their absence reads as
-    expected, not dangling.
+  - The contract is also checked for three kinds of reference problem, and Readyset now tries to
+    **fix them automatically, once, before the gate**: an unmarked path that doesn't exist
+    (**dangling**), a path marked `(new)` that already exists on disk (**new-but-exists** — the plan
+    would overwrite a real file believing it creates one), and a path marked `(delete)` that doesn't
+    exist (**delete-but-missing**). If any are present, one repair turn rewrites only the
+    `## Files This Change Will Touch` section (and matching path mentions) to correct them, then the
+    check re-runs. The repair **runs at most once per Propose or Refine** and is skipped when the run
+    has no turn budget left. Anything it could not fix is still shown — `scope refs: DANGLING …
+    · NEW-BUT-EXISTS … · DELETE-BUT-MISSING …` in the panel, and all three listed in the review
+    document's **Scope** section, which also shows `contract repair: fixed N of M` when a repair ran.
+    Mark files the change will *create* with `(new)` and files it will *delete* with `(delete)` so
+    each absence or presence reads as expected.
 - Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
@@ -393,8 +400,9 @@ Under `readyset/changes/<id>/`, in the order they get written:
 ```
 EXPLORATION.md   Explore phase findings — what was actually checked, and what was found
 proposal.md      Why / What Changes, plus the `## Files This Change Will Touch` scope contract
-                 (mark files the change will create with `(new)`, so the gate can tell them
-                 from files that must already exist)
+                 (mark files the change will create with `(new)` and files it will delete with
+                 `(delete)`, so the gate can tell them from files that must already exist; Readyset
+                 repairs a wrong contract once, automatically, before the gate)
 design.md        Context / Goals-Non-Goals / Decisions / Risks
 specs/**/spec.md ADDED/MODIFIED/REMOVED Requirements as WHEN/THEN scenarios
 tasks.md         checkbox tasks; each `- [x]` carries an indented `_Verified:` note

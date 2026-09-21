@@ -29,6 +29,7 @@ import {
 	listSubmodules,
 	type PhaseName,
 	readDirtyBaseline,
+	readContext,
 	readReview,
 	readScopeContract,
 	scaffoldChange,
@@ -116,7 +117,8 @@ const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (
   allowed to modify plus every new file it may create. Mark each new file with a trailing
   "(new)" (e.g. "- src/lib/thing.ts (new)") so the gate can tell a file the change creates from
   one that must already exist — an unmarked path that doesn't exist is a dangling reference and
-  gets flagged. This is the scope contract the gate
+  gets flagged. Mark a file this change deletes with "(delete)" (e.g. "- src/legacy.ts (delete)");
+  it must exist before Apply and is allowed to be gone afterward. This is the scope contract the gate
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
   arm's, and T12 grew an unasked-for 160-line bench file). A file not on this list may not
   be written during Apply without asking first.
@@ -974,6 +976,96 @@ async function spendTurn(pi: ExtensionAPI, ctx: ReviewCtx, budget: TurnBudget, l
 	return true;
 }
 
+/** The three problem kinds the contract-repair prompt can name, in the order it lists them. */
+function scopeRefProblems(refs: Awaited<ReturnType<typeof checkScopeRefs>>): string[] {
+	const lines: string[] = [];
+	for (const p of refs.missing) lines.push(`${p} — named but does not exist (is it really the right path? or should it be marked (new)?)`);
+	for (const p of refs.newButExists) lines.push(`${p} — marked (new) but the file already exists (drop the (new) if it will be modified)`);
+	for (const p of refs.deleteButMissing) lines.push(`${p} — marked (delete) but there is no such file to remove`);
+	return lines;
+}
+
+/** Prompt for the one-shot contract-repair turn: fix ONLY the scope contract, no code. */
+function contractRepairPrompt(problems: string[]): string {
+	return (
+		"Your `## Files This Change Will Touch` scope contract in proposal.md is wrong. Fix ONLY that " +
+		"section — do not touch code, do not restructure any other part of proposal.md, design.md, " +
+		"specs/, or tasks.md except to correct a path mention that matches a path you change here.\n\n" +
+		"Problems:\n" +
+		problems.map((p) => `- ${p}`).join("\n") +
+		"\n\nFor each path above: verify the real file with a read or a directory listing, then either " +
+		"correct the path to the real file, mark it `(new)` if this change truly creates it, drop the " +
+		"`(new)` if the file exists and will be modified, mark it `(delete)` if this change removes it " +
+		"(only if it exists now), or remove the line if the file isn't needed. Leave correctly-listed " +
+		"paths alone."
+	);
+}
+
+/**
+ * Bounded, one-shot contract repair: if the scope contract has dangling refs, a `(new)` path that
+ * already exists, or a `(delete)` path that doesn't, fire ONE repair turn (riding the propose phase
+ * model), re-check the planning boundary, and re-check the contract. Never loops — one turn per
+ * Propose/Refine. A `turn-needing` result is recorded as an appendContext entry and a
+ * `contract-repair` phase event. Callers then take their snapshot as usual; whatever is still wrong
+ * shows in the gate as a warning, exactly as today.
+ *
+ * `record` is the caller's `recordPhase` (the handler's factory-local one, or the module-scope loop
+ * one) so the event carries the run's lane/laneSource. Returns the post-repair refs so the caller
+ * does not re-check.
+ */
+async function runContractRepair(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	budget: TurnBudget,
+	changeId: string,
+	phaseModels: Map<string, { model: string; source: string }>,
+	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string }) => Promise<void>,
+): Promise<Awaited<ReturnType<typeof checkScopeRefs>>> {
+	const before = await checkScopeRefs(ctx.cwd, changeId);
+	const problems = scopeRefProblems(before);
+	if (problems.length === 0) return before; // nothing to repair: no event, no turn
+
+	if (budget.spent >= budget.max) {
+		ctx.ui.notify(
+			`The scope contract for "${changeId}" has ${problems.length} problem(s), but this run has no turn left to repair them — showing them in the gate instead.`,
+			"warning",
+		);
+		await record("contract-repair", "end", { outcome: "skipped-budget" });
+		return before;
+	}
+
+	ctx.ui.notify(`Repairing the scope contract for "${changeId}" (${problems.length} problem(s))...`, "info");
+	await record("contract-repair", "start", { model: phaseModels.get("propose")?.model });
+	await withPhaseModel(pi, ctx, "propose", phaseModels, () =>
+		spendTurn(pi, ctx, budget, "Contract repair", contractRepairPrompt(problems)),
+	);
+
+	// The repair turn is a planning turn: it may only touch the change directory. Checked the same
+	// way the Propose turn is, before the contract is trusted again.
+	const violations = await checkPhaseViolations(ctx.cwd, changeId, await pathsChangedThisRun(ctx.cwd, changeId));
+	if (violations.length > 0) {
+		ctx.ui.notify(
+			`The contract-repair turn for "${changeId}" changed files outside the change directory (${violations.map((v) => v.path).join(", ")}) — treating the repair as failed.`,
+			"error",
+		);
+		await appendContext(ctx.cwd, changeId, "Contract repair", `Repair turn wrote outside the change dir: ${violations.map((v) => `${v.path} (${v.detail})`).join("; ")}.`);
+		await record("contract-repair", "end", { model: phaseModels.get("propose")?.model, outcome: "partial" });
+		return checkScopeRefs(ctx.cwd, changeId);
+	}
+
+	const after = await checkScopeRefs(ctx.cwd, changeId);
+	const remaining = scopeRefProblems(after).length;
+	const fixed = problems.length - remaining;
+	await appendContext(
+		ctx.cwd,
+		changeId,
+		"Contract repair",
+		`${problems.length} issue(s) before, ${remaining} after: ${scopeRefProblems(after).map((p) => p.split(" — ")[0]).join(", ") || "(all fixed)"}`,
+	);
+	await record("contract-repair", "end", { model: phaseModels.get("propose")?.model, outcome: remaining === 0 ? "fixed" : "partial" });
+	return after;
+}
+
 interface ReviewSnapshot {
 	counted: { done: number; total: number } | undefined;
 	validated: Awaited<ReturnType<typeof validateChange>>;
@@ -1065,14 +1157,26 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 			heading: "Scope",
 			status: snapshot.scope.noContract
 				? "no contract"
-				: snapshot.scope.outside.length + snapshot.scopeRefs.missing.length > 0
-					? `${snapshot.scope.outside.length} out-of-scope, ${snapshot.scopeRefs.missing.length} dangling`
+				: snapshot.scope.outside.length +
+							snapshot.scopeRefs.missing.length +
+							snapshot.scopeRefs.newButExists.length +
+							snapshot.scopeRefs.deleteButMissing.length >
+						0
+					? `${snapshot.scope.outside.length} out-of-scope, ${snapshot.scopeRefs.missing.length + snapshot.scopeRefs.newButExists.length + snapshot.scopeRefs.deleteButMissing.length} ref problem(s)`
 					: "clean",
 			render: async () => {
 				const contract = await readScopeContract(ctx.cwd, chosen.changeId);
 				if (contract.files === undefined) {
 					return "_(no 'Files This Change Will Touch' contract in proposal.md — scope unknown.)_";
 				}
+				const contextRaw = await readContext(ctx.cwd, chosen.changeId).catch(() => undefined);
+				// The last appendContext entry whose phase is "Contract repair" looks like
+				// "## Contract repair — <ts>\n\n<N> issue(s) before, <M> after: ..."
+				const repairMatches = [...(contextRaw ?? "").matchAll(/## Contract repair —[^\n]*\n\n(\d+) issue\(s\) before, (\d+) after/g)];
+				const lastRepair = repairMatches[repairMatches.length - 1];
+				const repairLine = lastRepair
+					? `contract repair: fixed ${Number(lastRepair[1]) - Number(lastRepair[2])} of ${lastRepair[1]}`
+					: "contract repair: not run";
 				return [
 					"Contract:",
 					"",
@@ -1084,6 +1188,13 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 					snapshot.scopeRefs.missing.length > 0
 						? `Dangling refs (named but don't exist, not marked (new)): ${snapshot.scopeRefs.missing.join(", ")}`
 						: "Dangling refs (named but don't exist, not marked (new)): none",
+					snapshot.scopeRefs.newButExists.length > 0
+						? `New-but-exists (marked (new) but already on disk): ${snapshot.scopeRefs.newButExists.join(", ")}`
+						: "New-but-exists (marked (new) but already on disk): none",
+					snapshot.scopeRefs.deleteButMissing.length > 0
+						? `Delete-but-missing (marked (delete) but not on disk): ${snapshot.scopeRefs.deleteButMissing.join(", ")}`
+						: "Delete-but-missing (marked (delete) but not on disk): none",
+					repairLine,
 				].join("\n");
 			},
 		},
@@ -1310,8 +1421,17 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 				? `scope: OUT OF SCOPE already changed in the tree: ${snapshot.scope.outside.join(", ")}`
 				: "scope: working tree matches the contract",
 		// Only surface when there is a problem — a clean contract needs no line.
-		...(snapshot.scopeRefs.missing.length > 0
-			? [`scope refs: DANGLING — contract names file(s) that don't exist: ${snapshot.scopeRefs.missing.join(", ")}`]
+		...((snapshot.scopeRefs.missing.length > 0 || snapshot.scopeRefs.newButExists.length > 0 || snapshot.scopeRefs.deleteButMissing.length > 0)
+			? [
+					"scope refs: " +
+						[
+							snapshot.scopeRefs.missing.length > 0 ? `DANGLING ${snapshot.scopeRefs.missing.join(", ")}` : "",
+							snapshot.scopeRefs.newButExists.length > 0 ? `NEW-BUT-EXISTS ${snapshot.scopeRefs.newButExists.join(", ")}` : "",
+							snapshot.scopeRefs.deleteButMissing.length > 0 ? `DELETE-BUT-MISSING ${snapshot.scopeRefs.deleteButMissing.join(", ")}` : "",
+						]
+							.filter(Boolean)
+							.join(" · "),
+				]
 			: []),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
@@ -1407,6 +1527,9 @@ async function reviewAndMaybeExecute(
 		}).catch(() => {});
 	};
 
+	const recordRepair = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string } = {}) =>
+		recordPhase(chosen.changeId, phase, edge, extra);
+
 	for (;;) {
 		// Gate boundary opens before the review snapshot is taken (the panel the user sees) and
 		// closes once `choice` is resolved. The gate is UI, not a model turn, so no `model` field.
@@ -1486,6 +1609,7 @@ async function reviewAndMaybeExecute(
 				if (!refineFired) return;
 				refineOutcome = "refined";
 				await appendContext(ctx.cwd, chosen.changeId, "Refine", `User feedback: ${feedback}`);
+				await runContractRepair(pi, ctx, budget, chosen.changeId, phaseModels, recordRepair);
 			} finally {
 				await recordPhase(chosen.changeId, "refine", "end", { model: phaseModels.get("propose")?.model, outcome: refineOutcome });
 			}
@@ -2279,6 +2403,9 @@ export default function (pi: ExtensionAPI) {
 				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
 			};
 
+			const recordPhaseFor = async (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string } = {}) =>
+				recordPhase(chosen.changeId, phase, edge, phaseLane, phaseLaneSource, extra);
+
 			const fallbackFromFlag = parsedArgs.fallbackModel;
 			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
 			const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
@@ -2463,6 +2590,8 @@ export default function (pi: ExtensionAPI) {
 					"warning",
 				);
 			}
+
+			await runContractRepair(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, recordPhaseFor);
 
 			const reloaded = await loadBrainstorms(ctx.cwd);
 			await reconcileStatuses(ctx.cwd, reloaded);

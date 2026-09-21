@@ -290,7 +290,9 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
 }
 
 /** The phases a Readyset run records boundaries for. */
-export type PhaseName = "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive";
+export type PhaseName =
+	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"
+	| "contract-repair";
 
 /** One boundary event in the machine-parseable phase log. */
 export interface PhaseEvent {
@@ -380,11 +382,16 @@ export interface ValidateResult {
 
 export interface ScopeContract {
 	/** Repo-relative paths from the "## Files This Change Will Touch" section that are NOT marked
-	 *  `(new)` — i.e. files that must already exist. Undefined when the section is absent. */
+	 *  `(new)` or `(delete)` — i.e. files that must already exist. Undefined when the section is
+	 *  absent. */
 	files: string[] | undefined;
 	/** Repo-relative paths marked `(new)` — files this change will create. Always present (empty
 	 *  when none are marked, or when there is no contract). */
 	newFiles: string[];
+	/** Repo-relative paths marked `(delete)` — files this change will delete. Must exist before
+	 *  Apply and may be absent after it. Always present (empty when none are marked, or when there
+	 *  is no contract). */
+	deleteFiles: string[];
 	/** Raw section body, for display in the gate. */
 	raw: string | undefined;
 }
@@ -395,6 +402,9 @@ export interface ContractLine {
 	path: string;
 	/** True when the commentary after the path contains a `(new)` marker. */
 	isNew: boolean;
+	/** True when the commentary after the path contains a `(delete)`/`(deleted)`/`(remove)`/
+	 *  `(removed)` marker. Never true when `isNew` is true. */
+	isDelete: boolean;
 }
 
 /**
@@ -421,7 +431,9 @@ export function parseContractLine(line: string): ContractLine | undefined {
 		.replace(/^\.\//, ""); // a leading "./" is noise, not part of the repo-relative path
 	if (!looksLikePath(path)) return undefined;
 	if (!path || path === "." || path === "..") return undefined;
-	return { path, isNew: /\(\s*new\b[^)]*\)/i.test(commentary) };
+	const isNew = /\(\s*new\b[^)]*\)/i.test(commentary);
+	const isDelete = !isNew && /\(\s*(delete|deleted|remove|removed)\b[^)]*\)/i.test(commentary);
+	return { path, isNew, isDelete };
 }
 
 // The previous implementation gated paths on a hard-coded directory whitelist
@@ -484,21 +496,24 @@ function looksLikePath(token: string): boolean {
 export async function readScopeContract(cwd: string, changeId: string): Promise<ScopeContract> {
 	const paths = changePaths(cwd, changeId);
 	const raw = await readFile(paths.proposal, "utf8").catch(() => undefined);
-	if (raw === undefined) return { files: undefined, newFiles: [], raw: undefined };
+	if (raw === undefined) return { files: undefined, newFiles: [], deleteFiles: [], raw: undefined };
 	const match = raw.match(/^##[ \t]*Files This Change Will Touch[ \t]*\r?$/im);
-	if (!match || match.index === undefined) return { files: undefined, newFiles: [], raw: undefined };
+	if (!match || match.index === undefined) return { files: undefined, newFiles: [], deleteFiles: [], raw: undefined };
 	const rest = raw.slice(match.index + match[0].length);
 	const nextHeading = rest.match(/^##[ \t]/m);
 	const body = (nextHeading && nextHeading.index !== undefined ? rest.slice(0, nextHeading.index) : rest).trim();
-	if (!body) return { files: [], newFiles: [], raw: body };
+	if (!body) return { files: [], newFiles: [], deleteFiles: [], raw: body };
 	const files: string[] = [];
 	const newFiles: string[] = [];
+	const deleteFiles: string[] = [];
 	for (const line of body.split(/\r?\n/)) {
 		const parsed = parseContractLine(line);
 		if (parsed === undefined) continue;
-		(parsed.isNew ? newFiles : files).push(parsed.path);
+		if (parsed.isNew) newFiles.push(parsed.path);
+		else if (parsed.isDelete) deleteFiles.push(parsed.path);
+		else files.push(parsed.path);
 	}
-	return { files, newFiles, raw: body };
+	return { files, newFiles, deleteFiles, raw: body };
 }
 
 export interface ScopeCheck {
@@ -519,7 +534,7 @@ export async function checkScope(cwd: string, changeId: string, changedPaths: st
 	if (contract.files === undefined) return { outside: [], noContract: true };
 	// New files are in scope too — Apply is allowed to create anything the contract names as
 	// `(new)`, not just modify files that already exist.
-	const allowed = new Set([...contract.files, ...contract.newFiles].map((f) => join(cwd, f)));
+	const allowed = new Set([...contract.files, ...contract.newFiles, ...contract.deleteFiles].map((f) => join(cwd, f)));
 	const outside: string[] = [];
 	for (const rawPath of changedPaths) {
 		const abs = join(cwd, rawPath);
@@ -531,8 +546,15 @@ export async function checkScope(cwd: string, changeId: string, changedPaths: st
 }
 
 export interface ScopeRefs {
-	/** Contract paths (not marked `(new)`) that don't exist on the filesystem. Empty when all resolve. */
+	/** Contract paths (not marked `(new)`/`(delete)`) that don't exist on the filesystem. Empty
+	 *  when all resolve. */
 	missing: string[];
+	/** Paths marked `(new)` that already exist — the plan would overwrite a real file believing it
+	 *  creates one. Empty when none. */
+	newButExists: string[];
+	/** Paths marked `(delete)` that don't exist — there is nothing to delete. Empty when none, and
+	 *  always empty when `afterApply` is set. */
+	deleteButMissing: string[];
 	/** True when there is no contract at all (section absent) — not a pass, an unknown. */
 	noContract: boolean;
 }
@@ -542,16 +564,36 @@ export interface ScopeRefs {
  * don't exist. A `(new)` path is a file the change will create, so its absence now is expected,
  * not a dangling reference; an unmarked path claims the file already exists, so if it doesn't the
  * plan named a file to modify that isn't there. Advisory, mirroring `checkScope` — it flags, it
- * never blocks. The section-absent case is reported as noContract, never as a pass.
+ * never blocks. The section-absent case is reported as noContract, never as a pass. A `(new)` path
+ * that already exists (`newButExists`) means the plan would overwrite a real file believing it
+ * creates one. A `(delete)` path that doesn't exist is reported as `deleteButMissing` — unless
+ * `options.afterApply` is set, in which case a deleted file's absence is the expected outcome, not
+ * a problem.
  */
-export async function checkScopeRefs(cwd: string, changeId: string): Promise<ScopeRefs> {
+export async function checkScopeRefs(
+	cwd: string,
+	changeId: string,
+	options: { afterApply?: boolean } = {},
+): Promise<ScopeRefs> {
 	const contract = await readScopeContract(cwd, changeId);
-	if (contract.files === undefined) return { missing: [], noContract: true };
+	if (contract.files === undefined) {
+		return { missing: [], newButExists: [], deleteButMissing: [], noContract: true };
+	}
 	const missing: string[] = [];
 	for (const f of contract.files) {
 		if (!(await exists(join(cwd, f)))) missing.push(f);
 	}
-	return { missing, noContract: false };
+	const newButExists: string[] = [];
+	for (const f of contract.newFiles) {
+		if (await exists(join(cwd, f))) newButExists.push(f);
+	}
+	const deleteButMissing: string[] = [];
+	if (!options.afterApply) {
+		for (const f of contract.deleteFiles) {
+			if (!(await exists(join(cwd, f)))) deleteButMissing.push(f);
+		}
+	}
+	return { missing, newButExists, deleteButMissing, noContract: false };
 }
 
 /** Every markdown file directly under specs/**\/spec.md (any capability, any depth). */

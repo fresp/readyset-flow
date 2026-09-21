@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { readPhaseEvents, changePaths } from "../src/lib/readyset-spec.ts";
+import { readPhaseEvents, changePaths, readContext } from "../src/lib/readyset-spec.ts";
 
 // This whole file exercises readyset-review.ts's handler, which reads omp config
 // (language/model/fallback chain) via readPreferredLanguage()/readPinnedModel()/
@@ -2117,6 +2117,361 @@ await test("a discarded gate still closes its boundary with outcome discard", as
   assert.equal(gateEnd.outcome, "discard");
   const gateStart = events.find((e) => e.phase === "gate" && e.edge === "start");
   assert.ok(gateStart, "the gate start boundary is written too");
+});
+
+// --- Contract repair (dangling / new-but-exists / delete-but-missing) -------------------------
+
+// A minimal valid, *proposed* change so the handler reaches the gate without a Propose turn.
+// Mirrors the "already-proposed" tests above; used by the repair tests that reach the repair via
+// the Refine branch (the already-proposed path has no Propose turn to hang a repair on).
+async function writeProposedChange(cwd: string, changeId: string, contractLines: string[]) {
+  const dir = join(cwd, "readyset", "changes", changeId);
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  await writeFile(
+    join(dir, "proposal.md"),
+    ["## Why", "", "x", "", "## What Changes", "", "- x", "", "## Files This Change Will Touch", "", ...contractLines].join("\n") + "\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "specs", "cap", "spec.md"), "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+  return dir;
+}
+
+// Reads phase events from the archived CONTEXT.md if the change was archived, else the live path.
+async function phaseEventsArchivedOrLive(cwd: string, changeId: string) {
+  const live = await readPhaseEvents(cwd, changeId);
+  const archiveRoot = join(cwd, "readyset", "changes", "archive");
+  const entries = await (await import("node:fs/promises")).readdir(archiveRoot).catch(() => [] as string[]);
+  const dirName = entries.find((name) => name.endsWith(`-${changeId}`));
+  const archived = dirName ? await readPhaseEvents(cwd, `archive/${dirName}`) : [];
+  return archived.length > 0 ? archived : live;
+}
+
+await test("T0: the Propose path repairs a dangling contract before the gate", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(
+    cwd,
+    "2026-03-01-repair0.md",
+    { title: "Repair Zero", status: "open", created: "2026-03-01", change_id: "repair0", lane: "full" },
+    VALID_BRAINSTORM_BODY,
+  );
+  const dir = join(cwd, "readyset", "changes", "repair0");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-01 · Repair Zero"); // pick
+  fakeUiWrap.selectQueue.push("Archive now"); // archive prompt
+  fakeUiWrap.selectQueue.push("Approve & Execute"); // gate
+
+  // Propose turn: writes a contract with a dangling line.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(dir, "specs", "cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await writeFile(join(dir, "specs", "cap", "spec.md"), "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n", "utf8");
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
+  });
+  // Repair turn: rewrites the contract to a path that exists.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "real.ts"), "x\n", "utf8");
+  });
+  // Apply turn.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran it, it worked_\n", "utf8");
+  });
+  // Review turn.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  assert.ok(
+    fakePiWrap.calls.some((c) => /scope contract in proposal\.md is wrong/.test(c.prompt)),
+    "a repair turn fired with the repair prompt",
+  );
+  assert.ok(
+    !fakePiWrap.calls.some((c) => /Create a Readyset change/.test(c.prompt) && /scope contract in proposal\.md is wrong/.test(c.prompt)),
+    "the Propose prompt must not be the repair prompt",
+  );
+
+  const all = await phaseEventsArchivedOrLive(cwd, "repair0");
+  const repairEnd = all.find((e) => e.phase === "contract-repair" && e.edge === "end");
+  assert.ok(repairEnd, "a contract-repair end event exists");
+  assert.equal(repairEnd.outcome, "fixed");
+});
+
+await test("T1: a dangling contract triggers exactly one repair turn, then the gate", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-03-02-repair1.md", {
+    title: "Repair One",
+    status: "proposed",
+    created: "2026-03-02",
+    change_id: "repair1",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeProposedChange(cwd, "repair1", ["- src/missing.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-02 · Repair One"); // pick
+  fakeUiWrap.selectQueue.push("Refine"); // refine round
+  fakeUiWrap.inputQueue.push("fix the contract");
+  fakeUiWrap.selectQueue.push("Discard"); // second gate: discard
+
+  // (a) Refine turn: keeps the dangling line, so the repair still has work.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+  });
+  // (b) Repair turn: rewrites the contract to a path that exists.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "real.ts"), "x\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 2, "one Refine turn + one repair turn, no more");
+  assert.match(fakePiWrap.calls[0].prompt, /Revise the Readyset change/);
+  assert.match(fakePiWrap.calls[1].prompt, /scope contract in proposal\.md is wrong/);
+  assert.match(fakePiWrap.calls[1].prompt, /src\/missing\.ts/);
+
+  const events = await readPhaseEvents(cwd, "repair1");
+  const repairEnds = events.filter((e) => e.phase === "contract-repair" && e.edge === "end");
+  assert.equal(repairEnds.length, 1, "exactly one contract-repair end event");
+  assert.equal(repairEnds[0].outcome, "fixed");
+
+  const context = await readContext(cwd, "repair1");
+  assert.ok(context?.includes("## Contract repair —"), "a CONTEXT.md repair entry is written");
+  assert.ok(context?.includes("issue(s) before"), "the entry records the before/after count");
+});
+
+await test("T2: a clean contract triggers no repair", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-03-03-repair2.md", {
+    title: "Repair Two",
+    status: "proposed",
+    created: "2026-03-03",
+    change_id: "repair2",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeProposedChange(cwd, "repair2", ["- src/real.ts"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "real.ts"), "x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-03 · Repair Two");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("tweak the wording");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nupdated\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(!fakePiWrap.calls.some((c) => /scope contract in proposal\.md is wrong/.test(c.prompt)), "no repair turn fires");
+  const events = await readPhaseEvents(cwd, "repair2");
+  assert.ok(!events.some((e) => e.phase === "contract-repair"), "no contract-repair event exists");
+});
+
+await test("T3: a repair that writes outside the change dir is caught", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-03-04-repair3.md", {
+    title: "Repair Three",
+    status: "proposed",
+    created: "2026-03-04",
+    change_id: "repair3",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeProposedChange(cwd, "repair3", ["- src/missing.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-04 · Repair Three");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("fix the contract");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+  });
+  // Repair turn writes a rogue product file instead of fixing the contract.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "rogue.ts"), "// out of bounds\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "repair3");
+  const repairEnd = events.find((e) => e.phase === "contract-repair" && e.edge === "end");
+  assert.ok(repairEnd, "a contract-repair end event exists");
+  assert.equal(repairEnd.outcome, "partial");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /contract-repair turn.*outside the change directory/.test(n.message) && n.level === "error"),
+    "an error notification names the boundary violation",
+  );
+});
+
+await test("T4: an exhausted budget skips the repair and still reaches the gate", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-03-05-repair4.md", {
+    title: "Repair Four",
+    status: "proposed",
+    created: "2026-03-05",
+    change_id: "repair4",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeProposedChange(cwd, "repair4", ["- src/missing.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-05 · Repair Four");
+  // 10 Refine rounds, each keeping the contract dangling so the repair keeps wanting a turn.
+  // Each round consumes one turn; the 11th refine's spendTurn hits the cap.
+  for (let i = 0; i < 11; i++) {
+    fakeUiWrap.selectQueue.push("Refine");
+    fakeUiWrap.inputQueue.push(`refine ${i}`);
+  }
+  fakeUiWrap.selectQueue.push("Discard"); // final gate
+
+  for (let i = 0; i < 11; i++) {
+    fakePiWrap.queueEffect(async () => {
+      await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+    });
+  }
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Turn budget/.test(n.message) && n.level === "warning"),
+    "a turn-budget warning fired",
+  );
+  assert.ok(
+    fakeUiWrap.selectPrompts.some((p) => /Review change/.test(p)),
+    "the run still reached the review gate",
+  );
+
+  const events = await readPhaseEvents(cwd, "repair4");
+  const repairEnds = events.filter((e) => e.phase === "contract-repair" && e.edge === "end");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Turn budget/.test(n.message) && n.level === "warning"),
+    "a turn-budget warning fired",
+  );
+  assert.ok(
+    fakeUiWrap.selectPrompts.some((p) => /Review change/.test(p)),
+    "the run still reached the review gate",
+  );
+  assert.equal(fakePiWrap.calls.length, 10, "exactly the turn budget of model turns fired, never more");
+  // Observed behavior: the Refine turn consumes the last budget unit and `spendTurn` returns
+  // false, so the handler `return`s before the repair helper's pre-check runs — the repair never
+  // fires, and no `skipped-budget` event is written. The load-bearing guarantee (warn + reach the
+  // gate + never loop) is asserted above; this pins the exact presence so a change in ordering
+  // here is caught rather than hidden behind an `||`.
+  assert.equal(repairEnds.filter((e) => e.outcome === "skipped-budget").length, 0, "no repair turn fires once the budget is spent");
+  assert.equal(repairEnds.length, 5, "five repair turns ran before the budget was exhausted");
+});
+
+await test("T5: Refine triggers the repair again", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-03-06-repair5.md", {
+    title: "Repair Five",
+    status: "proposed",
+    created: "2026-03-06",
+    change_id: "repair5",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeProposedChange(cwd, "repair5", ["- src/missing.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-06 · Repair Five");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("round one");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("round two");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  // Round 1 refine leaves it dangling; its repair fixes it.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "real.ts"), "x\n", "utf8");
+  });
+  // Round 2 refine re-introduces a dangling line; its repair fixes it again.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "repair5");
+  const repairEnds = events.filter((e) => e.phase === "contract-repair" && e.edge === "end");
+  assert.equal(repairEnds.length, 2, "two repair rounds each recorded an end event");
+  assert.equal(repairEnds[1].outcome, "fixed", "the second repair resolved the contract");
+});
+
+await test("T6: phase events and CONTEXT.md entry are written", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-03-07-repair6.md", {
+    title: "Repair Six",
+    status: "proposed",
+    created: "2026-03-07",
+    change_id: "repair6",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeProposedChange(cwd, "repair6", ["- src/missing.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-03-07 · Repair Six");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("fix it");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "real.ts"), "x\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "repair6");
+  assert.ok(events.some((e) => e.phase === "contract-repair"), "a contract-repair phase event is written");
+  const context = await readContext(cwd, "repair6");
+  assert.ok(context?.includes("## Contract repair —"), "a CONTEXT.md repair entry is written");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
