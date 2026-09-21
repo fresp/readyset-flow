@@ -289,6 +289,84 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
 	return new Set(parsed?.paths ?? []);
 }
 
+/** The phases a Readyset run records boundaries for. */
+export type PhaseName = "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive";
+
+/** One boundary event in the machine-parseable phase log. */
+export interface PhaseEvent {
+	phase: PhaseName;
+	edge: "start" | "end";
+	at: string;
+	lane: "fast" | "full";
+	laneSource: "flag" | "brainstorm";
+	model?: string;
+	outcome?: string;
+}
+
+/** Marker line that opens one phase-event entry inside CONTEXT.md. */
+export const PHASE_MARKER = "<!-- readyset-phase -->";
+
+/**
+ * Appends one phase boundary event to this change's CONTEXT.md as its own marker entry, using the
+ * same append path appendContext uses. Every entry is `PHASE_MARKER` followed by a one-line ```json
+ * fence, so a reader can find each event's own fence without scanning the whole file (CONTEXT.md is
+ * append-only and may later contain braces in raw user text — see parseBaselineEntry's doc comment).
+ */
+export async function appendPhaseEvent(cwd: string, changeId: string, event: PhaseEvent): Promise<void> {
+	const paths = changePaths(cwd, changeId);
+	const entry = `\n\n${PHASE_MARKER}\n\`\`\`json\n${JSON.stringify(event)}\n\`\`\`\n`;
+	const existing = await readFile(paths.context, "utf8").catch(() => undefined);
+	const next = existing === undefined ? `# Context log${entry}` : `${existing.trimEnd()}\n${entry}`;
+	await writeFile(paths.context, next, "utf8");
+}
+
+/**
+ * Parses a single marker entry's own ```json fence: the first PHASE_MARKER at or after `from`,
+ * then the fence the writer itself created. Returns undefined when there is none or the JSON is
+ * malformed. Never "first { to last }" — see parseBaselineEntry for why that breaks once later
+ * entries (e.g. Refine feedback) contain braces.
+ */
+function parsePhaseEntry(raw: string, from: number): { event?: PhaseEvent; next: number } | undefined {
+	const idx = raw.indexOf(PHASE_MARKER, from);
+	if (idx === -1) return undefined;
+	const searchFrom = idx + PHASE_MARKER.length;
+	const fenceStart = raw.indexOf("```json", searchFrom);
+	if (fenceStart === -1) return { next: searchFrom };
+	const bodyStart = fenceStart + "```json".length;
+	const fenceEnd = raw.indexOf("```", bodyStart);
+	if (fenceEnd === -1) return { next: bodyStart };
+	const body = raw.slice(bodyStart, fenceEnd).trim();
+	const next = fenceEnd + 3;
+	try {
+		const parsed: unknown = JSON.parse(body);
+		if (parsed === null || typeof parsed !== "object") return { next };
+		const e = parsed as Partial<PhaseEvent>;
+		if (typeof e.phase !== "string" || (e.edge !== "start" && e.edge !== "end")) return { next };
+		if (typeof e.at !== "string" || typeof e.lane !== "string") return { next };
+		return { event: e as PhaseEvent, next };
+	} catch {
+		return { next };
+	}
+}
+
+/**
+ * Reads this change's phase-event log in file order. Returns an empty array when there is none or
+ * CONTEXT.md is unreadable. Malformed entries are skipped, never thrown.
+ */
+export async function readPhaseEvents(cwd: string, changeId: string): Promise<PhaseEvent[]> {
+	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
+	if (raw === undefined) return [];
+	const events: PhaseEvent[] = [];
+	let cursor = 0;
+	for (;;) {
+		const found = parsePhaseEntry(raw, cursor);
+		if (!found) break;
+		if (found.event) events.push(found.event);
+		cursor = found.next;
+	}
+	return events;
+}
+
 export interface ValidationIssue {
 	file: string;
 	problem: string;

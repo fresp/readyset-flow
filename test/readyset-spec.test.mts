@@ -23,6 +23,10 @@ import {
   checkScopeRefs,
   readReview,
   taskCheckedStates,
+  appendPhaseEvent,
+  readPhaseEvents,
+  PHASE_MARKER,
+  type PhaseEvent,
 } from "../src/lib/readyset-spec.ts";
 
 let pass = 0;
@@ -744,6 +748,117 @@ await test("baseline parse is scoped to its own fence, not the last brace in the
     "explored {nested: {deep: '{'}} and found } stray } braces",
   );
   assert.deepEqual([...(await readDirtyBaseline(cwd, "fence"))], ["a.txt"]);
+});
+
+await test("phase events round-trip in file order", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "ph");
+  const first: PhaseEvent = {
+    phase: "explore",
+    edge: "start",
+    at: "2026-01-01T00:00:00.000Z",
+    lane: "fast",
+    laneSource: "flag",
+    model: "small/fast",
+  };
+  const second: PhaseEvent = {
+    phase: "explore",
+    edge: "end",
+    at: "2026-01-01T00:01:00.000Z",
+    lane: "fast",
+    laneSource: "flag",
+    outcome: "exploration-written",
+  };
+  await appendPhaseEvent(cwd, "ph", first);
+  await appendPhaseEvent(cwd, "ph", second);
+  assert.deepEqual(await readPhaseEvents(cwd, "ph"), [first, second]);
+});
+
+await test("readPhaseEvents returns [] when there is no CONTEXT.md", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "none");
+  const { rm: rmFile } = await import("node:fs/promises");
+  await rmFile(changePaths(cwd, "none").context, { force: true });
+  assert.deepEqual(await readPhaseEvents(cwd, "none"), []);
+});
+
+await test("phase events coexist with the baseline and human-readable entries", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "mix");
+  await ensureDirtyBaseline(cwd, "mix", ["a.txt"]);
+  await appendContext(cwd, "mix", "Explore", "did exploration");
+  const event: PhaseEvent = {
+    phase: "propose",
+    edge: "start",
+    at: "2026-01-01T00:02:00.000Z",
+    lane: "full",
+    laneSource: "brainstorm",
+    model: "big/model",
+  };
+  await appendPhaseEvent(cwd, "mix", event);
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "mix"))], ["a.txt"]);
+  assert.deepEqual(await readPhaseEvents(cwd, "mix"), [event]);
+  const raw = await readContext(cwd, "mix");
+  assert.ok(raw?.includes("## Explore —"), "human entry must survive");
+  assert.ok(raw?.includes(PHASE_MARKER), "phase marker must be present");
+});
+
+await test("phase parse is fence-scoped: braces in a Refine entry don't corrupt later events", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "br");
+  const start: PhaseEvent = {
+    phase: "propose",
+    edge: "start",
+    at: "2026-01-01T00:03:00.000Z",
+    lane: "full",
+    laneSource: "brainstorm",
+  };
+  const end: PhaseEvent = {
+    phase: "propose",
+    edge: "end",
+    at: "2026-01-01T00:04:00.000Z",
+    lane: "full",
+    laneSource: "brainstorm",
+    outcome: "proposed",
+  };
+  await appendPhaseEvent(cwd, "br", start);
+  await appendContext(cwd, "br", "Refine", "User feedback: make it return {status: 'ok'}");
+  await appendPhaseEvent(cwd, "br", end);
+  assert.deepEqual(await readPhaseEvents(cwd, "br"), [start, end]);
+});
+
+await test("malformed phase entries are skipped, never thrown", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "bad");
+  const good: PhaseEvent = {
+    phase: "apply",
+    edge: "end",
+    at: "2026-01-01T00:05:00.000Z",
+    lane: "fast",
+    laneSource: "flag",
+    outcome: "applied",
+  };
+  const raw = [
+    "# Context log",
+    "",
+    PHASE_MARKER,
+    "```json",
+    JSON.stringify(good),
+    "```",
+    "",
+    PHASE_MARKER,
+    "```json",
+    "not json",
+    "```",
+    "",
+    PHASE_MARKER,
+    "```json",
+    '{"phase":"propose"}',
+    "```",
+    "",
+  ].join("\n");
+  await writeFile(changePaths(cwd, "bad").context, raw, "utf8");
+  assert.deepEqual(await readPhaseEvents(cwd, "bad"), [good]);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -32,6 +32,15 @@ gate blocks on; where a check is added it warns, as the scope contract already d
   post-Apply working-tree check now warns and names any out-of-contract file at the **Archive now?**
   prompt, and records it in `CONTEXT.md`. Advisory: implementation legitimately touches more files
   than planning did, so archive is still offered rather than blocked.
+- **Every run records its effective lane and phase boundaries in `CONTEXT.md`.** The v0.12 benchmark
+  ran `/readyset --fast`, but `--fast` only filters the picker — `--lane fast|full` is what forces
+  the lane, and nothing recorded which lane a run actually used. Each phase boundary (Grill, Explore,
+  Propose, Refine, gate, Apply, Review, Archive) is now written as its own
+  `<!-- readyset-phase -->` marker plus a one-line `json` fence, recording the phase, a `start`/`end`
+  edge, an ISO timestamp, the effective lane and its source (`flag`/`brainstorm`), and where relevant
+  the phase model and an outcome. readyset-bench's compile step can now split results by lane and
+  attribute session tokens/wall time to phases by timestamp. Advisory only — the existing
+  human-readable phase entries are unchanged and additional.
 
 ### Changed
 

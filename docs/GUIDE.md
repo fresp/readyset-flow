@@ -284,7 +284,8 @@ real run input — not just a label on the brainstorm picker.
 Grilling proposes a lane with a one-line reason and you confirm or override it; that decision is
 recorded on the brainstorm. `--lane fast|full` forces the lane for the run — the flag wins over the
 recorded lane, and the picker shows the effective lane so an override is visible before anything
-runs.
+runs. `--fast` is only a picker filter (it decides which brainstorms are *listed*) — it never forces
+a lane; only `--lane` does.
 
 The lane trims **volume**, never the questions that change behavior: grilling still asks everything
 whose answer would change what gets built on either lane.
@@ -401,6 +402,12 @@ evidence/E*.md   optional runtime-evidence records from `readyset_verify` — on
                  numbered E001, E002, ...; never auto-created, never mutated once written
 CONTEXT.md       append-only audit trail — one entry per phase transition, written by the
                  extension itself (not the model), so it can't be skipped or misremembered.
+                 As well as the human-readable phase entries, it carries a machine-parseable
+                 phase-event log — one `<!-- readyset-phase -->` marker followed by a one-line
+                 `json` fence per phase boundary, recording the phase, `start`/`end` edge, an ISO
+                 timestamp, the effective lane (`fast`/`full`) and its source (`flag`/`brainstorm`),
+                 and where relevant the phase model and an outcome. readyset-bench's compile step
+                 reads these to split runs by lane and attribute tokens/wall time to phases.
                  Also carries the once-written pre-existing-dirty baseline the gate invariant
                  and scope check subtract (see "What it deliberately does not do")
 REVIEW.md        code-review phase findings, written after implementation, before archive

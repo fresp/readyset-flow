@@ -11,8 +11,10 @@ import {
 import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { join } from "node:path";
 import {
 	appendContext,
+	appendPhaseEvent,
 	archiveChange,
 	changePaths,
 	checkPhaseViolations,
@@ -25,6 +27,7 @@ import {
 	getProgress,
 	hasExploration,
 	listSubmodules,
+	type PhaseName,
 	readDirtyBaseline,
 	readReview,
 	readScopeContract,
@@ -1379,11 +1382,35 @@ async function reviewAndMaybeExecute(
 	budget: TurnBudget,
 	phaseModels: Map<string, { model: string; source: string }> = new Map(),
 	reviewLane: "full" | "fast" = "full",
+	reviewLaneSource: "flag" | "brainstorm" = "brainstorm",
 ): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
 
+	// This loop owns the gate/refine/apply/review/archive boundaries. It is module-scope, so it
+	// has no access to the handler's `recordPhase`; this local writer records the same shape.
+	// Never throws -- a phase log is diagnostics, not control flow. The archive `end` event lands
+	// *after* archiveChange moved the change directory away, so its write legitimately fails.
+	const recordPhase = async (
+		changeId: string,
+		phase: PhaseName,
+		edge: "start" | "end",
+		extra: { model?: string; outcome?: string } = {},
+	): Promise<void> => {
+		await appendPhaseEvent(ctx.cwd, changeId, {
+			phase,
+			edge,
+			at: new Date().toISOString(),
+			lane: reviewLane,
+			laneSource: reviewLaneSource,
+			...extra,
+		}).catch(() => {});
+	};
+
 	for (;;) {
+		// Gate boundary opens before the review snapshot is taken (the panel the user sees) and
+		// closes once `choice` is resolved. The gate is UI, not a model turn, so no `model` field.
+		await recordPhase(chosen.changeId, "gate", "start");
 		const snapshot = await takeReviewSnapshot(ctx, chosen);
 		showReviewPanel(ctx, chosen, snapshot, budget);
 		ctx.ui.setEditorText(await buildReviewDocument(ctx, chosen, snapshot));
@@ -1409,7 +1436,10 @@ async function reviewAndMaybeExecute(
 			choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary);
 		}
 
-		if (!choice || choice === "discard") return;
+		if (!choice || choice === "discard") {
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "discard" });
+			return;
+		}
 
 		// "Approve & Execute" compacts first (see compactBeforeApply for why this is safe
 		// for a Readyset change specifically: everything Explore/Propose produced is already
@@ -1424,28 +1454,41 @@ async function reviewAndMaybeExecute(
 		// older sidebar builds that still return it (defensive; the current overlay no
 		// longer offers it).
 		if (choice === "approve" || choice === "compact") {
+			// Capture the pre-normalization value: the overlay/gate menu offers only `approve`
+			// and `compact` for execution, and `compact` means "approve, keep context".
+			const rawChoice = choice;
 			await compactBeforeApply(ctx, chosen.changeId);
 			choice = "approve";
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: rawChoice === "compact" ? "approve-keep-context" : "approve" });
 		}
 
 		if (choice === "refine") {
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine" });
 			const feedback = ctx.ui.input ? await ctx.ui.input("What should change?") : undefined;
 			if (!feedback) {
 				ctx.ui.notify("No feedback given — nothing changed.", "info");
 				continue;
 			}
 			ctx.ui.notify(`Revising "${chosen.changeId}"...`, "info");
-			const refineFired = await withPhaseModel(pi, ctx, "propose", phaseModels, () =>
-				spendTurn(
-					pi,
-					ctx,
-					budget,
-					"Refine",
-					refineTurnPrompt(chosen.changeId, feedback, snapshot.validated.issues.map((i) => `${i.file}: ${i.problem}`)),
-				),
-			);
-			if (!refineFired) return;
-			await appendContext(ctx.cwd, chosen.changeId, "Refine", `User feedback: ${feedback}`);
+			// Refine rides the propose override -- same as withPhaseModel(..., "propose", ...).
+			let refineOutcome = "aborted";
+			await recordPhase(chosen.changeId, "refine", "start", { model: phaseModels.get("propose")?.model });
+			try {
+				const refineFired = await withPhaseModel(pi, ctx, "propose", phaseModels, () =>
+					spendTurn(
+						pi,
+						ctx,
+						budget,
+						"Refine",
+						refineTurnPrompt(chosen.changeId, feedback, snapshot.validated.issues.map((i) => `${i.file}: ${i.problem}`)),
+					),
+				);
+				if (!refineFired) return;
+				refineOutcome = "refined";
+				await appendContext(ctx.cwd, chosen.changeId, "Refine", `User feedback: ${feedback}`);
+			} finally {
+				await recordPhase(chosen.changeId, "refine", "end", { model: phaseModels.get("propose")?.model, outcome: refineOutcome });
+			}
 			continue; // loop back: re-validate and show the panel/gate again
 		}
 
@@ -1459,60 +1502,70 @@ async function reviewAndMaybeExecute(
 		applyLoop: for (;;) {
 			activeVerifyChangeId = chosen.changeId;
 			let applyFired: boolean;
+			let applyOutcome = "aborted";
+			await recordPhase(chosen.changeId, "apply", "start", { model: phaseModels.get("apply")?.model });
 			try {
-				applyFired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
-					spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId)),
-				);
-			} finally {
-				activeVerifyChangeId = undefined;
-			}
-			if (!applyFired) return;
-
-			const status = await getProgress(ctx.cwd, chosen.changeId);
-			if (!status) {
-				ctx.ui.notify(`Implementation ran, but couldn't read tasks.md for "${chosen.changeId}" afterward.`, "warning");
-				return;
-			}
-			if (status.state !== "all_done") {
-				ctx.ui.notify(
-					`Paused at ${status.done}/${status.total} tasks (state: ${status.state}) — check the transcript above for why.`,
-					"warning",
-				);
-				return;
-			}
-
-			verification = await checkTaskVerification(ctx.cwd, chosen.changeId);
-			await appendContext(
-				ctx.cwd,
-				chosen.changeId,
-				"Apply",
-				`Implementation reported ${status.done}/${status.total} tasks done. ` +
-					(verification
-						? `${verification.withVerificationNote}/${verification.checkedTasks} carry a _Verified: note (${verification.missing} missing).`
-						: "tasks.md unreadable for verification check."),
-			);
-
-			if (verification && verification.missing > 0) {
-				const canSendBack = verificationSendbacks < MAX_VERIFICATION_SENDBACKS;
-				const options = canSendBack
-					? [
-							{ label: "Send back for verification", description: "fires another apply turn asking it to verify + note the missing tasks" },
-							{ label: "Continue to code review anyway", description: "proceed without full verification coverage" },
-						]
-					: [{ label: "Continue to code review anyway", description: "proceed without full verification coverage" }];
-				const proceedAnyway = await ctx.ui.select(
-					`Implementation complete, but ${verification.missing}/${verification.checkedTasks} checked tasks have no _Verified: note — ` +
-						"the apply turn marked them done without something that actually checked the behavior." +
-						(canSendBack ? "" : ` (already sent back ${verificationSendbacks}x — proceeding without full coverage this time.)`),
-					options,
-				);
-				if (proceedAnyway === "Send back for verification") {
-					verificationSendbacks++;
-					ctx.ui.notify(`Asking "${chosen.changeId}" to verify the remaining tasks...`, "info");
-					continue applyLoop;
+				try {
+					applyFired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
+						spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId)),
+					);
+				} finally {
+					activeVerifyChangeId = undefined;
 				}
+				if (!applyFired) return;
+
+				const status = await getProgress(ctx.cwd, chosen.changeId);
+				if (!status) {
+					applyOutcome = "no-tasks";
+					ctx.ui.notify(`Implementation ran, but couldn't read tasks.md for "${chosen.changeId}" afterward.`, "warning");
+					return;
+				}
+				if (status.state !== "all_done") {
+					applyOutcome = "paused";
+					ctx.ui.notify(
+						`Paused at ${status.done}/${status.total} tasks (state: ${status.state}) — check the transcript above for why.`,
+						"warning",
+					);
+					return;
+				}
+
+				verification = await checkTaskVerification(ctx.cwd, chosen.changeId);
+				await appendContext(
+					ctx.cwd,
+					chosen.changeId,
+					"Apply",
+					`Implementation reported ${status.done}/${status.total} tasks done. ` +
+						(verification
+							? `${verification.withVerificationNote}/${verification.checkedTasks} carry a _Verified: note (${verification.missing} missing).`
+							: "tasks.md unreadable for verification check."),
+				);
+
+				if (verification && verification.missing > 0) {
+					const canSendBack = verificationSendbacks < MAX_VERIFICATION_SENDBACKS;
+					const options = canSendBack
+						? [
+								{ label: "Send back for verification", description: "fires another apply turn asking it to verify + note the missing tasks" },
+								{ label: "Continue to code review anyway", description: "proceed without full verification coverage" },
+							]
+						: [{ label: "Continue to code review anyway", description: "proceed without full verification coverage" }];
+					const proceedAnyway = await ctx.ui.select(
+						`Implementation complete, but ${verification.missing}/${verification.checkedTasks} checked tasks have no _Verified: note — ` +
+							"the apply turn marked them done without something that actually checked the behavior." +
+							(canSendBack ? "" : ` (already sent back ${verificationSendbacks}x — proceeding without full coverage this time.)`),
+						options,
+					);
+					if (proceedAnyway === "Send back for verification") {
+						verificationSendbacks++;
+						ctx.ui.notify(`Asking "${chosen.changeId}" to verify the remaining tasks...`, "info");
+						applyOutcome = "sent-back";
+						continue applyLoop;
+					}
+				}
+				applyOutcome = "applied";
+				break;
+			} finally {
+				await recordPhase(chosen.changeId, "apply", "end", { model: phaseModels.get("apply")?.model, outcome: applyOutcome });
 			}
-			break;
 		}
 
 		// Scope, checked again against the working tree after Apply — the gate's `checkScope`
@@ -1541,17 +1594,25 @@ async function reviewAndMaybeExecute(
 			`Implementation complete: ${finalStatus?.done ?? "?"}/${finalStatus?.total ?? "?"} tasks. Running code review...`,
 			"info",
 		);
-		const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-			spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane)),
-		);
-		if (!reviewFired) return;
-		const reviewContent = await readReview(ctx.cwd, chosen.changeId);
-		await appendContext(
-			ctx.cwd,
-			chosen.changeId,
-			"Code review",
-			reviewContent ? "REVIEW.md written — see file for findings." : "Code review turn ran but REVIEW.md is empty or missing.",
-		);
+		let reviewContent: string | undefined;
+		let reviewOutcome = "aborted";
+		await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
+		try {
+			const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
+				spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane)),
+			);
+			if (!reviewFired) return;
+			reviewContent = await readReview(ctx.cwd, chosen.changeId);
+			reviewOutcome = reviewContent ? "review-written" : "no-review";
+			await appendContext(
+				ctx.cwd,
+				chosen.changeId,
+				"Code review",
+				reviewContent ? "REVIEW.md written — see file for findings." : "Code review turn ran but REVIEW.md is empty or missing.",
+			);
+		} finally {
+			await recordPhase(chosen.changeId, "review", "end", { model: phaseModels.get("review")?.model, outcome: reviewOutcome });
+		}
 
 		if (reviewContent) {
 			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
@@ -1569,28 +1630,45 @@ async function reviewAndMaybeExecute(
 			],
 		);
 		if (archiveChoice === "Archive now") {
-			const result = await archiveChange(ctx.cwd, chosen.changeId);
-			const baseNotice =
-				`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
-				"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
-			if (result.unappliedModifications.length === 0) {
-				ctx.ui.notify(baseNotice, "info");
-			} else {
-				// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
-				// the old requirement text is still sitting in the canonical spec, untouched, right next to the
-				// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
-				// than the same generic notice an ADDED-only archive gets.
-				const items = result.unappliedModifications
-					.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
-					.join("\n");
-				ctx.ui.notify(
-					`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
-						"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
-						"old text is still there. Manual cleanup needed:\n" +
-						items,
-					"warning",
-				);
+			await recordPhase(chosen.changeId, "archive", "start");
+			try {
+				const result = await archiveChange(ctx.cwd, chosen.changeId);
+				const baseNotice =
+					`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
+					"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
+				if (result.unappliedModifications.length === 0) {
+					ctx.ui.notify(baseNotice, "info");
+				} else {
+					// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
+					// the old requirement text is still sitting in the canonical spec, untouched, right next to the
+					// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
+					// than the same generic notice an ADDED-only archive gets.
+					const items = result.unappliedModifications
+						.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
+						.join("\n");
+					ctx.ui.notify(
+						`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
+							"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
+							"old text is still there. Manual cleanup needed:\n" +
+							items,
+						"warning",
+					);
+				}
+				// archiveChange renamed the change dir to changes/archive/<date>-<id>/, so the
+				// archive `end` event must target that location — writing to the live id would
+				// find no CONTEXT.md (the move already happened). READYSET_ROOT is "readyset".
+				const archivedChangeId = result.archivedDir.slice(join(ctx.cwd, "readyset", "changes").length + 1);
+				await recordPhase(archivedChangeId, "archive", "end", { outcome: "archived" });
+			} catch (err) {
+				// Close the archive boundary before rethrowing: the caller must still see the
+				// original error, but the phase log should record that archive did not complete.
+				await recordPhase(chosen.changeId, "archive", "end", { outcome: "error" });
+				throw err;
 			}
+		} else {
+			// Every non-archive path still closes the boundary, so the compile step sees a single
+			// `end` per archive window. `archiveChoice` is falsy on Esc/dismissed.
+			await recordPhase(chosen.changeId, "archive", "end", { outcome: archiveChoice || "dismissed" });
 		}
 		return;
 	}
@@ -2009,7 +2087,8 @@ export default function (pi: ExtensionAPI) {
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +
 			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --lang <language> to open " +
 			"grilling's discussion in that language from round 1 (must come before --idea), --model <spec> to pin a model " +
-			"for this run's turns, --fallback-model <spec> if the pin fails to apply)",
+			"for this run's turns, --fallback-model <spec> if the pin fails to apply, " +
+			"--lane <fast|full> to force the lane for the run (note: --fast only filters the picker; it does not force a lane))",
 		handler: async (args, ctx) => {
 			// `args` is the raw string omp hands a registered command (see parseReadysetArgs).
 			const parsedArgs = parseReadysetArgs(args);
@@ -2129,6 +2208,15 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
+			// Lane context every `recordPhase` below reads. `--lane` is the operator's explicit,
+			// per-run answer to the lane question, so its source is "flag"; a lane the brainstorm
+			// itself recorded (default, frontmatter, branch, or a resolved default) arrives the
+			// same way, so its source is "brainstorm". These two values are the ONLY lane/source
+			// pair the run may act on -- see the effectiveLane comment above for why reading
+			// b.lane directly silently drops the override.
+			const phaseLane: "fast" | "full" = effectiveLane;
+			const phaseLaneSource: "flag" | "brainstorm" = laneOverride ? "flag" : "brainstorm";
+
 			if (chosen.status === "archived") {
 				ctx.ui.notify(`Change "${chosen.changeId}" is already archived. Start a new brainstorm for follow-up work.`, "warning");
 				return;
@@ -2169,6 +2257,28 @@ export default function (pi: ExtensionAPI) {
 				phaseModelOverrides.set(e.phase, { model: e.model, source: "--phase-model flag" });
 			}
 
+			// A phase's effective model, mirroring withPhaseModel's own precedence
+			// (phaseModelOverrides wins, else the run's pinned model). withPhaseModel cannot report
+			// back whether the override actually pinned, so the phase log records the spec that
+			// *would* have been used: the override when one exists, else pinnedModel.
+			const phaseModelFor = (phase: string): string | undefined =>
+				phaseModelOverrides.get(phase)?.model ?? pinnedModel;
+
+			// Writes one phase boundary event. Never throws: a phase log is diagnostics, not control
+			// flow -- a write failure must not abort the run (mirrors appendContext's callers, which
+			// also never guard). Notably the archive `end` event lands *after* archiveChange moved
+			// the change directory away, so its write legitimately fails; that must not fail the run.
+			const recordPhase = async (
+				changeId: string,
+				phase: PhaseName,
+				edge: "start" | "end",
+				lane: "fast" | "full",
+				laneSource: "flag" | "brainstorm",
+				extra: { model?: string; outcome?: string } = {},
+			): Promise<void> => {
+				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
+			};
+
 			const fallbackFromFlag = parsedArgs.fallbackModel;
 			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
 			const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
@@ -2179,7 +2289,7 @@ export default function (pi: ExtensionAPI) {
 					// Defensive: a change that predates the baseline mechanism has no capture
 					// yet. This never overwrites an existing baseline (first capture wins).
 					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource);
 					return;
 				}
 
@@ -2232,6 +2342,16 @@ export default function (pi: ExtensionAPI) {
 				// trees must not widen it.
 				await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
 
+				// Grill boundary, recorded at the first opportunity: the change directory does not
+				// exist during grilling (scaffoldChange above just created it), so a grill `start`
+				// timestamp is not recoverable from CONTEXT.md. Only the boundary at which grilling
+				// completed is written -- never synthesized from the brainstorm's date-only `created`
+				// frontmatter, which would be a fabricated time.
+				await recordPhase(chosen.changeId, "grill", "end", phaseLane, phaseLaneSource, {
+					model: phaseModelFor("grill"),
+					outcome: "grilled",
+				});
+
 				// Fast lane folds Explore into Propose: no separate turn, no EXPLORATION.md turn.
 				// The full-lane path (separate grounding turn that must produce EXPLORATION.md)
 				// is unchanged below.
@@ -2239,86 +2359,103 @@ export default function (pi: ExtensionAPI) {
 				let explored = false;
 				const exploreBudget = startPhaseBudget();
 				if (isFastLane) {
+					await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
 					await appendContext(
 						ctx.cwd,
 						chosen.changeId,
 						"Explore",
 						"Skipped as a separate turn — fast lane folds grounding into Propose (a few targeted reads, noted inline).",
 					);
+					await recordPhase(chosen.changeId, "explore", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("explore"), outcome: "skipped-fast-lane" });
 				} else {
 					const submodules = await listSubmodules(ctx.cwd);
 					ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
 					await compactForPhase(reviewCtx, chosen.changeId, "Explore", compactBeforeExploreGuidance(chosen.changeId, chosen.file));
-					const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
-						spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
-					);
-					if (!exploreFired) return;
+					let exploreOutcome = "aborted";
+					await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
+					try {
+						const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
+							spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
+						);
+						if (!exploreFired) return;
 
-					explored = await hasExploration(ctx.cwd, chosen.changeId);
-					await appendContext(
-						ctx.cwd,
-						chosen.changeId,
-						"Explore",
-						(explored
-							? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
-							: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
-							` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
-					);
-					if (phaseBudgetExceeded(exploreBudget)) {
-						ctx.ui.notify(
-							`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
-								`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
-							"warning",
+						explored = await hasExploration(ctx.cwd, chosen.changeId);
+						exploreOutcome = explored ? "exploration-written" : "no-exploration";
+						await appendContext(
+							ctx.cwd,
+							chosen.changeId,
+							"Explore",
+							(explored
+								? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
+								: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
+								` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
 						);
-					}
-					if (!explored) {
-						ctx.ui.notify(
-							`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
-								"grounding will be weaker than usual. Check the transcript above.",
-							"warning",
-						);
+						if (phaseBudgetExceeded(exploreBudget)) {
+							ctx.ui.notify(
+								`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
+									`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
+								"warning",
+							);
+						}
+						if (!explored) {
+							ctx.ui.notify(
+								`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
+									"grounding will be weaker than usual. Check the transcript above.",
+								"warning",
+							);
+						}
+					} finally {
+						await recordPhase(chosen.changeId, "explore", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("explore"), outcome: exploreOutcome });
 					}
 				}
 
 				ctx.ui.notify(`Proposing change "${chosen.changeId}"${isFastLane ? " (fast lane — grounding folded in)" : ""} — this can take a while...`, "info");
 				await compactForPhase(reviewCtx, chosen.changeId, "Propose", compactBeforeProposeGuidance(chosen.changeId, chosen.file, !isFastLane));
 				const proposeBudget = startPhaseBudget();
-				const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
-					spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane)),
-				);
-				if (!proposeFired) return;
-				// Gate invariant (R2): a planning turn may only leave planning artifacts. The
-				// T11/T12 benchmark runs implemented the change out of the Propose turn and
-				// archived it themselves, shipping with no approval. That is checked here —
-				// structurally, from the working tree — before the gate is ever offered.
-				const violations = await checkPhaseViolations(
-					ctx.cwd,
-					chosen.changeId,
-					await pathsChangedThisRun(ctx.cwd, chosen.changeId),
-				);
-				if (violations.length > 0) {
+				let proposeOutcome = "aborted";
+				await recordPhase(chosen.changeId, "propose", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("propose") });
+				try {
+					const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
+						spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane)),
+					);
+					if (!proposeFired) return;
+					// Gate invariant (R2): a planning turn may only leave planning artifacts. The
+					// T11/T12 benchmark runs implemented the change out of the Propose turn and
+					// archived it themselves, shipping with no approval. That is checked here —
+					// structurally, from the working tree — before the gate is ever offered.
+					const violations = await checkPhaseViolations(
+						ctx.cwd,
+						chosen.changeId,
+						await pathsChangedThisRun(ctx.cwd, chosen.changeId),
+					);
+					if (violations.length > 0) {
+						proposeOutcome = "stopped-violation";
+						await appendContext(
+							ctx.cwd,
+							chosen.changeId,
+							"Propose",
+							`STOPPED — planning turn wrote outside its boundary: ${violations
+								.map((v) => `${v.path} (${v.detail})`)
+								.join("; ")}. No review gate is offered for this state.`,
+						);
+						ctx.ui.notify(
+							`Stopped: the Propose turn for "${chosen.changeId}" changed files outside the change ` +
+								`directory (${violations.map((v) => v.path).join(", ")}). Readyset never implements without approval, ` +
+								"so no review gate is offered — revert those files (or move them into the change dir) and run /readyset again.",
+							"error",
+						);
+						return;
+					}
+					proposeOutcome = "proposed";
 					await appendContext(
 						ctx.cwd,
 						chosen.changeId,
 						"Propose",
-						`STOPPED — planning turn wrote outside its boundary: ${violations
-							.map((v) => `${v.path} (${v.detail})`)
-							.join("; ")}. No review gate is offered for this state.`,
+						`Propose turn ran; see proposal.md/design.md/specs/tasks.md. (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
 					);
-					ctx.ui.notify(
-						`Stopped: the Propose turn for "${chosen.changeId}" changed files outside the change ` +
-							`directory (${violations.map((v) => v.path).join(", ")}). Readyset never implements without approval, ` +
-							"so no review gate is offered — revert those files (or move them into the change dir) and run /readyset again.",
-						"error",
-					);
-					return;
+				} finally {
+					await recordPhase(chosen.changeId, "propose", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("propose"), outcome: proposeOutcome });
 				}
-				await appendContext(
-					ctx.cwd,
-					chosen.changeId,
-					"Propose",
-					`Propose turn ran; see proposal.md/design.md/specs/tasks.md. (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
-				);
 			if (phaseBudgetExceeded(proposeBudget)) {
 				ctx.ui.notify(
 					`Propose for "${chosen.changeId}" hit its phase budget (${Math.round(proposeBudget.maxMs / 60000)} min) — the artifacts exist but the turn ran long. ` +
@@ -2354,7 +2491,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource);
 		});
 		},
 	});

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
+import { readPhaseEvents, changePaths } from "../src/lib/readyset-spec.ts";
 
 // This whole file exercises readyset-review.ts's handler, which reads omp config
 // (language/model/fallback chain) via readPreferredLanguage()/readPinnedModel()/
@@ -2003,6 +2004,119 @@ await test("parseReadysetArgs reads the raw argument string the way omp hands it
   );
   assert.equal(parse("--phase-model typo").phaseModels, undefined, "a flag with no = is ignored, not a crash");
   assert.equal(parse("--phase-model Explore=small/fast").phaseModels?.[0].phase, "explore", "phase names are lowercased");
+});
+
+await test("fast-lane run records its effective lane and the full phase-boundary set", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-02-01-fast.md", {
+    title: "Fast Fix",
+    status: "open",
+    created: "2026-02-01",
+    change_id: "fast-fix",
+    lane: "full", // recorded lane is full; --lane fast must override it
+  }, VALID_BRAINSTORM_BODY);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-02-01 · Fast Fix"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Archive now");
+
+  const dir = join(cwd, "readyset", "changes", "fast-fix");
+  // No Explore effect: fast lane never fires an Explore turn.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(dir, "specs", "cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await writeFile(
+      join(dir, "specs", "cap", "spec.md"),
+      "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  // The change was archived to changes/archive/<date>-fast-fix/, so the events live in the
+  // archived CONTEXT.md. Fall back to the live path if the archive move did not happen.
+  const liveEvents = await readPhaseEvents(cwd, "fast-fix");
+  let archivedEvents: Awaited<ReturnType<typeof readPhaseEvents>> = [];
+  const archiveRoot = join(cwd, "readyset", "changes", "archive");
+  const archivedEntries = await (await import("node:fs/promises")).readdir(archiveRoot).catch(() => [] as string[]);
+  const archivedDirName = archivedEntries.find((name) => name.endsWith("-fast-fix"));
+  if (archivedDirName) archivedEvents = await readPhaseEvents(cwd, `archive/${archivedDirName}`);
+  const all = archivedEvents.length > 0 ? archivedEvents : liveEvents;
+
+  assert.ok(all.length > 0, "phase events must be recorded");
+  const explore = all.find((e) => e.phase === "explore" && e.edge === "end");
+  assert.ok(explore, "an explore end event exists");
+  assert.equal(explore.outcome, "skipped-fast-lane");
+  assert.equal(explore.lane, "fast");
+
+  const propose = all.find((e) => e.phase === "propose" && e.edge === "end");
+  assert.ok(propose, "a propose end event exists");
+  assert.equal(propose.lane, "fast");
+
+  const gate = all.find((e) => e.phase === "gate" && e.edge === "end");
+  assert.ok(gate, "a gate end event exists");
+  assert.equal(gate.outcome, "approve");
+  assert.equal(gate.lane, "fast");
+
+  assert.ok(all.some((e) => e.phase === "apply" && e.edge === "end"), "an apply end event exists");
+  assert.ok(all.some((e) => e.phase === "review" && e.edge === "end"), "a review end event exists");
+  assert.ok(all.some((e) => e.phase === "archive" && e.edge === "end"), "an archive end event exists");
+
+  for (const e of all) {
+    if (e.phase === "grill") continue;
+    assert.equal(e.lane, "fast", `event ${e.phase}/${e.edge} carries the effective lane`);
+    assert.equal(e.laneSource, "flag", `event ${e.phase}/${e.edge} attributes the lane to the flag`);
+  }
+
+  const grill = all.find((e) => e.phase === "grill" && e.edge === "end");
+  assert.ok(grill, "a grill end event is recorded at scaffold time");
+  assert.equal(grill.lane, "fast");
+});
+
+await test("a discarded gate still closes its boundary with outcome discard", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-02-02-thing.md", { title: "Thing", status: "proposed", created: "2026-02-02", change_id: "thing" });
+  const dir = join(cwd, "readyset", "changes", "thing");
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-02-02 · Thing"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // gate: discard immediately
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 0, "no turn fires on a straight discard");
+  const events = await readPhaseEvents(cwd, "thing");
+  const gateEnd = events.find((e) => e.phase === "gate" && e.edge === "end");
+  assert.ok(gateEnd, "a gate end event is written even on discard");
+  assert.equal(gateEnd.outcome, "discard");
+  const gateStart = events.find((e) => e.phase === "gate" && e.edge === "start");
+  assert.ok(gateStart, "the gate start boundary is written too");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
