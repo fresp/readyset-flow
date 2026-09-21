@@ -27,11 +27,15 @@ import {
 	getProgress,
 	hasExploration,
 	listSubmodules,
+	type PhaseEvent,
 	type PhaseName,
 	readDirtyBaseline,
 	readContext,
 	readReview,
 	readScopeContract,
+	readScopeDeviations,
+	READYSET_ROOT,
+	type ScopeDeviation,
 	scaffoldChange,
 	validateChange,
 } from "../lib/readyset-spec.ts";
@@ -120,7 +124,8 @@ const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (
   gets flagged. Mark a file this change deletes with "(delete)" (e.g. "- src/legacy.ts (delete)");
   it must exist before Apply and is allowed to be gone afterward. This is the scope contract the gate
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
-  arm's, and T12 grew an unasked-for 160-line bench file). A file not on this list may not
+  arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
+  the change actually needs — nothing speculative. A file not on this list may not
   be written during Apply without asking first.
 - design.md — "## Context", "## Goals / Non-Goals", "## Decisions" (numbered, each with
   Rationale and Alternatives considered), "## Risks / Trade-offs".
@@ -132,7 +137,10 @@ const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (
   Use MODIFIED/REMOVED Requirements sections instead of ADDED when changing or removing
   existing behavior already covered by an existing spec.
 - tasks.md — numbered sections, each task a "- [ ] N.M <description>" checkbox line with
-  a verification note.`;
+  a verification note. Each task must map to a spec scenario; do NOT add
+  "cleanup"/"improve"/refactor tasks the request didn't ask for. If you change a file outside
+  the scope contract during Apply, record it under a "## Scope deviations" section here as
+  "- <path> — <reason>".`;
 
 /**
  * Explore turn — new in pipeline v2. Runs before Propose and writes EXPLORATION.md.
@@ -258,6 +266,14 @@ function applyTurnPrompt(changeId: string): string {
 		"behavior to check_` — never check a box with no note at all.\n\n" +
 		"Pause and ask if a task is unclear, needs scope beyond what the spec describes, or you hit an error or blocker — " +
 		"never silently narrow or drop specified behavior, and never check a box to move on without actually verifying it. " +
+		"\n\nScope discipline: touch ONLY files named in proposal.md's `## Files This Change Will Touch` " +
+		"contract — you may create a `(new)` file and remove a `(delete)` file. Do NOT refactor, rename, " +
+		"reformat, reorder, or rewrite comments in code a task doesn't require; do NOT add new helper " +
+		"modules, scripts, benchmarks, or docs unless the contract lists them. For tests, add or modify only " +
+		"what exercises the specs' WHEN/THEN scenarios — do not restructure existing tests. Prefer the " +
+		"smallest change that satisfies the scenarios. If a file outside the contract is truly required, you " +
+		"may change it, but in the SAME turn record it under `## Scope deviations` in tasks.md as " +
+		"`- <path> — <one-line reason>`.\n\n" +
 		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks."
 	);
 }
@@ -366,7 +382,7 @@ function compactBeforeProposeGuidance(changeId: string, brainstormFile: string, 
  * mitigation, not a claim of independence. Do not re-add "fresh context" wording here
  * without a mechanism that actually provides it.
  */
-function codeReviewTurnPrompt(changeId: string, lane: "full" | "fast" = "full"): string {
+function codeReviewTurnPrompt(changeId: string, lane: "full" | "fast" = "full", deviations: ScopeDeviation[] = []): string {
 	const paths = changePaths("", changeId);
 	return (
 		`Critically review the implementation of Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, ` +
@@ -386,6 +402,14 @@ function codeReviewTurnPrompt(changeId: string, lane: "full" | "fast" = "full"):
 		"correctness bug, edge case, or regression risk you can see in the touched files, whether or not tasks.md " +
 		"mentioned it. Structure it as a findings list; if you genuinely find nothing, say so plainly rather than padding " +
 		"the file — but check hard before concluding that. Do not edit the implementation in this turn — findings only." +
+		"\n\n" +
+		`Also write a "## Scope" section in ${paths.review}: go through every file this change ` +
+			`touched outside proposal.md's scope contract` +
+			(deviations.length > 0
+				? ` — these are declared deviations: ${deviations.map((d) => `${d.path}${d.reason ? ` (${d.reason})` : ""}`).join("; ")}`
+				: " (none were declared)") +
+			`. For each, judge whether it was NECESSARY or GOLD-PLATING (an unrequested refactor, extra ` +
+			`test, or new file), and flag any unrequested change you find in the diff.` +
 		(lane === "fast"
 			? " Keep this review proportional: verify the WHEN/THEN scenarios against behavior and the scope contract, " +
 				"but skip mutation-testing-style probes (removing code to see if tests catch it) — that depth belongs to the full lane."
@@ -960,6 +984,44 @@ async function pathsChangedThisRun(cwd: string, changeId: string): Promise<strin
 	return current.filter((p) => !baseline.has(p));
 }
 
+/** Final Apply diff size for the bench: files changed and lines added/deleted, from
+ *  `git diff --numstat` over the run's own changed paths, with untracked new files counted by their
+ *  line count. Excludes readyset/ (planning artifacts) and .ai/brainstorms/**
+ *  (.ai/brainstorms) so the number reflects product code. Returns zeros when git is unavailable. */
+async function applyDiffStats(cwd: string, changedPaths: string[]): Promise<{ files: number; added: number; deleted: number }> {
+	const product = changedPaths.filter(
+		(p) => !p.startsWith(`${READYSET_ROOT}/`) && !p.startsWith(".ai/brainstorms/"),
+	);
+	if (product.length === 0) return { files: 0, added: 0, deleted: 0 };
+	const run = promisify(execFile);
+	let files = 0, added = 0, deleted = 0;
+	try {
+		const { stdout } = await run("git", ["diff", "--numstat", "--", ...product], { cwd, timeout: 30000 });
+		for (const line of stdout.split("\n")) {
+			if (line.trim() === "") continue;
+			const [a, d] = line.split("\t");
+			files++;
+			added += a === "-" ? 0 : Number(a) || 0;
+			deleted += d === "-" ? 0 : Number(d) || 0;
+		}
+	} catch {
+		return { files: 0, added: 0, deleted: 0 };
+	}
+	// Untracked new files: `git diff --numstat` omits them. Count their lines as additions.
+	try {
+		const { stdout } = await run("git", ["ls-files", "--others", "--exclude-standard", "--", ...product], { cwd, timeout: 30000 });
+		for (const rel of stdout.split("\n")) {
+			if (rel.trim() === "") continue;
+			const text = await readFile(join(cwd, rel), "utf8").catch(() => "");
+			files++;
+			added += text === "" ? 0 : text.replace(/\n$/, "").split("\n").length;
+		}
+	} catch {
+		/* ls-files unavailable — the tracked numbers still stand */
+	}
+	return { files, added, deleted };
+}
+
 /** Fires a turn against the budget. Returns false (and notifies) without firing anything if
  *  the budget is already spent — callers must stop, not retry, when this returns false. */
 async function spendTurn(pi: ExtensionAPI, ctx: ReviewCtx, budget: TurnBudget, label: string, prompt: string): Promise<boolean> {
@@ -1064,6 +1126,101 @@ async function runContractRepair(
 	);
 	await record("contract-repair", "end", { model: phaseModels.get("propose")?.model, outcome: remaining === 0 ? "fixed" : "partial" });
 	return after;
+}
+
+/** Prompt for the one-shot post-Apply scope reconciliation turn. */
+function scopeReconcilePrompt(changeId: string, paths: string[]): string {
+	return (
+		`After implementing "${changeId}", the working tree changed these file(s) that proposal.md's ` +
+		"`## Files This Change Will Touch` scope contract does NOT name:\n\n" +
+		paths.map((p) => `- ${p}`).join("\n") +
+		`\n\nFor EACH path above, choose one:\n` +
+		`1. REVERT it: run \`git checkout -- <path>\` for a tracked file, or delete it if this run created ` +
+		`it and it is untracked. Do this ONE PATH AT A TIME. NEVER run \`git checkout .\`, \`git stash\`, ` +
+		`\`git reset\`, or \`git clean\`.\n` +
+		`2. KEEP it: leave the file and add a line to the \`## Scope deviations\` section of tasks.md: ` +
+		`\`- <path> — <why this change genuinely requires it>\`.\n\n` +
+		`After any revert, re-run the tests that cover the affected behavior and fix the corresponding ` +
+		`\`_Verified:\` notes in tasks.md. If a revert breaks required behavior, keep the file and justify ` +
+		`it instead. Leave correctly-in-contract files alone; do not start new work.`
+	);
+}
+
+/**
+ * Bounded, one-shot post-Apply scope reconciliation: if Apply touched files outside the contract
+ * and they have no `## Scope deviations` entry, fire ONE turn (riding the apply phase model) that
+ * reverts each or records a justification, then re-check. Never loops — at most one reconciliation
+ * per Apply, and none at all when every outside path is already justified. A turn-needing result is
+ * recorded as an `appendContext` entry and a `scope-reconcile` phase event with drift counts.
+ * Returns the drift counts so the caller can warn about what remains, exactly as 0.13.0 did.
+ */
+async function runScopeReconciliation(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	budget: TurnBudget,
+	changeId: string,
+	phaseModels: Map<string, { model: string; source: string }>,
+	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string; counts?: PhaseEvent["counts"] }) => Promise<void>,
+	outside: string[],
+	unjustified: string[],
+): Promise<{ outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number }> {
+	const outsideBefore = outside.length;
+	const justified = outsideBefore - unjustified.length;
+	if (unjustified.length === 0) {
+		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: 0 };
+	}
+	if (budget.spent >= budget.max) {
+		ctx.ui.notify(
+			`"${changeId}" touched ${unjustified.length} file(s) outside its scope contract, but this run has no turn left to reconcile them — showing them at the archive prompt instead.`,
+			"warning",
+		);
+		await record("scope-reconcile", "end", { outcome: "skipped-budget", counts: { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length } });
+		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length };
+	}
+
+	ctx.ui.notify(`Reconciling ${unjustified.length} out-of-contract file(s) for "${changeId}"...`, "info");
+	await record("scope-reconcile", "start", { model: phaseModels.get("apply")?.model });
+	await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
+		spendTurn(pi, ctx, budget, "Scope reconciliation", scopeReconcilePrompt(changeId, unjustified)),
+	);
+
+	// Recompute from the working tree; reverted paths are simply no longer outside, justified
+	// paths now have a deviation entry.
+	const changedAfter = await pathsChangedThisRun(ctx.cwd, changeId);
+	const after = await checkScope(ctx.cwd, changeId, changedAfter);
+	const justifiedAfter = new Set((await readScopeDeviations(ctx.cwd, changeId)).map((d) => d.path));
+	const outsideAfter = after.noContract ? [] : after.outside;
+	const stillUnjustified = outsideAfter.filter((p) => !justifiedAfter.has(p));
+	const reverted = outsideBefore - outsideAfter.length;
+	const counts = { outsideBefore, reverted, justified: outsideAfter.length - stillUnjustified.length, unjustifiedAfter: stillUnjustified.length };
+
+	// `(delete)` files are gone by design after Apply; ask the post-Apply question so this does not
+	// invent a false DELETE-BUT-MISSING.
+	const refsAfter = await checkScopeRefs(ctx.cwd, changeId, { afterApply: true });
+
+	// Safety check: the set of changed files must not have grown beyond
+	// outside ∪ contract ∪ change dir. A reconciliation turn that touched a NEW outside file is
+	// recorded, not blocked.
+	const contract = await readScopeContract(ctx.cwd, changeId);
+	const allowed = new Set<string>([
+		...outside,
+		...(contract.files ?? []), ...contract.newFiles, ...contract.deleteFiles,
+	]);
+	const grew = changedAfter.filter((p) => !allowed.has(p) && !p.startsWith(`${READYSET_ROOT}/changes/${changeId}/`) && !p.startsWith(".ai/brainstorms/") && !p.startsWith(`${READYSET_ROOT}/`));
+	if (grew.length > 0) {
+		await appendContext(ctx.cwd, changeId, "Scope reconciliation", `Reconciliation turn changed file(s) it was not asked to: ${grew.join(", ")}.`);
+		ctx.ui.notify(`The scope-reconciliation turn for "${changeId}" changed additional out-of-contract file(s): ${grew.join(", ")}.`, "warning");
+	}
+
+	await appendContext(
+		ctx.cwd,
+		changeId,
+		"Scope reconciliation",
+		`${unjustified.length} unjustified out-of-contract file(s) before; ${counts.reverted} reverted, ${counts.justified} justified, ${counts.unjustifiedAfter} still unjustified.` +
+			` Dangling/new-but-exists after Apply: ${[...refsAfter.missing, ...refsAfter.newButExists].join(", ") || "none"}.`,
+	);
+	await record("scope-reconcile", "end", { model: phaseModels.get("apply")?.model, outcome: counts.unjustifiedAfter === 0 ? "fixed" : "partial", counts });
+	return counts;
 }
 
 interface ReviewSnapshot {
@@ -1515,7 +1672,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"] } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -1528,6 +1685,9 @@ async function reviewAndMaybeExecute(
 	};
 
 	const recordRepair = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string } = {}) =>
+		recordPhase(chosen.changeId, phase, edge, extra);
+
+	const recordReconcile = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; counts?: PhaseEvent["counts"] } = {}) =>
 		recordPhase(chosen.changeId, phase, edge, extra);
 
 	for (;;) {
@@ -1688,7 +1848,10 @@ async function reviewAndMaybeExecute(
 				applyOutcome = "applied";
 				break;
 			} finally {
-				await recordPhase(chosen.changeId, "apply", "end", { model: phaseModels.get("apply")?.model, outcome: applyOutcome });
+				const diff = applyOutcome === "applied"
+					? await applyDiffStats(ctx.cwd, await pathsChangedThisRun(ctx.cwd, chosen.changeId))
+					: undefined;
+				await recordPhase(chosen.changeId, "apply", "end", { model: phaseModels.get("apply")?.model, outcome: applyOutcome, diff });
 			}
 		}
 
@@ -1697,17 +1860,28 @@ async function reviewAndMaybeExecute(
 		// change's file touches actually happen. Advisory, not fail-closed: implementation
 		// legitimately touches more files than planning discussion did, so this flags the drift
 		// at the archive prompt rather than refusing to offer archive.
-		const postApplyScope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
-		const postApplyDrift = !postApplyScope.noContract && postApplyScope.outside.length > 0;
-		if (postApplyDrift) {
-			await appendContext(
-				ctx.cwd,
-				chosen.changeId,
-				"Apply",
-				`Post-Apply scope drift — touched outside the contract: ${postApplyScope.outside.join(", ")}.`,
-			);
+		const changedThisRun = await pathsChangedThisRun(ctx.cwd, chosen.changeId);
+		const before = await checkScope(ctx.cwd, chosen.changeId, changedThisRun);
+		const deviations = await readScopeDeviations(ctx.cwd, chosen.changeId);
+		const justifiedPaths = new Set(deviations.map((d) => d.path));
+		const outsideBefore = before.noContract ? [] : before.outside;
+		const unjustified = outsideBefore.filter((p) => !justifiedPaths.has(p));
+
+		await runScopeReconciliation(
+			pi, ctx, budget, chosen.changeId, phaseModels, recordReconcile, outsideBefore, unjustified,
+		);
+
+		// Recover the actual *paths* of whatever is still unjustified (the helper returns counts),
+		// from one final scope read after the reconciliation turn returned.
+		const finalScope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
+		const finalJustified = new Set((await readScopeDeviations(ctx.cwd, chosen.changeId)).map((d) => d.path));
+		const finalOutside = finalScope.noContract ? [] : finalScope.outside;
+		const archiveDriftPaths = finalOutside.filter((p) => !finalJustified.has(p));
+		if (archiveDriftPaths.length > 0) {
+			await appendContext(ctx.cwd, chosen.changeId, "Apply",
+				`Post-Apply scope drift — touched outside the contract with no deviation entry: ${archiveDriftPaths.join(", ")}.`);
 			ctx.ui.notify(
-				`"${chosen.changeId}" touched file(s) outside its scope contract during Apply: ${postApplyScope.outside.join(", ")}. ` +
+				`"${chosen.changeId}" touched file(s) outside its scope contract during Apply: ${archiveDriftPaths.join(", ")}. ` +
 					"Archiving is still offered — this is a warning, not a block.",
 				"warning",
 			);
@@ -1722,8 +1896,9 @@ async function reviewAndMaybeExecute(
 		let reviewOutcome = "aborted";
 		await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
 		try {
+			const deviationsForReview = await readScopeDeviations(ctx.cwd, chosen.changeId);
 			const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-				spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane)),
+				spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane, deviationsForReview)),
 			);
 			if (!reviewFired) return;
 			reviewContent = await readReview(ctx.cwd, chosen.changeId);
@@ -1742,8 +1917,8 @@ async function reviewAndMaybeExecute(
 			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
 		}
 
-		const driftLine = postApplyDrift
-			? `Apply touched ${postApplyScope.outside.length} file(s) outside the contract (${postApplyScope.outside.join(", ")}). `
+		const driftLine = archiveDriftPaths.length > 0
+			? `Apply touched ${archiveDriftPaths.length} file(s) outside the contract (${archiveDriftPaths.join(", ")}). `
 			: "";
 		const archiveChoice = await ctx.ui.select(
 			`${driftLine}Code review done for "${chosen.changeId}"${reviewContent ? " — see readyset/changes/" + chosen.changeId + "/REVIEW.md" : ""}. Archive now?`,

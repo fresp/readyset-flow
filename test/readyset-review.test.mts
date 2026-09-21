@@ -2474,5 +2474,365 @@ await test("T6: phase events and CONTEXT.md entry are written", async () => {
   assert.ok(context?.includes("## Contract repair —"), "a CONTEXT.md repair entry is written");
 });
 
+// --- Post-Apply scope reconciliation ----------------------------------------------------------
+
+// A proposed change whose contract names src/keep.ts (created so it resolves), so Apply can be
+// driven straight from the gate with no Propose turn.
+async function writeReconcileChange(cwd: string, changeId: string) {
+  const dir = await writeProposedChange(cwd, changeId, ["- src/keep.ts"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+  return dir;
+}
+
+await test("S1: unjustified drift triggers exactly one reconciliation turn, which fixes it", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-01-recon1.md", {
+    title: "Reconcile One",
+    status: "proposed",
+    created: "2026-04-01",
+    change_id: "recon1",
+  });
+  const dir = await writeReconcileChange(cwd, "recon1");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-01 · Reconcile One"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+
+  // Apply: complete the task AND touch a file outside the contract.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
+  });
+  // Reconciliation: revert src/rogue.ts.
+  fakePiWrap.queueEffect(async () => {
+    await rm(join(cwd, "src", "rogue.ts"), { force: true });
+  });
+  // Review.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakePiWrap.calls.some((c) => /scope contract does NOT name/.test(c.prompt) && /src\/rogue\.ts/.test(c.prompt)),
+    "a reconciliation turn fired naming the out-of-contract file",
+  );
+  const events = await readPhaseEvents(cwd, "recon1");
+  const recStarts = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "start");
+  const recEnds = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "end");
+  assert.equal(recStarts.length, 1, "exactly one reconciliation turn started");
+  assert.equal(recEnds.length, 1, "exactly one reconciliation end event");
+  assert.equal(recEnds[0].outcome, "fixed");
+  assert.equal(recEnds[0].counts?.outsideBefore, 1);
+  assert.equal(recEnds[0].counts?.unjustifiedAfter, 0);
+});
+
+await test("S2: already-justified drift triggers no reconciliation", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-02-recon2.md", {
+    title: "Reconcile Two",
+    status: "proposed",
+    created: "2026-04-02",
+    change_id: "recon2",
+  });
+  const dir = await writeReconcileChange(cwd, "recon2");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-02 · Reconcile Two");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n\n## Scope deviations\n\n- src/rogue.ts — required by scenario X\n", "utf8");
+    await writeFile(join(cwd, "src", "rogue.ts"), "// justified\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(!fakePiWrap.calls.some((c) => /scope contract does NOT name/.test(c.prompt)), "no reconciliation turn fires");
+  const events = await readPhaseEvents(cwd, "recon2");
+  assert.ok(!events.some((e) => e.phase === "scope-reconcile"), "no scope-reconcile event exists");
+});
+
+await test("S3: a clean scope triggers no reconciliation", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-03-recon3.md", {
+    title: "Reconcile Three",
+    status: "proposed",
+    created: "2026-04-03",
+    change_id: "recon3",
+  });
+  const dir = await writeReconcileChange(cwd, "recon3");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-03 · Reconcile Three");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(!fakePiWrap.calls.some((c) => /scope contract does NOT name/.test(c.prompt)), "no reconciliation turn fires");
+  const events = await readPhaseEvents(cwd, "recon3");
+  assert.ok(!events.some((e) => e.phase === "scope-reconcile"), "no scope-reconcile event exists");
+});
+
+await test("S4: an exhausted budget skips reconciliation and keeps the warning", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-04-recon4.md", {
+    title: "Reconcile Four",
+    status: "proposed",
+    created: "2026-04-04",
+    change_id: "recon4",
+  }, VALID_BRAINSTORM_BODY);
+  const dir = await writeReconcileChange(cwd, "recon4");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-04 · Reconcile Four");
+  // 9 Refine rounds consume 9 turns; the Apply turn is the 10th and exhausts the budget.
+  for (let i = 0; i < 9; i++) {
+    fakeUiWrap.selectQueue.push("Refine");
+    fakeUiWrap.inputQueue.push(`round ${i}`);
+  }
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  for (let i = 0; i < 9; i++) {
+    fakePiWrap.queueEffect(async () => {
+      // No-op refine: the contract stays resolvable (src/keep.ts exists).
+      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
+    });
+  }
+  // Apply: unjustified drift.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
+  });
+  // Review.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "recon4");
+  const recEnds = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "end");
+  assert.equal(recEnds.length, 1, "exactly one reconciliation end event");
+  assert.equal(recEnds[0].outcome, "skipped-budget");
+  assert.equal(recEnds[0].counts?.unjustifiedAfter, 1);
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /no turn left to reconcile/.test(n.message) && n.level === "warning"),
+    "a no-turn-left warning fired",
+  );
+  // Observed behavior (pinned, not `||`): the 9 Refine turns plus the Apply turn spend the full
+  // budget, so once Apply completes there is no turn left for the review turn either — the run
+  // stops before Code review with the turn-budget warning, and the reconciliation's own
+  // skipped-budget pre-check writes the `scope-reconcile` event and the drift warning above. The
+  // load-bearing guarantees (skip + warn + never loop) are asserted here; reaching the archive
+  // prompt would require one more budget unit than this recipe has.
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Turn budget \(10 agent turns\) reached/.test(n.message) && n.level === "warning"),
+    "the run stopped at the turn budget before the review turn",
+  );
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /touched file\(s\) outside its scope contract during Apply/.test(n.message) && /src\/rogue\.ts/.test(n.message)),
+    "the remaining drift still warns at the end",
+  );
+  assert.equal(fakePiWrap.calls.length, 10, "never more than the turn budget of model turns");
+});
+
+await test("S5: a reconciliation turn that touches a new outside file is surfaced", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-05-recon5.md", {
+    title: "Reconcile Five",
+    status: "proposed",
+    created: "2026-04-05",
+    change_id: "recon5",
+  });
+  const dir = await writeReconcileChange(cwd, "recon5");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-05 · Reconcile Five");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
+  });
+  // Reconciliation: creates ANOTHER new outside file instead of fixing anything.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(cwd, "src", "rogue2.ts"), "// a new out-of-contract file\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /changed additional out-of-contract file/.test(n.message) && n.level === "warning"),
+    "a warning surfaces the new out-of-contract file",
+  );
+  const context = await readContext(cwd, "recon5");
+  assert.ok(
+    context?.includes("Reconciliation turn changed file(s) it was not asked to"),
+    "CONTEXT.md records the boundary growth",
+  );
+});
+
+await test("S6: the deviation list reaches the review prompt", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-06-recon6.md", {
+    title: "Reconcile Six",
+    status: "proposed",
+    created: "2026-04-06",
+    change_id: "recon6",
+  });
+  const dir = await writeReconcileChange(cwd, "recon6");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-06 · Reconcile Six");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n\n## Scope deviations\n\n- src/rogue.ts — required\n", "utf8");
+    await writeFile(join(cwd, "src", "rogue.ts"), "// justified\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakePiWrap.calls.some((c) => /## Scope/.test(c.prompt) && /src\/rogue\.ts/.test(c.prompt) && /required/.test(c.prompt)),
+    "the review prompt carries the declared deviation with its reason",
+  );
+});
+
+await test("S7: the apply end event carries diff stats", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-07-recon7.md", {
+    title: "Reconcile Seven",
+    status: "proposed",
+    created: "2026-04-07",
+    change_id: "recon7",
+  });
+  const dir = await writeProposedChange(cwd, "recon7", ["- src/keep.ts", "- src/new.ts (new)"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-07 · Reconcile Seven");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\nexport const more = 3;\n", "utf8");
+    await writeFile(join(cwd, "src", "new.ts"), "export const fresh = true;\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "recon7");
+  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
+  assert.ok(applyEnd, "an apply end event exists");
+  assert.equal(applyEnd.outcome, "applied");
+  assert.ok(applyEnd.diff, "the apply end event carries a diff");
+  assert.ok((applyEnd.diff?.files ?? 0) >= 1, "at least one file counted");
+  assert.ok((applyEnd.diff?.added ?? 0) >= 1, "at least one added line counted");
+});
+
+await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-08-recon8.md", {
+    title: "Reconcile Eight",
+    status: "proposed",
+    created: "2026-04-08",
+    change_id: "recon8",
+  });
+  const dir = await writeReconcileChange(cwd, "recon8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-08 · Reconcile Eight");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const applyCall = fakePiWrap.calls.find((c) => /Implement the Readyset change/.test(c.prompt));
+  assert.ok(applyCall, "an Apply turn fired");
+  assert.match(applyCall.prompt, /touch ONLY files/);
+  assert.match(applyCall.prompt, /## Scope deviations/);
+  assert.match(applyCall.prompt, /smallest change/);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

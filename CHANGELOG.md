@@ -51,6 +51,18 @@ gate blocks on; where a check is added it warns, as the scope contract already d
   understood (a `(delete)` path must exist before Apply and is allowed to be gone afterward). The
   repair never loops and is skipped when the run has no turn budget left; whatever remains still
   only warns. Recorded in `CONTEXT.md` and as a `contract-repair` phase event.
+- **Apply is accountable to the scope contract, and pushed toward minimal diffs.** The v0.12
+  benchmark showed Readyset's diffs still ran far larger than `/plan`'s — lines changed **246 vs
+  107**, code files changed **5.6 vs 4.4**, files outside expected scope **0.72 vs 0.39** — and the
+  post-Apply check only warned, which the data showed barely moves behavior. The Apply prompt now
+  states explicit minimal-diff rules (contract files only; no unrequested refactors, renames,
+  reformatting, helper modules, or tests), and the Propose guide requires every task to map to a
+  spec scenario with the minimum file set. After Execute, a file changed outside the contract with
+  no `## Scope deviations` entry triggers **one** reconciliation turn that reverts it or records a
+  justification; whatever remains still only warns. `scope-reconcile` phase events carry
+  `outsideBefore`/`reverted`/`justified`/`unjustifiedAfter` counts, and the apply `end` event now
+  carries the final diff size (`files`/`added`/`deleted`), so readyset-bench can track both directly.
+  The code-review turn receives the deviation list and writes a `## Scope` section.
 
 ### Changed
 

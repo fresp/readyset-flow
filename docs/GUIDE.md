@@ -332,6 +332,21 @@ Picks a brainstorm, then depending on its status:
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
   implementation legitimately touches more files than planning.
+  - Apply is also told to keep the **diff minimal**: touch only files in the scope contract, make
+    no refactors/renames/reformatting the task doesn't need, add no unrequested helper modules,
+    scripts, or docs, and only add or modify tests that exercise the specs' WHEN/THEN scenarios.
+    If a file outside the contract is genuinely required, Apply must record it under a
+    `## Scope deviations` section in `tasks.md` as `- <path> — <reason>`.
+  - After Execute, a file touched outside the contract with **no** deviation entry is
+    **reconciled once**: one bounded turn reverts it (`git checkout -- <path>`, or deletes it if
+    this run created it — never `git checkout .`/`git stash`/`git reset`/`git clean`) or keeps it
+    and writes a `## Scope deviations` entry. It re-runs the affected tests and updates their
+    `_Verified:` notes after any revert. The turn **runs at most once per Execute**, and is skipped
+    when the run has no turn budget left. Anything still unjustified is named at the **Archive
+    now?** prompt and in `CONTEXT.md` — a **warning, never a block**. If the reconciliation turn
+    itself touches a new out-of-contract file, that is surfaced too. The code-review turn also gets
+    the deviation list and writes a `## Scope` section of `REVIEW.md` judging each deviation
+    necessary-or-gold-plating.
 - **Approve & Execute** implements the tasks. Each completed task needs an indented `_Verified:`
   note, or the gate sends it back. It can optionally call `readyset_verify({taskId, command})` to
   back that note with more than a self-report — the command runs for real, and an immutable record

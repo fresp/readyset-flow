@@ -18,6 +18,7 @@ import {
   ensureDirtyBaseline,
   readDirtyBaseline,
   readScopeContract,
+  readScopeDeviations,
   parseContractLine,
   checkScope,
   checkScopeRefs,
@@ -918,6 +919,47 @@ await test("malformed phase entries are skipped, never thrown", async () => {
   ].join("\n");
   await writeFile(changePaths(cwd, "bad").context, raw, "utf8");
   assert.deepEqual(await readPhaseEvents(cwd, "bad"), [good]);
+});
+
+await test("readScopeDeviations: parses bullets with reasons, tolerant of backticks and separators", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "deviations");
+  await writeFile(
+    paths.tasks,
+    [
+      "- [ ] 1.1 x",
+      "",
+      "## Scope deviations",
+      "",
+      "- src/a.ts — needed a shared helper",
+      "- `src/b.ts`: the spec scenario requires it",
+      "- src/c.ts",
+      "- prose without a path",
+      "",
+      "## Notes",
+      "",
+      "- src/d.ts — after the section ends, so not a deviation",
+    ].join("\n"),
+    "utf8",
+  );
+  const deviations = await readScopeDeviations(cwd, "deviations");
+  assert.deepEqual(deviations.map((d) => d.path), ["src/a.ts", "src/b.ts", "src/c.ts"]);
+  assert.equal(deviations[0].reason, "needed a shared helper");
+  assert.equal(deviations[1].reason, "the spec scenario requires it");
+  assert.equal(deviations[2].reason, "");
+});
+
+await test("readScopeDeviations: absent section -> empty, never a throw", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "nodeviations");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  assert.deepEqual(await readScopeDeviations(cwd, "nodeviations"), []);
+});
+
+await test("readScopeDeviations: missing tasks.md -> empty", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "notasks");
+  assert.deepEqual(await readScopeDeviations(cwd, "notasks"), []);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

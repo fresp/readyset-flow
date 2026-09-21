@@ -292,7 +292,7 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
 /** The phases a Readyset run records boundaries for. */
 export type PhaseName =
 	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"
-	| "contract-repair";
+	| "contract-repair" | "scope-reconcile";
 
 /** One boundary event in the machine-parseable phase log. */
 export interface PhaseEvent {
@@ -303,6 +303,10 @@ export interface PhaseEvent {
 	laneSource: "flag" | "brainstorm";
 	model?: string;
 	outcome?: string;
+	/** `scope-reconcile` only: drift counts for the bench. */
+	counts?: { outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number };
+	/** `apply` `end` only: final Apply diff size for the bench. */
+	diff?: { files: number; added: number; deleted: number };
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */
@@ -514,6 +518,51 @@ export async function readScopeContract(cwd: string, changeId: string): Promise<
 		else files.push(parsed.path);
 	}
 	return { files, newFiles, deleteFiles, raw: body };
+}
+
+/** One entry from tasks.md's `## Scope deviations` section: a file changed outside the contract,
+ *  with the model's one-line reason. */
+export interface ScopeDeviation {
+	/** Repo-relative path, normalized the same way `parseContractLine` normalizes a contract path. */
+	path: string;
+	/** The commentary after the path — the model's reason. Empty when the line names a path only. */
+	reason: string;
+}
+
+/**
+ * Parses the `## Scope deviations` section of tasks.md: one bullet per out-of-contract file the
+ * Apply turn touched, as `- <path> — <reason>` (any separator: ` -- `, an em/en dash, `: `, or
+ * nothing). The path is read with `parseContractLine`'s own path rules (bullets, backticks, quotes,
+ * `**` and a leading `./` all stripped; a non-path first token is skipped), so a deviation line is
+ * written exactly like a scope-contract line plus a reason. The section body runs to the next `##`
+ * heading. Returns an empty array when the file or section is absent — an absent section means "no
+ * deviations declared", never an error.
+ */
+export async function readScopeDeviations(cwd: string, changeId: string): Promise<ScopeDeviation[]> {
+	const raw = await readFile(changePaths(cwd, changeId).tasks, "utf8").catch(() => undefined);
+	if (raw === undefined) return [];
+	const match = raw.match(/^##[ \t]*Scope deviations[ \t]*\r?$/im);
+	if (!match || match.index === undefined) return [];
+	const rest = raw.slice(match.index + match[0].length);
+	const nextHeading = rest.match(/^##[ \t]/m);
+	const body = (nextHeading && nextHeading.index !== undefined ? rest.slice(0, nextHeading.index) : rest).trim();
+	if (!body) return [];
+	const deviations: ScopeDeviation[] = [];
+	for (const line of body.split(/\r?\n/)) {
+		const parsed = parseContractLine(line);
+		if (parsed === undefined) continue;
+		// `parseContractLine` strips a trailing backtick/quote only when it is the last character, so a
+		// wrapped path followed by a separator (`` `src/b.ts`: ``) keeps them. Strip the wrappers and
+		// trailing punctuation here so the path matches what `checkScope` reports for the same file.
+		const path = parsed.path.replace(/^[`'"*]+/, "").replace(/[`'"*]+$/, "").replace(/[.,;:]+$/, "");
+		if (path === "") continue;
+		// Recover the trailing reason from the raw line: everything after the path token, with the
+		// separator (and any wrapper leftovers) removed.
+		const idx = line.indexOf(path);
+		const reason = idx === -1 ? "" : line.slice(idx + path.length).replace(/^[\s:`'"*—–-]+/, "").replace(/[\s`'"*.]+$/, "").trim();
+		deviations.push({ path, reason });
+	}
+	return deviations;
 }
 
 export interface ScopeCheck {
