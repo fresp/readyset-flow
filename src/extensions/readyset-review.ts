@@ -39,7 +39,14 @@ import {
 	scaffoldChange,
 	validateChange,
 } from "../lib/readyset-spec.ts";
-import { readFallbackChain, readPhaseModels, readPinnedModel, readPreferredLanguage } from "../lib/readyset-omp-config.ts";
+import {
+	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+	readCompactMinContextPercent,
+	readFallbackChain,
+	readPhaseModels,
+	readPinnedModel,
+	readPreferredLanguage,
+} from "../lib/readyset-omp-config.ts";
 import {
 	ReviewSidebarOverlay,
 	type OverlaySection,
@@ -278,50 +285,62 @@ function applyTurnPrompt(changeId: string): string {
 	);
 }
 
-/**
- * `internalGuidance` for `ctx.compact()` when the user picks Approve & Compact. Deliberately not
- * a user-facing "focus" instruction (see `ReviewCtx.compact`'s doc comment on why this rides the
- * private `internalGuidance` channel, not `customInstructions`) — it tells the summarizer what's
- * safe to compress away for a Readyset change specifically: proposal/design/specs/tasks are all
- * persisted under readyset/changes/<id>/ already, so the Explore/Propose discussion that produced
- * them isn't load-bearing for Apply, which re-reads those files from disk regardless of what's
- * left in context (see `applyTurnPrompt`).
- */
-
-/**
- * Runs ctx.compact() before Apply with the Readyset-specific internal guidance. The benchmark
- * showed Explore/Propose context dominating Apply and Review token cost (T01: max context
- * 154k, ~76% of all tokens as cache reads), and everything those phases produced is already
- * persisted under readyset/changes/<id>/ — so compacting here is safe (Apply re-reads the
- * artifacts from disk), and skipping it just pays for the same history twice. A missing
- * ctx.compact (older omp build) or a failed compaction degrades to plain Approve & Execute
- * rather than blocking the user from proceeding at all.
- */
-async function compactBeforeApply(ctx: ReviewCtx, changeId: string): Promise<void> {
-	await compactForPhase(ctx, changeId, "executing", compactBeforeExecuteGuidance(changeId));
+interface CompactBoundaryResult {
+	outcome: "compacted" | "skipped-below-threshold" | "skipped-flag" | "unavailable" | "failed";
+	beforePercent?: number;
+	afterPercent?: number;
 }
 
 /**
- * Shared compaction for every phase boundary (Explore, Propose, Apply). Runs `ctx.compact()`
- * with Readyset-specific internal guidance, degrading to a plain continue when `ctx.compact`
- * is missing (older omp build) or throws — a cost optimization must never block the run. Every
- * boundary passes `suppressContinuation: true` because the caller fires the next phase turn
- * itself immediately after (see each guidance builder for why compacting there is safe).
+ * Compaction for one phase boundary. Whether it runs is governed by `mode`:
+ * - "never":  always skip (the user asked for no compaction).
+ * - "always": always compact (0.13.0 behavior).
+ * - "auto":   compact only when the host reports context usage at or above `minContextPercent`;
+ *             when `getContextUsage` is missing or returns undefined, compact anyway (today's
+ *             behavior — we cannot measure, so we do not skip).
+ * The summarization runs inside `withPhaseModel(..., phase, ...)` so it uses the phase's own
+ * (usually cheaper) model. omp exposes NO compaction-model parameter (verified: CompactOptions
+ * has no model field, the session.compacting/session_before_compact results have none, and
+ * `compaction.*`/`modelRoles` settings have no model key), so this wrapper is the only supported
+ * way to influence the model the summary is produced on. A missing `ctx.compact` or a throw
+ * degrades to a plain continue — a cost optimization must never block the run.
  */
-async function compactForPhase(ctx: ReviewCtx, changeId: string, phaseLabel: string, guidance: string): Promise<void> {
+async function compactForPhase(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	phaseModels: Map<string, { model: string; source: string }>,
+	phase: "explore" | "propose" | "apply",
+	changeId: string,
+	phaseLabel: string,
+	guidance: string,
+	mode: "auto" | "always" | "never",
+	minContextPercent: number,
+): Promise<CompactBoundaryResult> {
+	if (mode === "never") return { outcome: "skipped-flag" };
 	if (typeof ctx.compact !== "function") {
 		ctx.ui.notify(`Compact isn't available in this context — continuing ${phaseLabel} without it.`, "warning");
-		return;
+		return { outcome: "unavailable" };
+	}
+	const before = ctx.getContextUsage?.();
+	const beforePercent = before?.percent;
+	if (mode === "auto" && beforePercent !== undefined && beforePercent < minContextPercent) {
+		ctx.ui.notify(
+			`Context is at ${beforePercent.toFixed(0)}% (below the ${minContextPercent}% threshold) — skipping the compaction before ${phaseLabel}.`,
+			"info",
+		);
+		return { outcome: "skipped-below-threshold", beforePercent };
 	}
 	ctx.ui.notify(`Compacting context before ${phaseLabel} for "${changeId}"...`, "info");
 	try {
-		await ctx.compact({ internalGuidance: guidance, suppressContinuation: true });
-	} catch (err) {
-		ctx.ui.notify(
-			`Compact failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.`,
-			"warning",
+		await withPhaseModel(pi, ctx, phase, phaseModels, () =>
+			ctx.compact!({ internalGuidance: guidance, suppressContinuation: true }).then(() => undefined),
 		);
+	} catch (err) {
+		ctx.ui.notify(`Compact failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.`, "warning");
+		return { outcome: "failed", beforePercent };
 	}
+	const after = ctx.getContextUsage?.();
+	return { outcome: "compacted", beforePercent, afterPercent: after?.percent };
 }
 
 function compactBeforeExecuteGuidance(changeId: string): string {
@@ -1660,6 +1679,8 @@ async function reviewAndMaybeExecute(
 	phaseModels: Map<string, { model: string; source: string }> = new Map(),
 	reviewLane: "full" | "fast" = "full",
 	reviewLaneSource: "flag" | "brainstorm" = "brainstorm",
+	compactMode: "auto" | "always" | "never" = "auto",
+	minContextPercent: number = DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
 ): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
@@ -1672,7 +1693,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"] } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"] } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -1724,23 +1745,39 @@ async function reviewAndMaybeExecute(
 			return;
 		}
 
-		// "Approve & Execute" compacts first (see compactBeforeApply for why this is safe
-		// for a Readyset change specifically: everything Explore/Propose produced is already
-		// persisted under readyset/changes/<id>/, and Apply re-reads those files from disk).
-		// "Approve & Execute, keep context" skips the compact for the case where discussion
-		// nuance didn't make it into the artifacts. A missing ctx.compact (older omp build)
-		// or a failed compaction degrades to plain Approve & Execute rather than blocking
-		// the user from proceeding at all. A scope mismatch (out-of-contract files already
-		// changed in the tree) likewise warns, never blocks: it is shown in the gate panel
+		// "Approve & Execute" compacts first when the context clears the threshold (see
+		// compactForPhase for why this is safe for a Readyset change specifically: everything
+		// Explore/Propose produced is already persisted under readyset/changes/<id>/, and Apply
+		// re-reads those files from disk). "Approve & Execute, keep context" skips the compact
+		// entirely — the escape hatch for when discussion nuance didn't make it into the
+		// artifacts. `--compact never` suppresses this default too. A missing ctx.compact (older
+		// omp build) or a failed compaction degrades to plain Approve & Execute rather than
+		// blocking the user from proceeding at all. A scope mismatch (out-of-contract files
+		// already changed in the tree) likewise warns, never blocks: it is shown in the gate panel
 		// so approval happens with eyes open, not stopped for work the user can see. "compact"
-		// is kept as an accepted result for
-		// older sidebar builds that still return it (defensive; the current overlay no
-		// longer offers it).
+		// is kept as an accepted result for older sidebar builds that still return it (defensive;
+		// the current overlay no longer offers it).
 		if (choice === "approve" || choice === "compact") {
 			// Capture the pre-normalization value: the overlay/gate menu offers only `approve`
 			// and `compact` for execution, and `compact` means "approve, keep context".
 			const rawChoice = choice;
-			await compactBeforeApply(ctx, chosen.changeId);
+			const compactResult = await compactForPhase(
+				pi,
+				ctx,
+				phaseModels,
+				"apply",
+				chosen.changeId,
+				"executing",
+				compactBeforeExecuteGuidance(chosen.changeId),
+				compactMode,
+				minContextPercent,
+			);
+			await recordPhase(chosen.changeId, "compact", "end", {
+				model: phaseModels.get("apply")?.model,
+				outcome: compactResult.outcome,
+				boundary: "apply",
+				context: { beforePercent: compactResult.beforePercent, afterPercent: compactResult.afterPercent },
+			});
 			choice = "approve";
 			await recordPhase(chosen.changeId, "gate", "end", { outcome: rawChoice === "compact" ? "approve-keep-context" : "approve" });
 		}
@@ -2285,6 +2322,8 @@ export interface ReadysetArgs {
 	fast: boolean;
 	/** `--lane fast|full`: force the lane for this run, bypassing the brainstorm's recorded lane. */
 	lane?: string;
+	/** `--compact auto|always|never` — when to compact at a phase boundary. Defaults to "auto". */
+	compact?: "auto" | "always" | "never";
 	lang?: string;
 	model?: string;
 	fallbackModel?: string;
@@ -2354,6 +2393,14 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 				parsed.lane = value;
 				i++;
 			}
+		} else if (token === "--compact") {
+			// Deliberately NOT defaulted here: leaving it undefined lets the handler tell "unset"
+			// from an explicit bad value (same pattern as --lane), so the caller can warn.
+			const value = (tokens[i + 1] ?? "").toLowerCase();
+			if (value === "auto" || value === "always" || value === "never") {
+				parsed.compact = value;
+				i++;
+			}
 		} else if (token === "--lang") parsed.lang = tokens[i + 1];
 		else if (token === "--model") parsed.model = tokens[i + 1];
 		else if (token === "--fallback-model") parsed.fallbackModel = tokens[i + 1];
@@ -2406,6 +2453,15 @@ export default function (pi: ExtensionAPI) {
 			const laneOverride = parsedArgs.lane === "fast" || parsedArgs.lane === "full" ? parsedArgs.lane : undefined;
 			if (parsedArgs.lane !== undefined && laneOverride === undefined) {
 				ctx.ui.notify(`Ignoring --lane "${parsedArgs.lane}" — expected fast or full. Running on the brainstorm's recorded lane.`, "warning");
+			}
+
+			// --compact auto|always|never controls when a phase boundary actually compacts.
+			// Anything else (or a bare --compact with no value) warns and uses "auto". The raw
+			// `--compact` text test covers both "no value" and "bad value", since the parser only
+			// sets `parsed.compact` on a valid mode.
+			const compactMode: "auto" | "always" | "never" = parsedArgs.compact ?? "auto";
+			if (parsedArgs.compact === undefined && /(^|\s)--compact(\s|$)/.test(args)) {
+				ctx.ui.notify(`Ignoring --compact with no valid mode — expected auto, always, or never. Using "auto".`, "warning");
 			}
 
 			// --lang <language> (or, if no flag, readyset.language in ~/.omp/agent/config.yml) sets
@@ -2563,6 +2619,13 @@ export default function (pi: ExtensionAPI) {
 			const phaseModelFor = (phase: string): string | undefined =>
 				phaseModelOverrides.get(phase)?.model ?? pinnedModel;
 
+			// The `auto` threshold: a boundary compacts only when the host reports context usage
+			// at or above this share of the window (see compactForPhase). A warning about an
+			// invalid stored value is surfaced once, here, rather than per boundary.
+			const resolvedCompactMin = await readCompactMinContextPercent();
+			if (resolvedCompactMin.warning) ctx.ui.notify(resolvedCompactMin.warning, "warning");
+			const minContextPercent = resolvedCompactMin.percent;
+
 			// Writes one phase boundary event. Never throws: a phase log is diagnostics, not control
 			// flow -- a write failure must not abort the run (mirrors appendContext's callers, which
 			// also never guard). Notably the archive `end` event lands *after* archiveChange moved
@@ -2573,7 +2636,7 @@ export default function (pi: ExtensionAPI) {
 				edge: "start" | "end",
 				lane: "fast" | "full",
 				laneSource: "flag" | "brainstorm",
-				extra: { model?: string; outcome?: string } = {},
+				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"] } = {},
 			): Promise<void> => {
 				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
 			};
@@ -2591,7 +2654,7 @@ export default function (pi: ExtensionAPI) {
 					// Defensive: a change that predates the baseline mechanism has no capture
 					// yet. This never overwrites an existing baseline (first capture wins).
 					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent);
 					return;
 				}
 
@@ -2672,7 +2735,23 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					const submodules = await listSubmodules(ctx.cwd);
 					ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
-					await compactForPhase(reviewCtx, chosen.changeId, "Explore", compactBeforeExploreGuidance(chosen.changeId, chosen.file));
+					const exploreCompact = await compactForPhase(
+						pi,
+						reviewCtx,
+						phaseModelOverrides,
+						"explore",
+						chosen.changeId,
+						"Explore",
+						compactBeforeExploreGuidance(chosen.changeId, chosen.file),
+						compactMode,
+						minContextPercent,
+					);
+					await recordPhase(chosen.changeId, "compact", "end", phaseLane, phaseLaneSource, {
+						model: phaseModelFor("explore"),
+						outcome: exploreCompact.outcome,
+						boundary: "explore",
+						context: { beforePercent: exploreCompact.beforePercent, afterPercent: exploreCompact.afterPercent },
+					});
 					let exploreOutcome = "aborted";
 					await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
 					try {
@@ -2712,7 +2791,23 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				ctx.ui.notify(`Proposing change "${chosen.changeId}"${isFastLane ? " (fast lane — grounding folded in)" : ""} — this can take a while...`, "info");
-				await compactForPhase(reviewCtx, chosen.changeId, "Propose", compactBeforeProposeGuidance(chosen.changeId, chosen.file, !isFastLane));
+				const proposeCompact = await compactForPhase(
+					pi,
+					reviewCtx,
+					phaseModelOverrides,
+					"propose",
+					chosen.changeId,
+					"Propose",
+					compactBeforeProposeGuidance(chosen.changeId, chosen.file, !isFastLane),
+					compactMode,
+					minContextPercent,
+				);
+				await recordPhase(chosen.changeId, "compact", "end", phaseLane, phaseLaneSource, {
+					model: phaseModelFor("propose"),
+					outcome: proposeCompact.outcome,
+					boundary: "propose",
+					context: { beforePercent: proposeCompact.beforePercent, afterPercent: proposeCompact.afterPercent },
+				});
 				const proposeBudget = startPhaseBudget();
 				let proposeOutcome = "aborted";
 				await recordPhase(chosen.changeId, "propose", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("propose") });
@@ -2795,7 +2890,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent);
 		});
 		},
 	});

@@ -1754,6 +1754,8 @@ await test("prep compaction: full lane compacts before Explore and before Propos
     cwd,
     ui: fakeUiWrap.ui,
     waitForIdle: fakePiWrap.waitForIdle,
+    // Above the default 25% threshold, so `auto` compacts at both boundaries.
+    getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
     async compact(opts: { internalGuidance?: string; suppressContinuation?: boolean }) {
       compactCalls.push(opts);
     },
@@ -1766,6 +1768,13 @@ await test("prep compaction: full lane compacts before Explore and before Propos
   assert.match(compactCalls[1].internalGuidance ?? "", /EXPLORATION\.md/);
   assert.equal(compactCalls[0].suppressContinuation, true);
   assert.equal(compactCalls[1].suppressContinuation, true);
+
+  const compactEvents = (await readPhaseEvents(cwd, "prep-compact")).filter((e) => e.phase === "compact" && e.edge === "end");
+  assert.equal(compactEvents.length, 2, "one compact event per boundary");
+  assert.equal(compactEvents[0].boundary, "explore");
+  assert.equal(compactEvents[0].outcome, "compacted");
+  assert.equal(compactEvents[1].boundary, "propose");
+  assert.equal(compactEvents[1].outcome, "compacted");
 });
 
 await test("prep compaction: fast lane skips the Explore boundary and compacts only before Propose", async () => {
@@ -1788,6 +1797,7 @@ await test("prep compaction: fast lane skips the Explore boundary and compacts o
     cwd,
     ui: fakeUiWrap.ui,
     waitForIdle: fakePiWrap.waitForIdle,
+    getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
     async compact(opts: { internalGuidance?: string }) {
       compactCalls.push(opts);
     },
@@ -1797,6 +1807,11 @@ await test("prep compaction: fast lane skips the Explore boundary and compacts o
   assert.equal(compactCalls.length, 1, "fast lane has no separate Explore turn, so only the Propose compaction fires");
   assert.match(compactCalls[0].internalGuidance ?? "", /\.ai\/brainstorms/);
   assert.doesNotMatch(compactCalls[0].internalGuidance ?? "", /EXPLORATION\.md/);
+
+  const compactEvents = (await readPhaseEvents(cwd, "fast-prep")).filter((e) => e.phase === "compact" && e.edge === "end");
+  assert.equal(compactEvents.length, 1, "only the Propose boundary records a compact event on the fast lane");
+  assert.equal(compactEvents[0].boundary, "propose");
+  assert.equal(compactEvents[0].outcome, "compacted");
 });
 
 await test("post-Apply scope drift: warns and surfaces the out-of-contract file at the archive prompt", async () => {
@@ -2832,6 +2847,242 @@ await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   assert.match(applyCall.prompt, /touch ONLY files/);
   assert.match(applyCall.prompt, /## Scope deviations/);
   assert.match(applyCall.prompt, /smallest change/);
+});
+
+// --- Conditional / model-aware compaction (C1-C8) ---------------------------------------------
+
+// A fresh full-lane run that reaches the Explore boundary, with a controllable context-usage
+// reading and a compact that records its calls. The Explore turn is the first boundary, so a
+// single queued effect is enough to observe whether the Explore compaction ran. Only the first
+// boundary is exercised unless a test queues more effects.
+async function runFreshFullLane(
+  opts: {
+    args?: string;
+    percent?: number | undefined; // undefined => omit getContextUsage entirely
+    noCompactApi?: boolean;
+    extraCtx?: Record<string, unknown>;
+  } = {},
+) {
+  const cwd = await freshRepo();
+  await writeBrainstorm(
+    cwd,
+    "2026-05-01-compact.md",
+    { title: "Compact Boundary", status: "open", created: "2026-05-01", change_id: "compact-boundary", lane: "full" },
+    VALID_BRAINSTORM_BODY,
+  );
+  const dir = join(cwd, "readyset", "changes", "compact-boundary");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-01 · Compact Boundary"); // pick
+
+  // Explore turn: write EXPLORATION.md so Propose's guidance can name it.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\nchecked things\n", "utf8");
+  });
+  // Propose turn: nothing needed beyond landing at the next boundary.
+  fakePiWrap.queueEffect(async () => {});
+
+  const compactCalls: Array<{ internalGuidance?: string }> = [];
+  const ctx: Record<string, unknown> = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    ...(opts.percent !== undefined ? { getContextUsage: () => ({ tokens: 80000, contextWindow: 100000, percent: opts.percent }) } : {}),
+    ...(opts.noCompactApi ? {} : { async compact(o: { internalGuidance?: string }) { compactCalls.push(o); } }),
+    ...(opts.extraCtx ?? {}),
+  };
+  await handler(opts.args ?? "", ctx);
+
+  const events = (await readPhaseEvents(cwd, "compact-boundary")).filter((e) => e.phase === "compact" && e.edge === "end");
+  return { cwd, compactCalls, events, fakeUiWrap };
+}
+
+await test("C1: below the threshold skips compaction and records skipped-below-threshold", async () => {
+  const { compactCalls, events } = await runFreshFullLane({ percent: 5 });
+  assert.equal(compactCalls.length, 0, "below the threshold, no compaction fires");
+  const explore = events.find((e) => e.boundary === "explore");
+  assert.ok(explore, "the Explore boundary still records a compact event (the skip is measurable)");
+  assert.equal(explore.outcome, "skipped-below-threshold");
+  assert.equal(explore.context?.beforePercent, 5);
+});
+
+await test("C2: above the threshold compacts at the Explore boundary", async () => {
+  const { compactCalls, events } = await runFreshFullLane({ percent: 80 });
+  assert.ok(compactCalls.length >= 1, "above the threshold, the Explore compaction fires");
+  const explore = events.find((e) => e.boundary === "explore");
+  assert.ok(explore, "the Explore compact event is recorded");
+  assert.equal(explore.outcome, "compacted");
+});
+
+await test("C3: no getContextUsage at all compacts anyway (today's fallback)", async () => {
+  const { compactCalls, events } = await runFreshFullLane({ percent: undefined });
+  assert.ok(compactCalls.length >= 1, "without a way to measure usage, compaction still runs");
+  const explore = events.find((e) => e.boundary === "explore");
+  assert.ok(explore, "the Explore compact event is recorded");
+  assert.equal(explore.outcome, "compacted");
+  assert.equal(explore.context?.beforePercent, undefined, "no beforePercent when the host did not report usage");
+});
+
+await test("C4: --compact never suppresses every boundary and records skipped-flag", async () => {
+  const { compactCalls, events } = await runFreshFullLane({ percent: 80, args: "--compact never" });
+  assert.equal(compactCalls.length, 0, "--compact never must compact nothing");
+  assert.ok(events.length > 0, "the boundaries still record a compact event");
+  for (const e of events) assert.equal(e.outcome, "skipped-flag", `boundary ${e.boundary} skipped by the flag`);
+});
+
+await test("C5: --compact always compacts even below the threshold", async () => {
+  const { compactCalls, events } = await runFreshFullLane({ percent: 5, args: "--compact always" });
+  assert.ok(compactCalls.length >= 1, "--compact always ignores the threshold");
+  const explore = events.find((e) => e.boundary === "explore");
+  assert.ok(explore, "the Explore compact event is recorded");
+  assert.equal(explore.outcome, "compacted");
+});
+
+await test("C6: the keep-context CTA never compacts, even above the threshold", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-05-02-keepctx.md", { title: "Keep Ctx", status: "proposed", created: "2026-05-02", change_id: "keepctx" });
+  const dir = await writeProposedChange(cwd, "keepctx", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-02 · Keep Ctx"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context"); // gate
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const compactCalls: unknown[] = [];
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
+    async compact(opts: unknown) {
+      compactCalls.push(opts);
+    },
+  };
+  await handler("", ctx);
+
+  assert.equal(compactCalls.length, 0, "keep-context bypasses compaction even above the threshold");
+});
+
+await test("C7: --compact never also suppresses the Apply default", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-05-03-neverapply.md", { title: "Never Apply", status: "proposed", created: "2026-05-03", change_id: "neverapply" });
+  const dir = await writeProposedChange(cwd, "neverapply", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-03 · Never Apply"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute"); // gate
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const compactCalls: unknown[] = [];
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
+    async compact(opts: unknown) {
+      compactCalls.push(opts);
+    },
+  };
+  await handler("--compact never", ctx);
+
+  assert.equal(compactCalls.length, 0, "--compact never suppresses the Apply default too");
+  const events = await readPhaseEvents(cwd, "neverapply");
+  const apply = events.find((e) => e.phase === "compact" && e.edge === "end" && e.boundary === "apply");
+  assert.ok(apply, "the Apply boundary records a compact event even when suppressed");
+  assert.equal(apply.outcome, "skipped-flag");
+});
+
+await test("C8: the compaction call runs under the phase model when an override is set", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(
+    cwd,
+    "2026-05-04-phasemodel.md",
+    { title: "Phase Model", status: "open", created: "2026-05-04", change_id: "phasemodel", lane: "full" },
+    VALID_BRAINSTORM_BODY,
+  );
+  const dir = join(cwd, "readyset", "changes", "phasemodel");
+
+  const setModelCalls: unknown[] = [];
+  const compactOrder: string[] = [];
+  const fakePiWrap = makeFakePi(cwd);
+  // Wrap setModel so we can observe when the explore override is pinned relative to the compact.
+  const pi = {
+    ...fakePiWrap.pi,
+    async setModel(spec: unknown) {
+      setModelCalls.push(spec);
+      compactOrder.push(`setModel:${String(spec)}`);
+      return true;
+    },
+  };
+  const handler = await loadHandler(pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-04 · Phase Model"); // pick
+
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\nchecked things\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {});
+
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    getContextUsage: () => ({ tokens: 90000, contextWindow: 100000, percent: 90 }),
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+    async compact() {
+      compactOrder.push("compact");
+    },
+  };
+  await handler("--phase-model explore=cheap/model", ctx);
+
+  // The explore override must have been pinned (resolved) during the run, and the Explore
+  // boundary's compact must have happened after the override was applied and before it was
+  // restored -- i.e. the compaction ran under the phase model, not the session default.
+  assert.ok(
+    setModelCalls.includes("resolved:cheap/model"),
+    "the explore phase override was pinned at some point during the run",
+  );
+  const overrideIdx = compactOrder.indexOf("setModel:resolved:cheap/model");
+  const compactIdx = compactOrder.indexOf("compact");
+  assert.ok(overrideIdx !== -1, "the explore override was pinned");
+  assert.ok(compactIdx !== -1, "a compaction fired");
+  assert.ok(
+    overrideIdx < compactIdx,
+    `the compaction must run after the explore override is pinned (order: ${compactOrder.join(" -> ")})`,
+  );
+  // The override is restored to the session default after the phase finishes.
+  assert.ok(
+    compactOrder.lastIndexOf("setModel:session-default-model") > compactIdx,
+    "the model is restored to the session default after the compaction",
+  );
+
+  const events = (await readPhaseEvents(cwd, "phasemodel")).filter((e) => e.phase === "compact" && e.edge === "end");
+  const explore = events.find((e) => e.boundary === "explore");
+  assert.ok(explore, "the Explore compact event is recorded");
+  assert.equal(explore.outcome, "compacted");
+  assert.equal(explore.model, "cheap/model", "the compact event names the phase model it ran under");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

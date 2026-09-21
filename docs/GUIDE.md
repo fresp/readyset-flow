@@ -306,12 +306,19 @@ Picks a brainstorm, then depending on its status:
 - **Approve & Execute** compacts the planning context first — Explore/Propose history is already
   persisted under `readyset/changes/<id>/`, so Apply re-reads the artifacts from disk instead of
   paying for that history twice. Pick **keep context** when discussion nuance didn't make it into
-  the artifacts, so the model still has it. A failed or unavailable `ctx.compact` degrades to plain
-  execution.
-  - Planning phases also compact at their own boundaries now — after grilling before **Explore**
-    (the brainstorm is on disk), and after Explore before **Propose** (`EXPLORATION.md` is). The
-    **keep context** choice applies only to this Apply boundary; the prep boundaries always compact,
-    since neither phase's correctness depends on keeping the prior phase's conversation.
+  the artifacts, so the model still has it; **keep context** never compacts. A failed or
+  unavailable `ctx.compact` degrades to plain execution.
+  - Planning phases also compact at their own boundaries — after grilling before **Explore**
+    (the brainstorm is on disk), and after Explore before **Propose** (`EXPLORATION.md` is). These
+    boundaries (and the Apply default above) only compact **when the reported context usage is at
+    or above `readyset.compact.minContextPercent` (default 25%)**, so a fresh session with almost
+    nothing to summarize skips the turn. `--compact always` forces every boundary; `--compact never`
+    disables them all (including the Apply default — only a future compaction CTA would then
+    compact). Because everything each phase relies on is on disk, this is **expected** to reduce
+    prep token cost (mostly cache reads), but that effect is **unmeasured** — it is pending the next
+    benchmark, as is the effect on plan quality. The summarization runs under the phase's own
+    configured model where one is set (omp exposes no compaction-model parameter); each boundary
+    records a `compact` phase event so the effect can be measured.
 - The panel also shows the **scope check** — the working tree against `proposal.md`'s
   `## Files This Change Will Touch` contract. Anything changed that the contract doesn't name is
   listed as **OUT OF SCOPE** (paths under `readyset/` and `.ai/brainstorms/` are always in scope). An

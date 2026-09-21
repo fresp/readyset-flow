@@ -73,9 +73,10 @@ function quoteIfNeeded(value) {
  * block entirely rather than leaving a valueless `readyset:` stub behind. Exported for direct
  * testing.
  */
-export function buildReadysetBlockLines({ language, modelDefault, fallbackChain = [] }) {
+export function buildReadysetBlockLines({ language, modelDefault, fallbackChain = [], compactMinContextPercent }) {
 	const hasModel = Boolean(modelDefault) || fallbackChain.length > 0;
-	if (!language && !hasModel) return [];
+	const hasCompact = typeof compactMinContextPercent === "number";
+	if (!language && !hasModel && !hasCompact) return [];
 
 	const lines = ["readyset:"];
 	if (language) lines.push(`  language: ${quoteIfNeeded(language)}`);
@@ -86,6 +87,10 @@ export function buildReadysetBlockLines({ language, modelDefault, fallbackChain 
 			lines.push("    fallbackChains:");
 			for (const spec of fallbackChain) lines.push(`      - ${quoteIfNeeded(spec)}`);
 		}
+	}
+	if (hasCompact) {
+		lines.push("  compact:");
+		lines.push(`    minContextPercent: ${compactMinContextPercent}`);
 	}
 	return lines;
 }
@@ -134,13 +139,13 @@ export function spliceReadysetBlock(raw, blockLines) {
 async function readCurrentConfig(configPath, spawnSync, runnerPath) {
 	const result = spawnSync(process.execPath, ["--experimental-strip-types", runnerPath, configPath], { encoding: "utf8" });
 	if (result.error || result.status !== 0) {
-		return { language: undefined, modelDefault: undefined, fallbackChain: [], readable: false };
+		return { language: undefined, modelDefault: undefined, fallbackChain: [], compactMinContextPercent: undefined, readable: false };
 	}
 	try {
 		const parsed = JSON.parse(result.stdout.trim());
 		return { ...parsed, readable: true };
 	} catch {
-		return { language: undefined, modelDefault: undefined, fallbackChain: [], readable: false };
+		return { language: undefined, modelDefault: undefined, fallbackChain: [], compactMinContextPercent: undefined, readable: false };
 	}
 }
 
@@ -175,12 +180,18 @@ export async function runConfigureWizard(configPath, { spawnSync, runnerPath, in
 		}
 
 		output.write(`Configuring the readyset: section of ${configPath}\n`);
-		if (current.language || current.modelDefault || current.fallbackChain?.length) {
+		if (
+			current.language ||
+			current.modelDefault ||
+			current.fallbackChain?.length ||
+			current.compactMinContextPercent != null
+		) {
 			output.write("Current: ");
 			const parts = [];
 			if (current.language) parts.push(`language=${current.language}`);
 			if (current.modelDefault) parts.push(`model.default=${current.modelDefault}`);
 			if (current.fallbackChain?.length) parts.push(`fallbackChains=[${current.fallbackChain.join(", ")}]`);
+			if (current.compactMinContextPercent != null) parts.push(`compact.minContextPercent=${current.compactMinContextPercent}`);
 			output.write(`${parts.join(", ")}\n`);
 		}
 		const proceed = await ask("Set this up now? [Y/n] ");
@@ -188,7 +199,8 @@ export async function runConfigureWizard(configPath, { spawnSync, runnerPath, in
 			output.write(
 				"\nSkipped -- nothing written. Add this to ~/.omp/agent/config.yml by hand whenever you're ready:\n\n" +
 					"readyset:\n  language: Indonesian\n  model:\n    default: anthropic/claude-opus-5\n" +
-					"    fallbackChains:\n      - anthropic/claude-sonnet-5\n      - spark/minimax-m3\n",
+					"    fallbackChains:\n      - anthropic/claude-sonnet-5\n      - spark/minimax-m3\n" +
+					"  compact:\n    minContextPercent: 25\n",
 			);
 			return;
 		}
@@ -198,6 +210,9 @@ export async function runConfigureWizard(configPath, { spawnSync, runnerPath, in
 		const modelAnswer = await ask(`Default model${current.modelDefault ? ` [${current.modelDefault}]` : " (e.g. anthropic/claude-opus-5)"}: `);
 		const fallbackAnswer = await ask(
 			`Fallback models, comma-separated, tried in order${current.fallbackChain?.length ? ` [${current.fallbackChain.join(", ")}]` : ""}: `,
+		);
+		const compactAnswer = await ask(
+			`Compact threshold percent, 0-100${current.compactMinContextPercent != null ? ` [${current.compactMinContextPercent}]` : " (default 25)"}: `,
 		);
 
 		const language = resolveAnswer(languageAnswer, current.language);
@@ -212,7 +227,24 @@ export async function runConfigureWizard(configPath, { spawnSync, runnerPath, in
 							.map((s) => s.trim())
 							.filter(Boolean);
 
-		const blockLines = buildReadysetBlockLines({ language, modelDefault, fallbackChain });
+		// Blank keeps the current value (or leaves it unset when there was none); `-` clears it;
+		// anything else must parse as a number in [0, 100], else we leave it unset rather than
+		// write garbage (the runtime parser warns on an invalid stored value anyway).
+		const compactResolved = resolveAnswer(compactAnswer, current.compactMinContextPercent);
+		let compactMinContextPercent;
+		if (compactResolved != null) {
+			const num = Number(String(compactResolved).trim());
+			if (String(compactResolved).trim() !== "" && Number.isFinite(num) && num >= 0 && num <= 100) {
+				compactMinContextPercent = num;
+			} else if (current.compactMinContextPercent == null) {
+				output.write(`\nIgnoring "${compactResolved}" — compact threshold must be a number between 0 and 100.\n`);
+			} else {
+				output.write(`\nIgnoring "${compactResolved}" — compact threshold must be a number between 0 and 100; keeping the current value.\n`);
+				compactMinContextPercent = current.compactMinContextPercent;
+			}
+		}
+
+		const blockLines = buildReadysetBlockLines({ language, modelDefault, fallbackChain, compactMinContextPercent });
 		const raw = await readFile(configPath, "utf8").catch(() => "");
 		const spliced = spliceReadysetBlock(raw, blockLines);
 

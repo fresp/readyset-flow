@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 import {
+	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+	parseCompactMinContextPercent,
 	parseFallbackChain,
 	parseFallbackModel,
 	parseLanguageOverride,
@@ -10,6 +12,7 @@ import {
 	parseOmpDefaultModel,
 	parsePhaseModels,
 	parseYamlSubset,
+	readCompactMinContextPercent,
 	readFallbackChain,
 	readFallbackModel,
 	readPhaseModels,
@@ -307,6 +310,80 @@ await test("readPhaseModels: reads a real file and tags the source", async () =>
 await test("readPhaseModels: missing file -> empty entries, never throws", async () => {
   const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
   assert.deepEqual(await readPhaseModels(join(dir, "does-not-exist.yml")), { entries: [] });
+});
+
+// -- parseCompactMinContextPercent ----------------------------------------------------------
+
+await test("parseCompactMinContextPercent: absent key -> default, no warning, present=false", () => {
+  assert.deepEqual(parseCompactMinContextPercent("readyset:\n  language: Indonesian\n"), {
+    percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+    warning: undefined,
+    present: false,
+  });
+});
+
+await test("parseCompactMinContextPercent: reads a valid numeric value", () => {
+  assert.deepEqual(parseCompactMinContextPercent("readyset:\n  compact:\n    minContextPercent: 40\n"), {
+    percent: 40,
+    warning: undefined,
+    present: true,
+  });
+});
+
+await test("parseCompactMinContextPercent: accepts the 0 and 100 boundaries", () => {
+  assert.equal(parseCompactMinContextPercent("readyset:\n  compact:\n    minContextPercent: 0\n").percent, 0);
+  assert.equal(parseCompactMinContextPercent("readyset:\n  compact:\n    minContextPercent: 100\n").percent, 100);
+});
+
+await test("parseCompactMinContextPercent: accepts a quoted numeric string", () => {
+  const parsed = parseCompactMinContextPercent('readyset:\n  compact:\n    minContextPercent: "40"\n');
+  assert.equal(parsed.percent, 40);
+  assert.equal(parsed.present, true);
+  assert.equal(parsed.warning, undefined);
+});
+
+await test("parseCompactMinContextPercent: invalid values warn and fall back to the default", () => {
+  for (const bad of ["abc", "-1", "101"]) {
+    const parsed = parseCompactMinContextPercent(`readyset:\n  compact:\n    minContextPercent: ${bad}\n`);
+    assert.equal(parsed.percent, DEFAULT_COMPACT_MIN_CONTEXT_PERCENT, `"${bad}" should fall back to the default`);
+    assert.equal(parsed.present, true, `"${bad}" is present even though rejected`);
+    assert.ok(parsed.warning && parsed.warning.length > 0, `"${bad}" should carry a warning`);
+  }
+});
+
+await test("parseCompactMinContextPercent: an empty value reads as unset (no warning), never a crash", () => {
+  // `minContextPercent:` with nothing after it is an empty mapping to the subset parser, not an
+  // empty string -- so it reads as absent: the default, no warning. Documented so a later change
+  // doesn't "fix" this into a warning the parser can't actually produce.
+  assert.deepEqual(parseCompactMinContextPercent("readyset:\n  compact:\n    minContextPercent:\n"), {
+    percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+    warning: undefined,
+    present: false,
+  });
+});
+
+await test("readCompactMinContextPercent: missing file -> default, no warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  assert.deepEqual(await readCompactMinContextPercent(join(dir, "does-not-exist.yml")), {
+    percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+    warning: undefined,
+  });
+});
+
+await test("readCompactMinContextPercent: reads a valid value from a real file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  compact:\n    minContextPercent: 60\n", "utf8");
+  assert.deepEqual(await readCompactMinContextPercent(configPath), { percent: 60, warning: undefined });
+});
+
+await test("readCompactMinContextPercent: an invalid stored value yields the default plus a warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  compact:\n    minContextPercent: nope\n", "utf8");
+  const parsed = await readCompactMinContextPercent(configPath);
+  assert.equal(parsed.percent, DEFAULT_COMPACT_MIN_CONTEXT_PERCENT);
+  assert.ok(parsed.warning && parsed.warning.length > 0);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

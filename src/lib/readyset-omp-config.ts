@@ -195,6 +195,52 @@ export function parsePhaseModels(raw: string): { phase: string; model: string }[
 	return out;
 }
 
+/** Default for `readyset.compact.minContextPercent`: skip a boundary's compaction when the
+ *  context is below this share of the window, because the summarization turn costs more than it
+ *  saves on a nearly-empty context. */
+export const DEFAULT_COMPACT_MIN_CONTEXT_PERCENT = 25;
+
+export interface ParsedCompactMinPercent {
+	/** The resolved percentage (0-100), or the default when unset/unreadable. */
+	percent: number;
+	/** Human-readable warning when a value was present but rejected; undefined when clean. */
+	warning: string | undefined;
+	/** True when the key was present (even if rejected). */
+	present: boolean;
+}
+
+/**
+ * Parses `readyset.compact.minContextPercent` — a number in [0, 100]. Any other value (non-numeric,
+ * out of range, empty) is rejected and the default is used, with a warning the caller surfaces.
+ * Absent key is not a warning, just the default.
+ */
+export function parseCompactMinContextPercent(raw: string): ParsedCompactMinPercent {
+	const doc = parseYamlSubset(raw);
+	const value = getPath(doc, "readyset.compact.minContextPercent");
+	if (value === undefined) return { percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT, warning: undefined, present: false };
+	const text = typeof value === "string" ? value.trim() : String(value);
+	const num = Number(text);
+	if (text === "" || Number.isNaN(num) || !Number.isFinite(num) || num < 0 || num > 100) {
+		return {
+			percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+			warning: `readyset.compact.minContextPercent ("${text}") isn't a number between 0 and 100 — using the default (${DEFAULT_COMPACT_MIN_CONTEXT_PERCENT}).`,
+			present: true,
+		};
+	}
+	return { percent: num, warning: undefined, present: true };
+}
+
+export interface ResolvedCompactMinPercent { percent: number; warning: string | undefined }
+
+/** Reads `readyset.compact.minContextPercent` (or `configPath`, for tests). Never throws — a
+ *  missing/unreadable file means "use the default", same as every other reader here. */
+export async function readCompactMinContextPercent(configPath: string = OMP_CONFIG_PATH): Promise<ResolvedCompactMinPercent> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT, warning: undefined };
+	const parsed = parseCompactMinContextPercent(raw);
+	return { percent: parsed.percent, warning: parsed.warning };
+}
+
 /** Readyset's own fallback chain: `readyset.model.fallbackChains` (an ordered list, current
  *  shape) or a bare `readyset.fallbackModel: <spec>` (legacy shape — treated as a one-element
  *  chain). Returns every entry found; empty when neither is set. */

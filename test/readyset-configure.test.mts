@@ -77,11 +77,11 @@ function collectingOutput(): Writable & { text: () => string } {
 
 /** A fake `spawnSync` for tests that don't want to actually spawn `configure-runner.mts` --
  *  returns canned "current config" JSON, matching the real runner's stdout contract. */
-function fakeSpawnSync(current: { language?: string; modelDefault?: string; fallbackChain?: string[] }) {
+function fakeSpawnSync(current: { language?: string; modelDefault?: string; fallbackChain?: string[]; compactMinContextPercent?: number }) {
 	return () => ({
 		error: undefined,
 		status: 0,
-		stdout: JSON.stringify({ language: undefined, modelDefault: undefined, fallbackChain: [], ...current }),
+		stdout: JSON.stringify({ language: undefined, modelDefault: undefined, fallbackChain: [], compactMinContextPercent: undefined, ...current }),
 	});
 }
 
@@ -161,6 +161,34 @@ await test("buildReadysetBlockLines: a value needing quoting gets quoted", () =>
 	assert.equal(lines[1], '  language: "weird # value"');
 });
 
+await test("buildReadysetBlockLines: compact threshold only emits the compact sub-block", () => {
+	assert.deepEqual(buildReadysetBlockLines({ compactMinContextPercent: 25 }), [
+		"readyset:",
+		"  compact:",
+		"    minContextPercent: 25",
+	]);
+});
+
+await test("buildReadysetBlockLines: the compact sub-block comes after model:", () => {
+	assert.deepEqual(
+		buildReadysetBlockLines({ language: "Indonesian", modelDefault: "m1", fallbackChain: ["m2"], compactMinContextPercent: 40 }),
+		[
+			"readyset:",
+			"  language: Indonesian",
+			"  model:",
+			"    default: m1",
+			"    fallbackChains:",
+			"      - m2",
+			"  compact:",
+			"    minContextPercent: 40",
+		],
+	);
+});
+
+await test("buildReadysetBlockLines: everything unset (including compact) -> empty (no block)", () => {
+	assert.deepEqual(buildReadysetBlockLines({ compactMinContextPercent: undefined }), []);
+});
+
 // -- spliceReadysetBlock -------------------------------------------------------------------
 
 await test("spliceReadysetBlock: replaces an existing block, leaves everything else untouched", () => {
@@ -220,7 +248,7 @@ await test("runConfigureWizard: fresh answers on an empty config write a full bl
 	await runConfigureWizard(configPath, {
 		spawnSync: fakeSpawnSync({}) as unknown as typeof realSpawnSync,
 		runnerPath,
-		input: scriptedInput(["y", "Indonesian", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5, spark/minimax-m3"]),
+		input: scriptedInput(["y", "Indonesian", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5, spark/minimax-m3", ""]),
 		output,
 	});
 	const written = await readFile(configPath, "utf8");
@@ -238,7 +266,7 @@ await test("runConfigureWizard: blank answers keep every current value, and the 
 	await runConfigureWizard(configPath, {
 		spawnSync: fakeSpawnSync({ language: "Indonesian", modelDefault: "m1", fallbackChain: ["m2"] }) as unknown as typeof realSpawnSync,
 		runnerPath,
-		input: scriptedInput(["y", "", "", ""]),
+		input: scriptedInput(["y", "", "", "", ""]),
 		output,
 	});
 	const after = await readFile(configPath, "utf8");
@@ -253,7 +281,7 @@ await test("runConfigureWizard: a literal '-' clears an existing value, others c
 	await runConfigureWizard(configPath, {
 		spawnSync: fakeSpawnSync({ language: "Indonesian", modelDefault: "m1", fallbackChain: ["m2"] }) as unknown as typeof realSpawnSync,
 		runnerPath,
-		input: scriptedInput(["y", "-", "", ""]),
+		input: scriptedInput(["y", "-", "", "", ""]),
 		output,
 	});
 	const after = await readFile(configPath, "utf8");
@@ -267,7 +295,7 @@ await test("runConfigureWizard: clearing every field removes the readyset: block
 	await runConfigureWizard(configPath, {
 		spawnSync: fakeSpawnSync({ language: "Indonesian" }) as unknown as typeof realSpawnSync,
 		runnerPath,
-		input: scriptedInput(["y", "-", "", ""]),
+		input: scriptedInput(["y", "-", "", "", ""]),
 		output,
 	});
 	const after = await readFile(configPath, "utf8");
@@ -282,7 +310,7 @@ await test("runConfigureWizard: unreadable current config (fake spawnSync failur
 	await runConfigureWizard(configPath, {
 		spawnSync: failingSpawnSync,
 		runnerPath,
-		input: scriptedInput(["y", "Indonesian", "", ""]),
+		input: scriptedInput(["y", "Indonesian", "", "", ""]),
 		output,
 	});
 	assert.match(output.text(), /couldn't read current config\.yml values/);
@@ -297,13 +325,72 @@ await test("runConfigureWizard: real configure-runner.mts subprocess reads an ex
 	await runConfigureWizard(configPath, {
 		spawnSync: realSpawnSync,
 		runnerPath,
-		input: scriptedInput(["y", "", "", ""]),
+		input: scriptedInput(["y", "", "", "", ""]),
 		output,
 	});
 	assert.match(output.text(), /Current: language=Indonesian, model\.default=m1, fallbackChains=\[m2, m3\]/);
 	assert.match(output.text(), /No changes/);
 	const after = await readFile(configPath, "utf8");
 	assert.equal(after, initial, "the real subprocess round-trip must not alter the file when nothing changed");
+});
+
+await test("runConfigureWizard: a compact threshold answer writes the compact sub-block", async () => {
+	const configPath = await freshConfigPath();
+	const output = collectingOutput();
+	await runConfigureWizard(configPath, {
+		spawnSync: fakeSpawnSync({}) as unknown as typeof realSpawnSync,
+		runnerPath,
+		input: scriptedInput(["y", "", "", "", "40"]),
+		output,
+	});
+	const written = await readFile(configPath, "utf8");
+	assert.equal(written, "readyset:\n  compact:\n    minContextPercent: 40\n");
+	assert.match(output.text(), /Wrote readyset:/);
+});
+
+await test("runConfigureWizard: blank compact answer keeps the current value", async () => {
+	const initial = "readyset:\n  language: Indonesian\n  compact:\n    minContextPercent: 30\n";
+	const configPath = await freshConfigPath(initial);
+	const output = collectingOutput();
+	await runConfigureWizard(configPath, {
+		spawnSync: fakeSpawnSync({ language: "Indonesian", compactMinContextPercent: 30 }) as unknown as typeof realSpawnSync,
+		runnerPath,
+		input: scriptedInput(["y", "", "", "", ""]),
+		output,
+	});
+	assert.match(output.text(), /Current: language=Indonesian, compact\.minContextPercent=30/);
+	const after = await readFile(configPath, "utf8");
+	assert.equal(after, initial, "blank answers keep every current value, including the compact threshold");
+	assert.match(output.text(), /No changes/);
+});
+
+await test("runConfigureWizard: a literal '-' clears the compact threshold", async () => {
+	const initial = "readyset:\n  language: Indonesian\n  compact:\n    minContextPercent: 30\n";
+	const configPath = await freshConfigPath(initial);
+	const output = collectingOutput();
+	await runConfigureWizard(configPath, {
+		spawnSync: fakeSpawnSync({ language: "Indonesian", compactMinContextPercent: 30 }) as unknown as typeof realSpawnSync,
+		runnerPath,
+		input: scriptedInput(["y", "", "", "", "-"]),
+		output,
+	});
+	const after = await readFile(configPath, "utf8");
+	assert.equal(after, "readyset:\n  language: Indonesian\n");
+});
+
+await test("runConfigureWizard: an invalid compact answer leaves it unset rather than writing garbage", async () => {
+	const configPath = await freshConfigPath();
+	const output = collectingOutput();
+	await runConfigureWizard(configPath, {
+		spawnSync: fakeSpawnSync({}) as unknown as typeof realSpawnSync,
+		runnerPath,
+		input: scriptedInput(["y", "", "", "", "abc"]),
+		output,
+	});
+	assert.match(output.text(), /must be a number between 0 and 100/);
+	// Nothing else was set, so no readyset block is written at all.
+	const after = await readFile(configPath, "utf8").catch(() => "");
+	assert.equal(after, "");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -292,7 +292,7 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
 /** The phases a Readyset run records boundaries for. */
 export type PhaseName =
 	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"
-	| "contract-repair" | "scope-reconcile";
+	| "contract-repair" | "scope-reconcile" | "compact";
 
 /** One boundary event in the machine-parseable phase log. */
 export interface PhaseEvent {
@@ -307,6 +307,10 @@ export interface PhaseEvent {
 	counts?: { outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number };
 	/** `apply` `end` only: final Apply diff size for the bench. */
 	diff?: { files: number; added: number; deleted: number };
+	/** `compact` only: which boundary this compaction preceded. */
+	boundary?: "explore" | "propose" | "apply";
+	/** `compact` only: context usage before/after when the host reported it. */
+	context?: { beforePercent?: number; afterPercent?: number };
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */

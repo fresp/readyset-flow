@@ -20,7 +20,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { parseModelOverride, parseFallbackChain, parseLanguageOverride } from "../lib/readyset-omp-config.ts";
+import { parseModelOverride, parseFallbackChain, parseLanguageOverride, parseCompactMinContextPercent } from "../lib/readyset-omp-config.ts";
 
 async function main() {
 	const [configPath] = process.argv.slice(2);
@@ -30,7 +30,7 @@ async function main() {
 	}
 	const raw = await readFile(configPath, "utf8").catch(() => undefined);
 	if (raw === undefined) {
-		console.log(JSON.stringify({ language: undefined, modelDefault: undefined, fallbackChain: [] }));
+		console.log(JSON.stringify({ language: undefined, modelDefault: undefined, fallbackChain: [], compactMinContextPercent: undefined }));
 		process.exit(0);
 	}
 	console.log(
@@ -38,6 +38,13 @@ async function main() {
 			language: parseLanguageOverride(raw),
 			modelDefault: parseModelOverride(raw),
 			fallbackChain: parseFallbackChain(raw),
+			// Report the *resolved* threshold only when the key is actually present, so the
+			// wizard can tell "unset" (omit the block) from "explicitly set" (keep it) — a bare
+			// `.percent` would always read as the default 25 even for a config that never set it.
+			compactMinContextPercent: (() => {
+				const parsed = parseCompactMinContextPercent(raw);
+				return parsed.present ? parsed.percent : undefined;
+			})(),
 		}),
 	);
 	process.exit(0);

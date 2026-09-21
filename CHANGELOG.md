@@ -66,12 +66,22 @@ gate blocks on; where a check is added it warns, as the scope contract already d
 
 ### Changed
 
-- **Planning phases compact at every boundary now, not only before Apply.** Prep (Grill → Explore →
-  Propose) was **16×** the plan arm's entire run in tokens — the single biggest number in the cost
-  breakdown — because each phase carried every prior phase's conversation forward at full cache-read
-  cost. Compaction now also fires before Explore (the brainstorm is already on disk) and before
-  Propose (`EXPLORATION.md` is), mirroring the pre-Apply compaction. Cost-only: neither boundary's
-  correctness depends on keeping history, since both phases re-read their artifacts from disk.
+- **Planning phases compact conditionally at every boundary now, not only before Apply.** Prep
+  (Grill → Explore → Propose) was **16×** the plan arm's entire run in tokens — the single biggest
+  number in the cost breakdown — because each phase carried every prior phase's conversation forward
+  at full cache-read cost. Compaction now also fires before Explore (the brainstorm is already on
+  disk) and before Propose (`EXPLORATION.md` is), mirroring the pre-Apply compaction. It is
+  **expected** to reduce prep token cost (mostly cache reads); wall time is unlikely to change much,
+  and the effect on both cost and plan quality is **pending the next benchmark** — this is a
+  mechanism, not a measured outcome. It is now **conditional**: a boundary compacts only when the
+  reported context usage is at or above `readyset.compact.minContextPercent` (default 25), so a
+  fresh session with almost nothing to summarize no longer pays for a summarization turn, and a
+  `--compact auto|always|never` flag forces or disables it. `--compact never` disables every
+  boundary. The summarization also now runs under the phase's own configured model (via the
+  phase-model wrapper) where one is set — omp exposes no compaction-model parameter, so this is the
+  only supported way to influence which model produces the summary. Each boundary records a
+  `compact` phase event carrying its `boundary`, `outcome`, and before/after context percent, so the
+  effect is measurable in the next benchmark.
 
 ### Fixed
 
