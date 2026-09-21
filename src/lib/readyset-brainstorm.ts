@@ -206,13 +206,23 @@ export async function loadBrainstorms(cwd: string): Promise<BrainstormMeta[]> {
  * mutating the passed items in place and returning how many files were rewritten.
  *
  * Derived from the filesystem rather than from what a command *intended* to do, so a
- * propose that failed halfway leaves the brainstorm untouched. Fast-lane brainstorms
- * are never touched: they have no change to reconcile against.
+ * propose that failed halfway leaves the brainstorm untouched.
+ *
+ * Lane is deliberately not consulted. An earlier version skipped `lane !== "full"` here,
+ * on the theory that a fast-lane brainstorm never has a change to reconcile against — the
+ * extension writes no `readyset/changes/<id>/` for it. That theory is false for the fast
+ * lane as it actually runs (it still goes through Propose and writes a change dir), and the
+ * skip was not harmless: the review gate only opens for a brainstorm whose status is
+ * `proposed` (see the `isProposed` check in readyset-review.ts), so every fast-lane change
+ * dead-ended at "Propose doesn't look finished" with no gate ever shown. Measured on
+ * `readyset-bench` label `b1-subset-0.12`: all 5 fast-lane runs, 0 gates; all 7 full-lane
+ * runs, 1 gate each. The status is already guarded by `changeState` below, so an untouched
+ * fast-lane brainstorm with no change dir is still left alone.
  */
 export async function reconcileStatuses(cwd: string, items: BrainstormMeta[]): Promise<number> {
 	let updated = 0;
 	for (const b of items) {
-		if (b.lane !== "full" || b.status === "archived") continue;
+		if (b.status === "archived") continue;
 		const state = await changeState(cwd, b.changeId);
 		let next: string | undefined;
 		if (state === "archived") next = "archived";

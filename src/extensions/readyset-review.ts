@@ -2230,9 +2230,17 @@ export default function (pi: ExtensionAPI) {
 			const wroteProposal = after ? (await validateChange(ctx.cwd, after.changeId)).issues.every((i) => !(i.file === "proposal.md" && i.problem === "missing")) : false;
 
 			if (!after || !isProposed(after.status) || !wroteProposal) {
+				// Name the actual failing condition. The old message said "proposal.md not
+				// found or empty" for all three, which sent a live investigation (b1-subset-0.12
+				// T12) hunting for a file that was on disk the whole time — the real cause was
+				// a fast-lane brainstorm whose status never got reconciled to "proposed".
+				const why = !after
+					? `no brainstorm matches the change id "${chosen.changeId}"`
+					: !isProposed(after.status)
+						? `its brainstorm status is "${after.status}", not proposed`
+						: "proposal.md is missing or empty";
 				ctx.ui.notify(
-					`Propose for "${chosen.changeId}" doesn't look finished (readyset/changes/${chosen.changeId}/proposal.md ` +
-						"not found or empty) — check the transcript above for errors, then run /readyset again.",
+					`Propose for "${chosen.changeId}" doesn't look finished (${why}) — check the transcript above for errors, then run /readyset again.`,
 					"warning",
 				);
 				return;

@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { validateBrainstormContent } from "../src/lib/readyset-brainstorm.ts";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	BRAINSTORM_DIR,
+	READYSET_DIR,
+	loadBrainstorms,
+	reconcileStatuses,
+	validateBrainstormContent,
+} from "../src/lib/readyset-brainstorm.ts";
 
 let pass = 0;
 let fail = 0;
@@ -89,6 +98,70 @@ await test("summary text differs between ok and not-ok results", () => {
 	const notOk = validateBrainstormContent(withFrontmatter(""));
 	assert.notEqual(ok.summary, notOk.summary);
 	assert.match(notOk.summary, /\d+ section\(s\) look unresolved/);
+});
+
+// --- reconcileStatuses vs lane -------------------------------------------------------
+//
+// Regression: reconcileStatuses used to skip every brainstorm whose lane wasn't "full", so a
+// fast-lane change never had its brainstorm status bumped to "proposed". The review gate only
+// opens for a proposed brainstorm, so every fast-lane run dead-ended with "Propose doesn't look
+// finished" and no gate (readyset-bench label b1-subset-0.12: 5 fast-lane runs, 0 gates).
+
+async function scratchRepo(): Promise<string> {
+	const { mkdtemp } = await import("node:fs/promises");
+	return mkdtemp(join(tmpdir(), "rs-bs-"));
+}
+
+function writeBrainstorm(cwd: string, id: string, lane: string): void {
+	const dir = join(cwd, BRAINSTORM_DIR);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(
+		join(dir, `2026-09-21-${id}.md`),
+		`---\ntitle: T\nslug: ${id}\nstatus: open\nlane: ${lane}\nchange_id:\ncreated: 2026-09-21\n---\n\n## Problem / Context\n\nbody\n`,
+		"utf8",
+	);
+}
+
+function writeChangeDir(cwd: string, id: string): void {
+	const dir = join(cwd, READYSET_DIR, "changes", id);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- y\n", "utf8");
+}
+
+await test("a fast-lane brainstorm with a real change dir IS reconciled to proposed", async () => {
+	const cwd = await scratchRepo();
+	writeBrainstorm(cwd, "fast-thing", "fast");
+	writeChangeDir(cwd, "fast-thing");
+
+	const items = await loadBrainstorms(cwd);
+	assert.ok(items.some((b) => b.changeId === "fast-thing"), "brainstorm must be discoverable");
+	await reconcileStatuses(cwd, items);
+
+	const after = items.find((b) => b.changeId === "fast-thing");
+	assert.equal(after?.status, "proposed", "fast lane must not be skipped");
+	const rewritten = readFileSync(join(cwd, BRAINSTORM_DIR, "2026-09-21-fast-thing.md"), "utf8");
+	assert.ok(rewritten.includes("status: proposed"), "frontmatter must be rewritten");
+});
+
+await test("a fast-lane brainstorm with NO change dir is still left untouched", async () => {
+	const cwd = await scratchRepo();
+	writeBrainstorm(cwd, "not-proposed-fast", "fast");
+
+	const items = await loadBrainstorms(cwd);
+	const updated = await reconcileStatuses(cwd, items);
+
+	assert.equal(updated, 0, "a brainstorm with no change under readyset/changes must not be bumped");
+	assert.equal(items.find((b) => b.changeId === "not-proposed-fast")?.status, "open");
+});
+
+await test("a full-lane brainstorm is still reconciled (unchanged behavior)", async () => {
+	const cwd = await scratchRepo();
+	writeBrainstorm(cwd, "full-thing", "full");
+	writeChangeDir(cwd, "full-thing");
+
+	const items = await loadBrainstorms(cwd);
+	await reconcileStatuses(cwd, items);
+	assert.equal(items.find((b) => b.changeId === "full-thing")?.status, "proposed");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
