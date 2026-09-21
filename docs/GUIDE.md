@@ -307,10 +307,23 @@ Picks a brainstorm, then depending on its status:
   paying for that history twice. Pick **keep context** when discussion nuance didn't make it into
   the artifacts, so the model still has it. A failed or unavailable `ctx.compact` degrades to plain
   execution.
+  - Planning phases also compact at their own boundaries now — after grilling before **Explore**
+    (the brainstorm is on disk), and after Explore before **Propose** (`EXPLORATION.md` is). The
+    **keep context** choice applies only to this Apply boundary; the prep boundaries always compact,
+    since neither phase's correctness depends on keeping the prior phase's conversation.
 - The panel also shows the **scope check** — the working tree against `proposal.md`'s
   `## Files This Change Will Touch` contract. Anything changed that the contract doesn't name is
   listed as **OUT OF SCOPE** (paths under `readyset/` and `.ai/brainstorms/` are always in scope). An
   absent contract reads as "no contract", not a silent pass. It **warns, never blocks**.
+  - The contract is also checked for **dangling references**: a path that isn't marked `(new)` and
+    doesn't exist on disk is a file the plan claims it will modify that isn't there, shown as
+    `scope refs: DANGLING …` and listed in the review document's **Scope** section. Mark files the
+    change will *create* with `(new)` (e.g. `- src/lib/thing.ts (new)`) so their absence reads as
+    expected, not dangling.
+- Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
+  what Propose changed. A file touched outside the contract during Execute is named at the
+  **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
+  implementation legitimately touches more files than planning.
 - **Approve & Execute** implements the tasks. Each completed task needs an indented `_Verified:`
   note, or the gate sends it back. It can optionally call `readyset_verify({taskId, command})` to
   back that note with more than a self-report — the command runs for real, and an immutable record
@@ -379,6 +392,8 @@ Under `readyset/changes/<id>/`, in the order they get written:
 ```
 EXPLORATION.md   Explore phase findings — what was actually checked, and what was found
 proposal.md      Why / What Changes, plus the `## Files This Change Will Touch` scope contract
+                 (mark files the change will create with `(new)`, so the gate can tell them
+                 from files that must already exist)
 design.md        Context / Goals-Non-Goals / Decisions / Risks
 specs/**/spec.md ADDED/MODIFIED/REMOVED Requirements as WHEN/THEN scenarios
 tasks.md         checkbox tasks; each `- [x]` carries an indented `_Verified:` note

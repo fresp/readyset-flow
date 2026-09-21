@@ -6,6 +6,44 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.13.0
+
+A quality-and-cost pass driven by the `v0.12` full-matrix benchmark (12 tasks × 3 reps × 2 arms).
+It tightens the one dimension Readyset still didn't win — scope discipline — at the two places it
+was still unchecked, closes the largest objective gap in the report (dangling file references), and
+cuts the biggest number in the cost breakdown (prep-phase tokens). Nothing here changes what the
+gate blocks on; where a check is added it warns, as the scope contract already did.
+
+### Added
+
+- **Dangling file references in the scope contract are now flagged.** Readyset named files it would
+  modify that didn't exist at **0.53/run vs 0.03/run** for `/plan` — the largest relative gap of any
+  objective metric in the v0.12 report. A `## Files This Change Will Touch` path that isn't marked
+  `(new)` and doesn't exist on disk is now reported as `scope refs: DANGLING …` in the gate panel
+  and listed in a new **Scope** section of the review document. Advisory, like the OUT-OF-SCOPE
+  check: it flags, it never blocks.
+- **Files the change will create must be marked `(new)`.** The section already listed existing
+  files and to-be-created files together with nothing distinguishing them, which is why an
+  existence check needs a marker. A trailing `(new)` (e.g. `- src/lib/thing.ts (new)`) now marks a
+  file the change creates; an unmarked path still means "must already exist", and the Propose prompt
+  teaches the convention.
+- **Scope is checked again after Apply.** The gate's scope check runs before Apply, so it only ever
+  saw what Propose changed — and Apply is where most of a change's file touches happen. A
+  post-Apply working-tree check now warns and names any out-of-contract file at the **Archive now?**
+  prompt, and records it in `CONTEXT.md`. Advisory: implementation legitimately touches more files
+  than planning did, so archive is still offered rather than blocked.
+
+### Changed
+
+- **Planning phases compact at every boundary now, not only before Apply.** Prep (Grill → Explore →
+  Propose) was **16×** the plan arm's entire run in tokens — the single biggest number in the cost
+  breakdown — because each phase carried every prior phase's conversation forward at full cache-read
+  cost. Compaction now also fires before Explore (the brainstorm is already on disk) and before
+  Propose (`EXPLORATION.md` is), mirroring the pre-Apply compaction. Cost-only: neither boundary's
+  correctness depends on keeping history, since both phases re-read their artifacts from disk.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.12.1...0.13.0
+
 ## 0.12.1
 
 - **The fast lane can reach the review gate again.** `reconcileStatuses` skipped every
