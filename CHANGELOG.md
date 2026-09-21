@@ -6,6 +6,26 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.12.1
+
+- **The fast lane can reach the review gate again.** `reconcileStatuses` skipped every
+  brainstorm whose lane wasn't `full`, on the stated theory that a fast-lane brainstorm has no
+  change to reconcile against. The fast lane as it actually runs does write a change directory and
+  a proposal — and the skip was not harmless: the post-Propose gate check only opens the gate for a
+  brainstorm whose status is `proposed`, so **every fast-lane change dead-ended at "Propose doesn't
+  look finished" with no gate ever offered**. Measured on `readyset-bench` label `b1-subset-0.12`
+  (4 tasks × 3 reps): `lane=full → gate shown` in 7/7 runs, `lane=fast → gate shown` in 0/5 — a
+  perfect split. This is the actual source of the historical T11/T12 "gate bypass": the gate was
+  never shown, so the only way those runs reached code was the model continuing on its own.
+  The reconciliation now derives from the filesystem alone; the existing `changeState` guard already
+  leaves a fast-lane brainstorm with no change directory untouched, so the lane filter bought
+  nothing.
+- **That failure message now names the real cause.** It claimed "proposal.md not found or empty"
+  for all three failing conditions (no matching brainstorm / status not proposed / empty proposal),
+  which sent a live investigation hunting for a file that was on disk the whole time.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.12.0...0.12.1
+
 ## 0.12.0
 
 A hardening release driven by end-to-end benchmarking (`/readyset` vs omp `/plan` vs Command Code
