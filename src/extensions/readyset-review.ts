@@ -17,6 +17,7 @@ import {
 	changePaths,
 	checkPhaseViolations,
 	checkScope,
+	checkScopeRefs,
 	checkTaskVerification,
 	ensureDirtyBaseline,
 	ensureReadysetRoot,
@@ -26,6 +27,7 @@ import {
 	listSubmodules,
 	readDirtyBaseline,
 	readReview,
+	readScopeContract,
 	scaffoldChange,
 	validateChange,
 } from "../lib/readyset-spec.ts";
@@ -108,7 +110,10 @@ const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (
 - proposal.md — must have a "## Why" section (1-2 paragraphs on the problem), a
   "## What Changes" section (bullet list of concrete changes), and a "## Files This Change
   Will Touch" section: an exhaustive repo-relative path list of every existing file Apply is
-  allowed to modify plus every new file it may create. This is the scope contract the gate
+  allowed to modify plus every new file it may create. Mark each new file with a trailing
+  "(new)" (e.g. "- src/lib/thing.ts (new)") so the gate can tell a file the change creates from
+  one that must already exist — an unmarked path that doesn't exist is a dangling reference and
+  gets flagged. This is the scope contract the gate
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
   arm's, and T12 grew an unasked-for 160-line bench file). A file not on this list may not
   be written during Apply without asking first.
@@ -272,16 +277,24 @@ function applyTurnPrompt(changeId: string): string {
  * rather than blocking the user from proceeding at all.
  */
 async function compactBeforeApply(ctx: ReviewCtx, changeId: string): Promise<void> {
+	await compactForPhase(ctx, changeId, "executing", compactBeforeExecuteGuidance(changeId));
+}
+
+/**
+ * Shared compaction for every phase boundary (Explore, Propose, Apply). Runs `ctx.compact()`
+ * with Readyset-specific internal guidance, degrading to a plain continue when `ctx.compact`
+ * is missing (older omp build) or throws — a cost optimization must never block the run. Every
+ * boundary passes `suppressContinuation: true` because the caller fires the next phase turn
+ * itself immediately after (see each guidance builder for why compacting there is safe).
+ */
+async function compactForPhase(ctx: ReviewCtx, changeId: string, phaseLabel: string, guidance: string): Promise<void> {
 	if (typeof ctx.compact !== "function") {
-		ctx.ui.notify("Compact isn't available in this context — approving without it.", "warning");
+		ctx.ui.notify(`Compact isn't available in this context — continuing ${phaseLabel} without it.`, "warning");
 		return;
 	}
-	ctx.ui.notify(`Compacting context before executing "${changeId}"...`, "info");
+	ctx.ui.notify(`Compacting context before ${phaseLabel} for "${changeId}"...`, "info");
 	try {
-		await ctx.compact({
-			internalGuidance: compactBeforeExecuteGuidance(changeId),
-			suppressContinuation: true,
-		});
+		await ctx.compact({ internalGuidance: guidance, suppressContinuation: true });
 	} catch (err) {
 		ctx.ui.notify(
 			`Compact failed (${err instanceof Error ? err.message : String(err)}) — continuing without it.`,
@@ -298,6 +311,39 @@ function compactBeforeExecuteGuidance(changeId: string): string {
 		"disk and will be re-read from there when execution starts — the Explore/Propose discussion that " +
 		"produced them does not need to be retained. Keep the change id and these file paths; the rest of " +
 		"that discussion can be summarized away."
+	);
+}
+
+/**
+ * Compaction before the Explore turn (the Grill→Explore boundary). Grilling's questions and the
+ * user's answers produce the brainstorm file, which is already on disk at `brainstormFile` and is
+ * re-read by Explore — the discussion that produced it is not load-bearing for grounding, so it can
+ * be summarized away rather than carried forward at full cache-read cost.
+ */
+function compactBeforeExploreGuidance(changeId: string, brainstormFile: string): string {
+	return (
+		`Readyset change "${changeId}" is about to start Explore. The brainstorm it works from is ` +
+		`persisted at ${brainstormFile} and will be re-read from there — the grilling discussion (including ` +
+		"the user's answers) that produced it does not need to be retained. Keep the change id and the " +
+		"brainstorm path; the rest of that discussion can be summarized away."
+	);
+}
+
+/**
+ * Compaction before the Propose turn (the Explore→Propose boundary). On the full lane Explore has
+ * written `EXPLORATION.md`, which Propose re-reads; on the fast lane Explore is folded into Propose
+ * and no such file exists, so only the brainstorm is relied on outside context.
+ */
+function compactBeforeProposeGuidance(changeId: string, brainstormFile: string, explored: boolean): string {
+	const paths = changePaths("", changeId);
+	return (
+		`Readyset change "${changeId}" is about to start Propose. The brainstorm it works from is persisted ` +
+		`at ${brainstormFile}` +
+		(explored
+			? `, and its grounding findings are persisted at ${paths.exploration} (EXPLORATION.md) — both are ` +
+				"re-read from disk when Propose runs, so the Explore turn's discussion does not need to be retained."
+			: " — Propose re-reads it from disk, so the prior discussion does not need to be retained.") +
+		" Keep the change id and these file paths; the rest of that discussion can be summarized away."
 	);
 }
 
@@ -930,6 +976,9 @@ interface ReviewSnapshot {
 	validated: Awaited<ReturnType<typeof validateChange>>;
 	verification: Awaited<ReturnType<typeof checkTaskVerification>>;
 	scope: Awaited<ReturnType<typeof checkScope>>;
+	/** Dangling file references: contract paths (not marked `(new)`) that don't exist on disk.
+	 *  Advisory, like `scope` — surfaced in the gate, never blocks. */
+	scopeRefs: Awaited<ReturnType<typeof checkScopeRefs>>;
 	explored: boolean;
 	reviewed: boolean;
 	/** Runtime evidence (readyset_verify) — independent of, and never reconciled with,
@@ -949,6 +998,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	// Scope is checked against the working tree, not the plan: anything the repo already
 	// shows as changed that the contract doesn't name is flagged here, in the gate.
 	const scope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
+	const scopeRefs = await checkScopeRefs(ctx.cwd, chosen.changeId);
 	const explored = await hasExploration(ctx.cwd, chosen.changeId);
 	const review = await readReview(ctx.cwd, chosen.changeId);
 	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
@@ -958,6 +1008,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		validated,
 		verification,
 		scope,
+		scopeRefs,
 		explored,
 		reviewed: !!review,
 		evidenceTotal,
@@ -1005,6 +1056,33 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 			heading: "Proposal",
 			status: "proposal.md",
 			render: () => readOrPlaceholder(paths.proposal, "_(proposal.md not found.)_"),
+		},
+		{
+			id: "scope",
+			heading: "Scope",
+			status: snapshot.scope.noContract
+				? "no contract"
+				: snapshot.scope.outside.length + snapshot.scopeRefs.missing.length > 0
+					? `${snapshot.scope.outside.length} out-of-scope, ${snapshot.scopeRefs.missing.length} dangling`
+					: "clean",
+			render: async () => {
+				const contract = await readScopeContract(ctx.cwd, chosen.changeId);
+				if (contract.files === undefined) {
+					return "_(no 'Files This Change Will Touch' contract in proposal.md — scope unknown.)_";
+				}
+				return [
+					"Contract:",
+					"",
+					contract.raw || "(empty)",
+					"",
+					snapshot.scope.outside.length > 0
+						? `Working-tree drift (changed but not in the contract): ${snapshot.scope.outside.join(", ")}`
+						: "Working-tree drift (changed but not in the contract): none",
+					snapshot.scopeRefs.missing.length > 0
+						? `Dangling refs (named but don't exist, not marked (new)): ${snapshot.scopeRefs.missing.join(", ")}`
+						: "Dangling refs (named but don't exist, not marked (new)): none",
+				].join("\n");
+			},
 		},
 		{
 			id: "design",
@@ -1228,6 +1306,10 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 			: snapshot.scope.outside.length > 0
 				? `scope: OUT OF SCOPE already changed in the tree: ${snapshot.scope.outside.join(", ")}`
 				: "scope: working tree matches the contract",
+		// Only surface when there is a problem — a clean contract needs no line.
+		...(snapshot.scopeRefs.missing.length > 0
+			? [`scope refs: DANGLING — contract names file(s) that don't exist: ${snapshot.scopeRefs.missing.join(", ")}`]
+			: []),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -1433,6 +1515,27 @@ async function reviewAndMaybeExecute(
 			break;
 		}
 
+		// Scope, checked again against the working tree after Apply — the gate's `checkScope`
+		// runs before Apply, so it only sees what Propose changed, and Apply is where most of a
+		// change's file touches actually happen. Advisory, not fail-closed: implementation
+		// legitimately touches more files than planning discussion did, so this flags the drift
+		// at the archive prompt rather than refusing to offer archive.
+		const postApplyScope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
+		const postApplyDrift = !postApplyScope.noContract && postApplyScope.outside.length > 0;
+		if (postApplyDrift) {
+			await appendContext(
+				ctx.cwd,
+				chosen.changeId,
+				"Apply",
+				`Post-Apply scope drift — touched outside the contract: ${postApplyScope.outside.join(", ")}.`,
+			);
+			ctx.ui.notify(
+				`"${chosen.changeId}" touched file(s) outside its scope contract during Apply: ${postApplyScope.outside.join(", ")}. ` +
+					"Archiving is still offered — this is a warning, not a block.",
+				"warning",
+			);
+		}
+
 		const finalStatus = await getProgress(ctx.cwd, chosen.changeId);
 		ctx.ui.notify(
 			`Implementation complete: ${finalStatus?.done ?? "?"}/${finalStatus?.total ?? "?"} tasks. Running code review...`,
@@ -1454,8 +1557,11 @@ async function reviewAndMaybeExecute(
 			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
 		}
 
+		const driftLine = postApplyDrift
+			? `Apply touched ${postApplyScope.outside.length} file(s) outside the contract (${postApplyScope.outside.join(", ")}). `
+			: "";
 		const archiveChoice = await ctx.ui.select(
-			`Code review done for "${chosen.changeId}"${reviewContent ? " — see readyset/changes/" + chosen.changeId + "/REVIEW.md" : ""}. Archive now?`,
+			`${driftLine}Code review done for "${chosen.changeId}"${reviewContent ? " — see readyset/changes/" + chosen.changeId + "/REVIEW.md" : ""}. Archive now?`,
 			[
 				{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
 				{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
@@ -2142,6 +2248,7 @@ export default function (pi: ExtensionAPI) {
 				} else {
 					const submodules = await listSubmodules(ctx.cwd);
 					ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
+					await compactForPhase(reviewCtx, chosen.changeId, "Explore", compactBeforeExploreGuidance(chosen.changeId, chosen.file));
 					const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
 						spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
 					);
@@ -2174,6 +2281,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				ctx.ui.notify(`Proposing change "${chosen.changeId}"${isFastLane ? " (fast lane — grounding folded in)" : ""} — this can take a while...`, "info");
+				await compactForPhase(reviewCtx, chosen.changeId, "Propose", compactBeforeProposeGuidance(chosen.changeId, chosen.file, !isFastLane));
 				const proposeBudget = startPhaseBudget();
 				const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
 					spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane)),

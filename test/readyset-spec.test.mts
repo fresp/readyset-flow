@@ -19,6 +19,7 @@ import {
   readDirtyBaseline,
   readScopeContract,
   checkScope,
+  checkScopeRefs,
   readReview,
   taskCheckedStates,
 } from "../src/lib/readyset-spec.ts";
@@ -493,6 +494,54 @@ await test("checkScope: no contract -> noContract true, never a silent pass", as
   const result = await checkScope(cwd, "nocontract", ["src/a.ts"]);
   assert.equal(result.noContract, true);
   assert.deepEqual(result.outside, []);
+});
+
+await test("readScopeContract: a trailing (new) is split into newFiles, not files", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "newsplit");
+  await writeFile(
+    paths.proposal,
+    ["# P", "", "## Files This Change Will Touch", "", "- src/a.ts", "- src/b.ts (new)", "- `src/c.ts` (new) -- with commentary", "", "## What Changes", "", "- y"].join("\n"),
+    "utf8",
+  );
+  const contract = await readScopeContract(cwd, "newsplit");
+  assert.deepEqual(contract.files, ["src/a.ts"]);
+  assert.deepEqual(contract.newFiles, ["src/b.ts", "src/c.ts"]);
+});
+
+await test("checkScope: a (new) path is in scope (creating it is allowed)", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "newscope");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- src/a.ts\n- src/brand-new.ts (new)\n", "utf8");
+  const result = await checkScope(cwd, "newscope", ["src/a.ts", "src/brand-new.ts", "src/rogue.ts"]);
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.outside, ["src/rogue.ts"]);
+});
+
+await test("checkScopeRefs: flags an unmarked path that doesn't exist, ignores (new) and existing paths", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "refs");
+  // src/exists.ts is created so it resolves; src/dangling.ts is named but never created and is
+  // not marked (new) -- a dangling reference. src/created.ts (new) doesn't exist yet, but that's
+  // expected, so it must NOT be flagged.
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "exists.ts"), "x", "utf8");
+  await writeFile(
+    paths.proposal,
+    "# P\n\n## Files This Change Will Touch\n\n- src/exists.ts\n- src/dangling.ts\n- src/created.ts (new)\n",
+    "utf8",
+  );
+  const result = await checkScopeRefs(cwd, "refs");
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.missing, ["src/dangling.ts"]);
+});
+
+await test("checkScopeRefs: no contract -> noContract true, empty missing", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "refsnocontract");
+  const result = await checkScopeRefs(cwd, "refsnocontract");
+  assert.equal(result.noContract, true);
+  assert.deepEqual(result.missing, []);
 });
 
 await test("validateChange: inspection-only THEN is flagged as unobservable", async () => {

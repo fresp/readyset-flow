@@ -1,6 +1,7 @@
 import { mkdir, writeFile, readFile, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 
 // This whole file exercises readyset-review.ts's handler, which reads omp config
@@ -1080,11 +1081,11 @@ await test("review gate pushes a full compiled document (all sections) to the ed
   assert.equal(fakeUiWrap.editorTextHistory.length, 1);
   const doc = fakeUiWrap.editorTextHistory[0];
   // table of contents lists every section with a status
-  for (const tocEntry of ["1. Exploration", "2. Proposal", "3. Design", "4. Specs (1)", "5. Tasks (1/1)", "6. Verification summary", "7. Runtime evidence", "8. Code review", "9. Context log"]) {
+  for (const tocEntry of ["1. Exploration", "2. Proposal", "3. Scope", "4. Design", "5. Specs (1)", "6. Tasks (1/1)", "7. Verification summary", "8. Runtime evidence", "9. Code review", "10. Context log"]) {
     assert.ok(doc.includes(tocEntry), `expected table of contents to include "${tocEntry}"`);
   }
   // each section heading appears again as its own header, and the spec file path is shown
-  for (const heading of ["EXPLORATION", "PROPOSAL", "DESIGN", "SPECS (1)", "specs/widgets/spec.md", "TASKS (1/1)", "VERIFICATION SUMMARY", "RUNTIME EVIDENCE", "CODE REVIEW", "CONTEXT LOG"]) {
+  for (const heading of ["EXPLORATION", "PROPOSAL", "SCOPE", "DESIGN", "SPECS (1)", "specs/widgets/spec.md", "TASKS (1/1)", "VERIFICATION SUMMARY", "RUNTIME EVIDENCE", "CODE REVIEW", "CONTEXT LOG"]) {
     assert.ok(doc.includes(heading), `expected document to include "${heading}"`);
   }
   assert.match(doc, /REDIRECT_URI stale/);
@@ -1722,6 +1723,154 @@ await test("Approve & Execute degrades to plain execution when ctx.compact isn't
   );
   assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "no-compact-test"/);
+});
+
+await test("prep compaction: full lane compacts before Explore and before Propose with Readyset guidance", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(
+    cwd,
+    "2026-02-01-prep.md",
+    { title: "Prep Compact", status: "open", created: "2026-02-01", change_id: "prep-compact" },
+    VALID_BRAINSTORM_BODY,
+  );
+  const dir = join(cwd, "readyset", "changes", "prep-compact");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-02-01 · Prep Compact"); // pick
+
+  // Explore turn: write EXPLORATION.md so Propose's guidance can name it.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\nchecked things\n", "utf8");
+  });
+  // Propose turn: nothing needed -- we only assert the compactions fired.
+  fakePiWrap.queueEffect(async () => {});
+
+  const compactCalls: Array<{ internalGuidance?: string; suppressContinuation?: boolean }> = [];
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    async compact(opts: { internalGuidance?: string; suppressContinuation?: boolean }) {
+      compactCalls.push(opts);
+    },
+  };
+  await handler("", ctx);
+
+  assert.equal(compactCalls.length, 2, "one compaction before Explore, one before Propose");
+  assert.match(compactCalls[0].internalGuidance ?? "", /prep-compact/);
+  assert.match(compactCalls[0].internalGuidance ?? "", /\.ai\/brainstorms/);
+  assert.match(compactCalls[1].internalGuidance ?? "", /EXPLORATION\.md/);
+  assert.equal(compactCalls[0].suppressContinuation, true);
+  assert.equal(compactCalls[1].suppressContinuation, true);
+});
+
+await test("prep compaction: fast lane skips the Explore boundary and compacts only before Propose", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(
+    cwd,
+    "2026-02-02-fastprep.md",
+    { title: "Fast Prep", status: "open", created: "2026-02-02", change_id: "fast-prep" },
+    VALID_BRAINSTORM_BODY,
+  );
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-02-02 · Fast Prep"); // pick
+  fakePiWrap.queueEffect(async () => {}); // the single (Propose) turn
+
+  const compactCalls: Array<{ internalGuidance?: string }> = [];
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    async compact(opts: { internalGuidance?: string }) {
+      compactCalls.push(opts);
+    },
+  };
+  await handler("--fast --lane fast", ctx);
+
+  assert.equal(compactCalls.length, 1, "fast lane has no separate Explore turn, so only the Propose compaction fires");
+  assert.match(compactCalls[0].internalGuidance ?? "", /\.ai\/brainstorms/);
+  assert.doesNotMatch(compactCalls[0].internalGuidance ?? "", /EXPLORATION\.md/);
+});
+
+await test("post-Apply scope drift: warns and surfaces the out-of-contract file at the archive prompt", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-02-03-drift.md", {
+    title: "Drift Test",
+    status: "proposed",
+    created: "2026-02-03",
+    change_id: "drift-test",
+  });
+  const dir = join(cwd, "readyset", "changes", "drift-test");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\ndrift\n\n## Files This Change Will Touch\n\n- src/keep.ts\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-02-03 · Drift Test"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+
+  // Apply turn: finish the task AND touch a file outside the contract.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /outside its scope contract during Apply/.test(n.message) && /src\/rogue\.ts/.test(n.message)),
+    "should warn that Apply drifted outside the scope contract",
+  );
+  assert.ok(
+    fakeUiWrap.selectPrompts.some((p) => /outside the contract/.test(p) && /src\/rogue\.ts/.test(p)),
+    "the archive prompt should surface the drift",
+  );
+});
+
+await test("dangling refs: a contract path that doesn't exist and isn't (new) is surfaced in the gate", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-02-04-dangling.md", {
+    title: "Dangling Test",
+    status: "proposed",
+    created: "2026-02-04",
+    change_id: "dangling-test",
+  });
+  const dir = join(cwd, "readyset", "changes", "dangling-test");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## Files This Change Will Touch\n\n- src/ghost.ts\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-02-04 · Dangling Test"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // leave the gate
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakeUiWrap.widgetHistory.some((entry) => entry.some((l) => /DANGLING/.test(l) && /src\/ghost\.ts/.test(l))),
+    "the gate widget should flag the dangling contract path",
+  );
+  assert.ok(
+    fakeUiWrap.editorTextHistory.some((doc) => /Dangling refs .*src\/ghost\.ts/.test(doc)),
+    "the compiled review document should list the dangling ref",
+  );
 });
 
 await test("setModel returning false (no API key) counts as a failed pin and moves on to the fallback", async () => {

@@ -301,8 +301,12 @@ export interface ValidateResult {
 }
 
 export interface ScopeContract {
-	/** Repo-relative paths from the "## Files This Change Will Touch" section, or undefined when the section is absent. */
+	/** Repo-relative paths from the "## Files This Change Will Touch" section that are NOT marked
+	 *  `(new)` — i.e. files that must already exist. Undefined when the section is absent. */
 	files: string[] | undefined;
+	/** Repo-relative paths marked `(new)` — files this change will create. Always present (empty
+	 *  when none are marked, or when there is no contract). */
+	newFiles: string[];
 	/** Raw section body, for display in the gate. */
 	raw: string | undefined;
 }
@@ -310,34 +314,42 @@ export interface ScopeContract {
 /**
  * Reads the scope contract from proposal.md's "## Files This Change Will Touch" section. A
  * bullet or plain line naming a repo-relative path counts; prose lines that name no path do
- * not. Returns `files: undefined` when the section is absent entirely (older changes, or a
- * Propose turn that predates the contract) — callers treat that as "no contract", never as
- * "everything allowed".
+ * not. A trailing `(new)` marks a file this change will create and is split out into
+ * `newFiles` — so an unmarked path means "must already exist", the distinction `checkScopeRefs`
+ * relies on to tell a dangling reference from a file that is simply new. Returns
+ * `files: undefined` when the section is absent entirely (older changes, or a Propose turn that
+ * predates the contract) — callers treat that as "no contract", never as "everything allowed".
  */
 export async function readScopeContract(cwd: string, changeId: string): Promise<ScopeContract> {
 	const paths = changePaths(cwd, changeId);
 	const raw = await readFile(paths.proposal, "utf8").catch(() => undefined);
-	if (raw === undefined) return { files: undefined, raw: undefined };
+	if (raw === undefined) return { files: undefined, newFiles: [], raw: undefined };
 	const match = raw.match(/^##[ \t]*Files This Change Will Touch[ \t]*\r?$/im);
-	if (!match || match.index === undefined) return { files: undefined, raw: undefined };
+	if (!match || match.index === undefined) return { files: undefined, newFiles: [], raw: undefined };
 	const rest = raw.slice(match.index + match[0].length);
 	const nextHeading = rest.match(/^##[ \t]/m);
 	const body = (nextHeading && nextHeading.index !== undefined ? rest.slice(0, nextHeading.index) : rest).trim();
-	if (!body) return { files: [], raw: body };
+	if (!body) return { files: [], newFiles: [], raw: body };
 	const files: string[] = [];
+	const newFiles: string[] = [];
 	for (const line of body.split(/\r?\n/)) {
 		// Bullet ("- src/x.ts") or bare path ("src/x.ts"); strip inline commentary after " -- ".
-		const stripped = line
-			.replace(/^\s*[-*+]\s+/, "")
-			.replace(/\s+--\s+.*$/, "")
-			.trim()
-			.replace(/^[`'"]+|[`'".,;:]+$/g, "");
+		let stripped = line.replace(/^\s*[-*+]\s+/, "").replace(/\s+--\s+.*$/, "").trim();
+		// A trailing "(new)" marks a file this change will create. Split it off BEFORE the
+		// whitespace rejection below, since the marker itself contains a space and would
+		// otherwise drop the whole line.
+		let isNew = false;
+		if (/\(\s*new\s*\)\s*$/i.test(stripped)) {
+			isNew = true;
+			stripped = stripped.replace(/\(\s*new\s*\)\s*$/i, "").trim();
+		}
+		stripped = stripped.replace(/^[`'"]+|[`'".,;:]+$/g, "");
 		if (!stripped || /\s/.test(stripped)) continue;
 		if (/^(src|test|tests|bin|examples|lib|docs|scripts|assets|resources|config)\//.test(stripped) || /^[\w.-]+\.(mjs|js|ts|mts|json|md|ya?ml|mjs)$/.test(stripped)) {
-			files.push(stripped.replace(/^\.\//, ""));
+			(isNew ? newFiles : files).push(stripped.replace(/^\.\//, ""));
 		}
 	}
-	return { files, raw: body };
+	return { files, newFiles, raw: body };
 }
 
 export interface ScopeCheck {
@@ -356,7 +368,9 @@ export interface ScopeCheck {
 export async function checkScope(cwd: string, changeId: string, changedPaths: string[]): Promise<ScopeCheck> {
 	const contract = await readScopeContract(cwd, changeId);
 	if (contract.files === undefined) return { outside: [], noContract: true };
-	const allowed = new Set(contract.files.map((f) => join(cwd, f)));
+	// New files are in scope too — Apply is allowed to create anything the contract names as
+	// `(new)`, not just modify files that already exist.
+	const allowed = new Set([...contract.files, ...contract.newFiles].map((f) => join(cwd, f)));
 	const outside: string[] = [];
 	for (const rawPath of changedPaths) {
 		const abs = join(cwd, rawPath);
@@ -365,6 +379,30 @@ export async function checkScope(cwd: string, changeId: string, changedPaths: st
 		if (!allowed.has(abs)) outside.push(rawPath);
 	}
 	return { outside, noContract: false };
+}
+
+export interface ScopeRefs {
+	/** Contract paths (not marked `(new)`) that don't exist on the filesystem. Empty when all resolve. */
+	missing: string[];
+	/** True when there is no contract at all (section absent) — not a pass, an unknown. */
+	noContract: boolean;
+}
+
+/**
+ * Stats every path in the scope contract that isn't marked `(new)` and reports the ones that
+ * don't exist. A `(new)` path is a file the change will create, so its absence now is expected,
+ * not a dangling reference; an unmarked path claims the file already exists, so if it doesn't the
+ * plan named a file to modify that isn't there. Advisory, mirroring `checkScope` — it flags, it
+ * never blocks. The section-absent case is reported as noContract, never as a pass.
+ */
+export async function checkScopeRefs(cwd: string, changeId: string): Promise<ScopeRefs> {
+	const contract = await readScopeContract(cwd, changeId);
+	if (contract.files === undefined) return { missing: [], noContract: true };
+	const missing: string[] = [];
+	for (const f of contract.files) {
+		if (!(await exists(join(cwd, f)))) missing.push(f);
+	}
+	return { missing, noContract: false };
 }
 
 /** Every markdown file directly under specs/**\/spec.md (any capability, any depth). */
