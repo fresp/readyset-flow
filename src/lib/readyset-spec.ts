@@ -311,14 +311,90 @@ export interface ScopeContract {
 	raw: string | undefined;
 }
 
+/** Result of parsing one line of a `## Files This Change Will Touch` body. */
+export interface ContractLine {
+	/** Repo-relative path, without any leading `./`, backticks, quotes, or bullet. */
+	path: string;
+	/** True when the commentary after the path contains a `(new)` marker. */
+	isNew: boolean;
+}
+
 /**
- * Reads the scope contract from proposal.md's "## Files This Change Will Touch" section. A
- * bullet or plain line naming a repo-relative path counts; prose lines that name no path do
- * not. A trailing `(new)` marks a file this change will create and is split out into
- * `newFiles` — so an unmarked path means "must already exist", the distinction `checkScopeRefs`
- * relies on to tell a dangling reference from a file that is simply new. Returns
- * `files: undefined` when the section is absent entirely (older changes, or a Propose turn that
- * predates the contract) — callers treat that as "no contract", never as "everything allowed".
+ * Parses one line of a `## Files This Change Will Touch` body into a path, or returns undefined
+ * when the line names no path (prose, a bold header, `None`, a URL).
+ */
+export function parseContractLine(line: string): ContractLine | undefined {
+	let token = line.trim();
+	// Strip a bullet or a list number: "- x", "* x", "+ x", "1. x", "1) x".
+	token = token.replace(/^([-*+]|\d+[.)])\s+/, "");
+	// Strip surrounding bold markers before reading the first token, so "**src/a.ts**" yields the
+	// bare path rather than "**src/a.ts**".
+	token = token.replace(/^\*+(?=\S)/, "").replace(/\*+$/, "").trim();
+	// The path is the first whitespace-delimited token; everything after it is commentary,
+	// whatever separator follows (" -- ", "—", "–", ": ", "(modified)", "(new)", ...).
+	const match = token.match(/^(\S+)([\s\S]*)$/);
+	if (!match) return undefined;
+	const first = match[1];
+	const commentary = match[2];
+	if (!looksLikePath(first)) return undefined;
+	const path = first
+		.replace(/^[`'"]+/, "") // opening backtick/quote
+		.replace(/[`'"]+$/, "") // closing backtick/quote
+		.replace(/[.,;:]+$/, "") // trailing sentence punctuation
+		.replace(/^\.\//, ""); // a leading "./" is noise, not part of the repo-relative path
+	if (!path || path === "." || path === "..") return undefined;
+	return { path, isNew: /\(\s*new\s*\)/i.test(commentary) };
+}
+
+// The previous implementation gated paths on a hard-coded directory whitelist
+// (src|test|tests|bin|examples|lib|docs|scripts|assets|resources|config) plus a root-level
+// JS/MD/YAML extension whitelist. Both were wrong for a language-agnostic tool: "app/handler.go",
+// "packages/core/index.ts", ".github/workflows/ci.yml" and "Makefile" were silently dropped from
+// the contract, which made checkScope report them OUT OF SCOPE once Apply touched them and made
+// checkScopeRefs skip them entirely. The replacement decides from the token's own shape instead.
+
+/** Known files that legitimately have no extension. */
+const EXTENSIONLESS_FILES: Record<string, true> = {
+	Makefile: true, GNUmakefile: true, Dockerfile: true, Containerfile: true, Jenkinsfile: true, Procfile: true,
+	Gemfile: true, Rakefile: true, Brewfile: true, Vagrantfile: true, Justfile: true, justfile: true, Taskfile: true,
+	LICENSE: true, CODEOWNERS: true,
+};
+
+/**
+ * Language-agnostic "is this token a file path?" test.
+ */
+function looksLikePath(token: string): boolean {
+	if (token === "" || token === "." || token === "..") return false;
+	if (/\s/.test(token)) return false;
+	if (token.includes("://")) return false;
+	if (token.startsWith("#")) return false; // an ATX heading is never a path
+	if (EXTENSIONLESS_FILES[token]) return true;
+	const base = token.slice(token.lastIndexOf("/") + 1);
+	if (base.startsWith(".") && base.length > 1) return true; // dotfile: .gitignore, .env.example
+	const dot = base.lastIndexOf(".");
+	if (dot <= 0) return false;
+	const stem = base.slice(0, dot);
+	const ext = base.slice(dot + 1);
+	// "name.ext" with a 2+ char stem: rejects "e.g"/"i.e", accepts "go.mod".
+	if (stem.length >= 2 && ext.length >= 1) return true;
+	// A directory separator between path characters: "app/handler.go", ".github/workflows/ci.yml".
+	return token.includes("/");
+}
+
+/**
+ * Reads the scope contract from proposal.md's `## Files This Change Will Touch` section; the body
+ * runs until the next `##` heading. A line is a contract line when its first token — after an
+ * optional `-`/`*`/`+` bullet or `1.`/`1)` list number, and after any surrounding `**` — looks
+ * like a path (see `looksLikePath`). Everything after that first token is commentary, whatever the
+ * separator (` -- `, an em/en dash, `: `, `(modified)`, ...).
+ *
+ * A `(new)` marker anywhere in that commentary (case-insensitive) marks a file this change creates
+ * and is split into `newFiles`; an unmarked path means "must already exist" — the distinction
+ * `checkScopeRefs` relies on to tell a dangling reference from a file that is simply new. Lines
+ * whose first token is not a path (prose, `**Existing files:**`, `None`, a URL) are skipped. A
+ * leading `./` is stripped; trailing `.,;:` and surrounding backticks/quotes are stripped too.
+ * Returns `files: undefined` when the section is absent entirely (older changes, or a Propose turn
+ * that predates the contract) — callers treat that as "no contract", never as "everything allowed".
  */
 export async function readScopeContract(cwd: string, changeId: string): Promise<ScopeContract> {
 	const paths = changePaths(cwd, changeId);
@@ -333,21 +409,9 @@ export async function readScopeContract(cwd: string, changeId: string): Promise<
 	const files: string[] = [];
 	const newFiles: string[] = [];
 	for (const line of body.split(/\r?\n/)) {
-		// Bullet ("- src/x.ts") or bare path ("src/x.ts"); strip inline commentary after " -- ".
-		let stripped = line.replace(/^\s*[-*+]\s+/, "").replace(/\s+--\s+.*$/, "").trim();
-		// A trailing "(new)" marks a file this change will create. Split it off BEFORE the
-		// whitespace rejection below, since the marker itself contains a space and would
-		// otherwise drop the whole line.
-		let isNew = false;
-		if (/\(\s*new\s*\)\s*$/i.test(stripped)) {
-			isNew = true;
-			stripped = stripped.replace(/\(\s*new\s*\)\s*$/i, "").trim();
-		}
-		stripped = stripped.replace(/^[`'"]+|[`'".,;:]+$/g, "");
-		if (!stripped || /\s/.test(stripped)) continue;
-		if (/^(src|test|tests|bin|examples|lib|docs|scripts|assets|resources|config)\//.test(stripped) || /^[\w.-]+\.(mjs|js|ts|mts|json|md|ya?ml|mjs)$/.test(stripped)) {
-			(isNew ? newFiles : files).push(stripped.replace(/^\.\//, ""));
-		}
+		const parsed = parseContractLine(line);
+		if (parsed === undefined) continue;
+		(parsed.isNew ? newFiles : files).push(parsed.path);
 	}
 	return { files, newFiles, raw: body };
 }

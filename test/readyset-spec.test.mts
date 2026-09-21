@@ -18,6 +18,7 @@ import {
   ensureDirtyBaseline,
   readDirtyBaseline,
   readScopeContract,
+  parseContractLine,
   checkScope,
   checkScopeRefs,
   readReview,
@@ -453,6 +454,72 @@ await test("checkPhaseViolations: a file with the change id as a prefix is still
   assert.equal(violations.length, 1);
 });
 
+await test("parseContractLine: the reproduction section parses completely", async () => {
+  assert.deepEqual(parseContractLine("- app/handler.go"), { path: "app/handler.go", isNew: false });
+  assert.deepEqual(parseContractLine("- packages/core/index.ts"), { path: "packages/core/index.ts", isNew: false });
+  assert.deepEqual(parseContractLine("- .github/workflows/ci.yml"), { path: ".github/workflows/ci.yml", isNew: false });
+  assert.deepEqual(parseContractLine("- src/a.ts (new)"), { path: "src/a.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- `src/b.ts` (new)"), { path: "src/b.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- src/c.ts (new) -- helper"), { path: "src/c.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- src/d.ts — modified"), { path: "src/d.ts", isNew: false });
+  assert.deepEqual(parseContractLine("- Makefile"), { path: "Makefile", isNew: false });
+  assert.deepEqual(parseContractLine("- src/e.tsx"), { path: "src/e.tsx", isNew: false });
+});
+
+await test("readScopeContract: the reproduction section keeps every path and splits (new)", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "repro");
+  await writeFile(
+    paths.proposal,
+    [
+      "# P",
+      "",
+      "## Files This Change Will Touch",
+      "",
+      "- app/handler.go",
+      "- packages/core/index.ts",
+      "- .github/workflows/ci.yml",
+      "- src/a.ts (new)",
+      "- `src/b.ts` (new)",
+      "- src/c.ts (new) -- helper",
+      "- src/d.ts — modified",
+      "- Makefile",
+      "- src/e.tsx",
+      "",
+      "## What Changes",
+      "",
+      "- y",
+    ].join("\n"),
+    "utf8",
+  );
+  const contract = await readScopeContract(cwd, "repro");
+  assert.deepEqual(contract.files, ["app/handler.go", "packages/core/index.ts", ".github/workflows/ci.yml", "src/d.ts", "Makefile", "src/e.tsx"]);
+  assert.deepEqual(contract.newFiles, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+});
+
+await test("parseContractLine: numbered list items and (new) after other commentary", async () => {
+  assert.deepEqual(parseContractLine("1. src/x.ts"), { path: "src/x.ts", isNew: false });
+  assert.deepEqual(parseContractLine("1) src/y.ts"), { path: "src/y.ts", isNew: false });
+  assert.deepEqual(parseContractLine("- src/c.ts -- helper (new)"), { path: "src/c.ts", isNew: true });
+  assert.deepEqual(parseContractLine("- src/z.ts: (new)"), { path: "src/z.ts", isNew: true });
+});
+
+await test("parseContractLine: tokens that are not paths are skipped", async () => {
+  for (const line of ["- prose without a path", "**Existing files:**", "None", "- https://example.com/x", "- e.g.", "- i.e", "- .", "- ..", ""]) {
+    assert.equal(parseContractLine(line), undefined);
+  }
+});
+
+await test("parseContractLine: extensionless files, dotfiles and stray punctuation", async () => {
+  assert.equal(parseContractLine("- Dockerfile")?.path, "Dockerfile");
+  assert.equal(parseContractLine("- .gitignore")?.path, ".gitignore");
+  assert.equal(parseContractLine("- ./src/a.ts")?.path, "src/a.ts");
+  assert.equal(parseContractLine("- src/a.ts.")?.path, "src/a.ts");
+  assert.equal(parseContractLine("- **src/a.ts**")?.path, "src/a.ts");
+  assert.equal(parseContractLine("- go.mod")?.path, "go.mod");
+  assert.equal(parseContractLine("- build.gradle.kts")?.path, "build.gradle.kts");
+});
+
 await test("readScopeContract: parses the Files section, bullets and bare paths", async () => {
   const cwd = await freshCwd();
   const paths = await scaffoldChange(cwd, "scoped");
@@ -516,6 +583,24 @@ await test("checkScope: a (new) path is in scope (creating it is allowed)", asyn
   const result = await checkScope(cwd, "newscope", ["src/a.ts", "src/brand-new.ts", "src/rogue.ts"]);
   assert.equal(result.noContract, false);
   assert.deepEqual(result.outside, ["src/rogue.ts"]);
+});
+
+await test("checkScope: a path under app/ named in the contract is not reported outside", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "appscope");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- app/handler.go\n- src/rogue.ts\n", "utf8");
+  const result = await checkScope(cwd, "appscope", ["app/handler.go", "app/rogue.go"]);
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.outside, ["app/rogue.go"]);
+});
+
+await test("checkScopeRefs: an unmarked path under packages/ IS reported dangling", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "pkgrefs");
+  await writeFile(paths.proposal, "# P\n\n## Files This Change Will Touch\n\n- packages/x/y.ts\n- packages/x/z.ts (new)\n", "utf8");
+  const result = await checkScopeRefs(cwd, "pkgrefs");
+  assert.equal(result.noContract, false);
+  assert.deepEqual(result.missing, ["packages/x/y.ts"]);
 });
 
 await test("checkScopeRefs: flags an unmarked path that doesn't exist, ignores (new) and existing paths", async () => {

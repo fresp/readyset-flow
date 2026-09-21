@@ -38,9 +38,22 @@ gate blocks on; where a check is added it warns, as the scope contract already d
 - **Planning phases compact at every boundary now, not only before Apply.** Prep (Grill → Explore →
   Propose) was **16×** the plan arm's entire run in tokens — the single biggest number in the cost
   breakdown — because each phase carried every prior phase's conversation forward at full cache-read
-  cost. Compaction now also fires before Explore (the brainstorm is already on disk) and before
+  Compaction now also fires before Explore (the brainstorm is already on disk) and before
   Propose (`EXPLORATION.md` is), mirroring the pre-Apply compaction. Cost-only: neither boundary's
   correctness depends on keeping history, since both phases re-read their artifacts from disk.
+
+### Fixed
+
+- **The scope contract no longer drops non-JS paths.** The parser gated every line on a hard-coded
+  directory whitelist (`src|test|tests|bin|examples|lib|docs|scripts|assets|resources|config`) plus
+  a root-level JS/MD/YAML extension whitelist, and only ever stripped commentary after a literal
+  ` -- `. So `app/handler.go`, `packages/core/index.ts`, `.github/workflows/ci.yml`, `Makefile`, and
+  any path with other trailing commentary (`— modified`, `(modified)`, `: note`) never entered the
+  contract at all — which meant the post-Apply check reported them OUT OF SCOPE the moment
+  implementation touched them, and the dangling check never saw them. The parser now reads the
+  first token as the path and treats everything after it as commentary, accepting any path shape
+  (directory separators, dotfiles, `name.ext`, known extensionless files), recognizing numbered
+  list items (`1. src/x.ts`), and finding `(new)` anywhere in that commentary.
 
 **Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.12.1...0.13.0
 
