@@ -2,11 +2,13 @@
  * Minimal, dependency-free glob matcher for `readyset.review.sensitivePaths` and any future
  * path-pattern config. Supports the subset those defaults need — nothing more:
  *   - `*`  matches any run of characters EXCEPT `/`
- *   - `**` matches any run of characters INCLUDING `/` (a leading `**\/` also matches zero
- *          directories, so `**\/auth/**` matches `auth/x.ts` and `src/auth/x.ts`)
+ *   - `**` matches any run of characters INCLUDING `/` (a `**\/` — at any position, not just the
+ *          start — also matches zero directories, so `**\/auth/**` matches `auth/x.ts` and
+ *          `src/auth/x.ts`, and `src/**\/auth.ts` matches `src/auth.ts`)
  *   - `?`  matches exactly one character except `/`
  *   - everything else is literal
  * Patterns and paths are matched as POSIX-style, repo-relative strings (forward slashes).
+ * Matching is case-insensitive.
  *
  * Hand-rolled on purpose: this package has zero runtime dependencies, so there is no
  * minimatch/picomatch to lean on (see `configure.mjs`'s note on that policy). The subset above
@@ -26,9 +28,10 @@ export function globToRegExp(pattern: string): RegExp {
 		const ch = pattern[i];
 		if (ch === "*") {
 			if (pattern[i + 1] === "*") {
-				// `**/` at the start matches zero or more leading directories; any other `**`
-				// spans path separators too.
-				if (i === 0 && pattern[i + 2] === "/") {
+				// `**/` matches zero or more directories, at ANY position (so `src/**/auth.ts`
+				// matches `src/auth.ts`, and a leading `**/auth/**` matches `auth/x.ts`); any other
+				// `**` spans path separators too.
+				if (pattern[i + 2] === "/") {
 					source += "(?:.*/)?";
 					i += 2;
 					continue;
@@ -46,7 +49,7 @@ export function globToRegExp(pattern: string): RegExp {
 		}
 		source += escapeRegExpChar(ch);
 	}
-	return new RegExp(`^${source}$`);
+	return new RegExp(`^${source}$`, "i");
 }
 
 /** Normalizes a repo-relative path for matching: `\` → `/`, strip a leading `./`. */

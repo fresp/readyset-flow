@@ -29,6 +29,7 @@ import {
 	checkTaskVerification,
 	ensureDirtyBaseline,
 	ensureReadysetRoot,
+	findMissingRequestedDocs,
 	findSpecFiles,
 	getProgress,
 	hasBeenApplied,
@@ -72,10 +73,13 @@ import {
 	readReviewFullLane,
 	readReviewMode,
 	readReviewThresholds,
+	readScopeProtectedPaths,
+	readTestPaths,
 	type ParsedReviewThresholds,
 	type ReviewFullLane,
 	type ReviewMode,
 } from "../lib/readyset-omp-config.ts";
+import { matchesAnyGlob } from "../lib/readyset-glob.ts";
 import {
 	evaluateReviewTriggers,
 	type ReviewTriggerInput,
@@ -170,7 +174,9 @@ const PROPOSAL_GUIDE_BULLET = `- proposal.md — must have a "## Why" section (1
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
   arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
   the change actually needs — nothing speculative. A file not on this list may not
-  be written during Apply without asking first.
+  be written during Apply without asking first. Every doc the request or brainstorm asks for
+  (README, CHANGELOG, docs/…, migration notes, deprecation notes) must be in this contract —
+  list it, marking a new file "(new)".
   Also add a \`## Open Decisions\` section (one \`### question\` block as specified in the prompt
   above, or the single line "none") and a \`## Assumptions\` section (one \`- <assumed decision> —
   <chosen behavior>\` line per brainstorm \`## Assumed\` item, or "none").`;
@@ -225,7 +231,8 @@ function artifactGuide(lane: ChangeLane, budgets: ArtifactBudgets): string {
 		bullets +
 		"\n\nBudgets (characters, hard guidance — stay under them):\n" +
 		budgetLines.join("\n") +
-		"\n\nDo not restate another artifact's content:\n" +
+		"\n\nMinimal diff: never modify seed data, fixtures or sample data in production paths; never add runtime self-checks/assertions to production code; never change an existing test's expectations unless the requested behavior changes them.\n" +
+		"\nDo not restate another artifact's content:\n" +
 		(lane === "fast"
 			? ""
 			: "- design.md explains decisions and risks only; never re-list `## What Changes`.\n") +
@@ -382,10 +389,15 @@ function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): 
 		"\n\nScope discipline: touch ONLY files named in proposal.md's `## Files This Change Will Touch` " +
 		"contract — you may create a `(new)` file and remove a `(delete)` file. Do NOT refactor, rename, " +
 		"reformat, reorder, or rewrite comments in code a task doesn't require; do NOT add new helper " +
-		"modules, scripts, benchmarks, or docs unless the contract lists them. For tests, add or modify only " +
+		"modules, scripts, benchmarks, or docs beyond what the contract lists, and every doc the contract " +
+		"lists must be updated — a contract doc left untouched is a dropped requirement, not a saving. For " +
+		"tests, add or modify only " +
 		"what exercises the specs' WHEN/THEN scenarios — do not restructure existing tests. Prefer the " +
-		"smallest change that satisfies the scenarios. If a file outside the contract is truly required, you " +
-		"may change it, but in the SAME turn record it under `## Scope deviations` in tasks.md as " +
+		"smallest change that satisfies the scenarios. Never modify seed data, fixtures, or sample data in " +
+		"production paths unless the request asks for it. Never add runtime self-checks or assertions to " +
+		"production code to verify your own change — that belongs in tests. Never change an existing test's " +
+		"expectations unless the requested behavior changes them. If a file outside the contract is truly " +
+		"required, you may change it, but in the SAME turn record it under `## Scope deviations` in tasks.md as " +
 		"`- <path> — <one-line reason>`.\n\n" +
 		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks." +
 		openDecisionsBlock
@@ -1302,12 +1314,19 @@ async function runContractRepair(
 	changeId: string,
 	phaseModels: Map<string, { model: string; source: string }>,
 	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string }) => Promise<void>,
+	brainstormText = "",
 ): Promise<Awaited<ReturnType<typeof checkScopeRefs>>> {
 	const applied = await hasBeenApplied(ctx.cwd, changeId);
 	const appliedRefs = applied ? { afterApply: true as const } : {};
 	const beforeRaw = await checkScopeRefs(ctx.cwd, changeId, appliedRefs);
 	const before = applied ? { ...beforeRaw, newButExists: [] } : beforeRaw;
-	const problems = scopeRefProblems(before);
+	// Doc mentions that the request/brainstorm asked for but the contract omits are folded into the
+	// same one-shot repair turn, so a requested doc can never be silently dropped at planning time.
+	const missingDocs = await findMissingRequestedDocs(ctx.cwd, changeId, brainstormText, brainstormText);
+	const problems = [
+		...scopeRefProblems(before),
+		...missingDocs.map((d) => `requested doc missing from contract: ${d} (add it to \`## Files This Change Will Touch\`, marked (new) if the file does not exist yet)`),
+	];
 	if (problems.length === 0) return before; // nothing to repair: no event, no turn
 
 	if (applied) {
@@ -1727,6 +1746,8 @@ interface ReviewSnapshot {
 	openDecisions: OpenDecision[];
 	/** proposal.md's `## Assumptions` body, or undefined when absent. */
 	assumptions: string | undefined;
+	/** Doc mentions (from `chosen.raw`) that the contract does not name. */
+	missingDocs: string[];
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -1752,6 +1773,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const sizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
 	const openDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
 	const assumptions = await readAssumptions(ctx.cwd, chosen.changeId);
+	const missingDocs = await findMissingRequestedDocs(ctx.cwd, chosen.changeId, chosen.raw, chosen.raw);
 	return {
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
 		validated,
@@ -1765,6 +1787,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		sizes,
 		openDecisions,
 		assumptions,
+		missingDocs,
 	};
 }
 
@@ -1870,6 +1893,9 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 						? `Delete-but-missing (marked (delete) but not on disk): ${snapshot.scopeRefs.deleteButMissing.join(", ")}`
 						: "Delete-but-missing (marked (delete) but not on disk): none",
 					repairLine,
+					...(snapshot.missingDocs.length > 0
+						? snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`)
+						: []),
 				].join("\n");
 			},
 		},
@@ -2145,6 +2171,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 					...(snapshot.assumptions !== undefined ? ["assumptions: see proposal.md `## Assumptions`"] : []),
 				]
 			: []),
+		...snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -2218,6 +2245,8 @@ async function buildReviewTriggerInput(
 	clarity: ReviewTriggerInput["clarity"],
 	thresholds: ParsedReviewThresholds,
 	openDecisions: number,
+	protectedPatterns: string[],
+	testPaths: string[],
 ): Promise<ReviewTriggerInput> {
 	const [conflicts, evidence, verification, progress, events] = await Promise.all([
 		findEvidenceConflicts(cwd, changeId),
@@ -2239,6 +2268,9 @@ async function buildReviewTriggerInput(
 		changedPaths,
 		clarity,
 		openDecisions,
+		protectedPatterns,
+		testPaths,
+		verifiedCommandNotes: verification?.withCommandNote ?? 0,
 		thresholds,
 	};
 }
@@ -2292,6 +2324,8 @@ async function reviewAndMaybeExecute(
 	reviewMode: ReviewMode = "auto",
 	reviewFullLane: ReviewFullLane = "always",
 	reviewThresholds: ParsedReviewThresholds = { ...DEFAULT_REVIEW_THRESHOLDS, warning: undefined },
+	protectedPaths: string[] = [],
+	testPaths: string[] = [],
 ): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
@@ -2441,7 +2475,7 @@ async function reviewAndMaybeExecute(
 				if (!refineFired) return;
 				refineOutcome = "refined";
 				await appendContext(ctx.cwd, chosen.changeId, "Refine", `User feedback: ${feedback}`);
-				await runContractRepair(pi, ctx, budget, chosen.changeId, phaseModels, recordRepair);
+				await runContractRepair(pi, ctx, budget, chosen.changeId, phaseModels, recordRepair, chosen.raw);
 				await runTrim(pi, ctx, budget, chosen.changeId, phaseModels, artifactBudgets, reviewLane, recordRepair);
 			} finally {
 				await recordPhase(chosen.changeId, "refine", "end", { model: phaseModels.get("propose")?.model, outcome: refineOutcome });
@@ -2535,6 +2569,12 @@ async function reviewAndMaybeExecute(
 		// legitimately touches more files than planning discussion did, so this flags the drift
 		// at the archive prompt rather than refusing to offer archive.
 		const changedThisRun = await pathsChangedThisRun(ctx.cwd, chosen.changeId);
+		const protectedHits = changedThisRun.filter((p) => matchesAnyGlob(p, protectedPaths));
+		if (protectedHits.length > 0) {
+			await appendContext(ctx.cwd, chosen.changeId, "Apply",
+				`Protected path(s) changed: ${protectedHits.join(", ")} — see readyset.scope.protectedPaths.`);
+			ctx.ui.notify(`"${chosen.changeId}" changed protected path(s) (${protectedHits.join(", ")}). A protected path may only be changed when the request asks for it, and then the contract must list it with a reason.`, "warning");
+		}
 		const before = await checkScope(ctx.cwd, chosen.changeId, changedThisRun);
 		const deviations = await readScopeDeviations(ctx.cwd, chosen.changeId);
 		const justifiedPaths = new Set(deviations.map((d) => d.path));
@@ -2581,7 +2621,7 @@ async function reviewAndMaybeExecute(
 		} else if (reviewMode === "auto") {
 			triggerResult = evaluateReviewTriggers(
 				await buildReviewTriggerInput(
-					ctx.cwd, chosen.changeId, archiveDriftPaths, changedThisRun, chosen.clarity, reviewThresholds, snapshot.openDecisions.length,
+					ctx.cwd, chosen.changeId, archiveDriftPaths, changedThisRun, chosen.clarity, reviewThresholds, snapshot.openDecisions.length, protectedPaths, testPaths,
 				),
 			);
 			if (!fullLaneExempt && triggerResult.fired.length === 0) skipReason = "skipped-no-trigger";
@@ -2812,6 +2852,8 @@ async function runOnDemandReview(
 	phaseModels: Map<string, { model: string; source: string }>,
 	mode: ReviewMode,
 	thresholds: ParsedReviewThresholds,
+	protectedPaths: string[],
+	testPaths: string[],
 ): Promise<void> {
 	const state = await changeState(ctx.cwd, changeId);
 	if (state === "archived") {
@@ -2846,7 +2888,7 @@ async function runOnDemandReview(
 	const driftPaths = (scope.noContract ? [] : scope.outside).filter((p) => !justified.has(p));
 	const brainstorm = await loadBrainstorms(ctx.cwd).then((all) => all.find((b) => b.changeId === changeId));
 	const triggerResult = evaluateReviewTriggers(
-		await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds, (await readOpenDecisions(ctx.cwd, changeId)).length),
+		await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds, (await readOpenDecisions(ctx.cwd, changeId)).length, protectedPaths, testPaths),
 	);
 
 	let reviewContent: string | undefined;
@@ -3393,6 +3435,10 @@ export default function (pi: ExtensionAPI) {
 			if (resolvedReviewFullLane.warning) ctx.ui.notify(resolvedReviewFullLane.warning, "warning");
 			const reviewThresholds = await readReviewThresholds();
 			if (reviewThresholds.warning) ctx.ui.notify(reviewThresholds.warning, "warning");
+			const scopeProtected = await readScopeProtectedPaths();
+			if (scopeProtected.warning) ctx.ui.notify(scopeProtected.warning, "warning");
+			const testPathsResult = await readTestPaths();
+			if (testPathsResult.warning) ctx.ui.notify(testPathsResult.warning, "warning");
 			const effectiveReviewMode: ReviewMode = parsedArgs.review ?? resolvedReviewMode.mode;
 			const reviewFullLane: ReviewFullLane = resolvedReviewFullLane.fullLane;
 			if (parsedArgs.review === undefined && /(^|\s)--review(\s|$)/.test(args)) {
@@ -3419,6 +3465,8 @@ export default function (pi: ExtensionAPI) {
 					resolvedPhaseModels,
 					effectiveReviewMode,
 					reviewThresholds,
+					scopeProtected.paths,
+					testPathsResult.paths,
 				);
 				return;
 			}
@@ -3671,7 +3719,7 @@ export default function (pi: ExtensionAPI) {
 					// Defensive: a change that predates the baseline mechanism has no capture
 					// yet. This never overwrites an existing baseline (first capture wins).
 					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
 					return;
 				}
 
@@ -3897,7 +3945,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			await runContractRepair(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, recordPhaseFor);
+			await runContractRepair(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, recordPhaseFor, chosen.raw);
 			await runTrim(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, artifactBudgets, effectiveLane, recordPhaseFor);
 
 			const reloaded = await loadBrainstorms(ctx.cwd);
@@ -3927,7 +3975,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
 		});
 		},
 	});

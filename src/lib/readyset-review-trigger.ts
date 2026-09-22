@@ -20,6 +20,7 @@ export type ReviewTriggerName =
 	| "no-evidence"
 	| "diff-size"
 	| "sensitive-path"
+	| "protected-path"
 	| "clarity"
 	| "open-decisions";
 
@@ -31,7 +32,7 @@ export interface ReviewTriggerInput {
 	/** Total readyset_verify records for the change (checkTaskEvidence().totalRecords). */
 	evidenceTotal: number;
 	/** Notes-format verification check for the same change. */
-	verification: { checkedTasks: number; withVerificationNote: number; missing: number } | undefined;
+	verification: { checkedTasks: number; withVerificationNote: number; missing: number; withCommandNote?: number } | undefined;
 	/** Numbers of checked tasks (getProgress().done) — 0 means nothing finished, so the
 	 *  "no evidence" trigger cannot fire. */
 	checkedTasks: number;
@@ -43,6 +44,12 @@ export interface ReviewTriggerInput {
 	clarity: "clear" | "partial" | "ambiguous" | undefined;
 	/** proposal.md's `## Open Decisions` count at review time; > 0 fires the `open-decisions` trigger. */
 	openDecisions: number;
+	/** `readyset.scope.protectedPaths` patterns; a changed path matching one fires `protected-path`. */
+	protectedPatterns: string[];
+	/** `readyset.review.testPaths` patterns; matched paths are excluded from the `diff-size` count. */
+	testPaths: string[];
+	/** Checked tasks whose `_Verified:` note names a runnable command; > 0 satisfies `no-evidence`. */
+	verifiedCommandNotes: number;
 	thresholds: { maxLines: number; maxFiles: number; sensitivePaths: string[] };
 }
 
@@ -56,7 +63,9 @@ export interface ReviewTriggerResult {
 }
 
 /** Evaluates every trigger in a fixed order and reports which fired. Any single fired trigger
- *  is enough: the caller reviews when `fired.length > 0`. */
+ *  is enough: the caller reviews when `fired.length > 0`. Test paths (readyset.review.testPaths)
+ *  are excluded from the `diff-size` file count — a large test suite is not itself a reason to
+ *  review — while `protected-path` fires on any protected-pattern hit regardless of the contract. */
 export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTriggerResult {
 	const evaluated: ReviewTriggerResult["evaluated"] = [];
 
@@ -75,10 +84,11 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 	});
 
 	// "Finished work with nothing to show for it": at least one task checked, yet the change
-	// carries no readyset_verify record at all. One record anywhere satisfies this trigger —
+	// carries no readyset_verify record at all AND no `_Verified:` note names a runnable command.
+	// A command-bearing note (or one readyset_verify record anywhere) satisfies this trigger —
 	// readyset_verify is optional by design, and a per-task requirement would fire on most runs
 	// and erase the saving.
-	const noEvidence = input.checkedTasks > 0 && input.evidenceTotal === 0;
+	const noEvidence = input.checkedTasks > 0 && input.evidenceTotal === 0 && input.verifiedCommandNotes === 0;
 	evaluated.push({
 		name: "no-evidence",
 		fired: noEvidence,
@@ -86,15 +96,19 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 			input.checkedTasks === 0
 				? "no tasks checked"
 				: noEvidence
-					? `${input.checkedTasks} checked task(s), 0 evidence records`
-					: `${input.evidenceTotal} evidence record(s)`,
+					? `${input.checkedTasks} checked task(s), 0 evidence records, no _Verified: note names a command either`
+					: `${input.evidenceTotal} evidence record(s), ${input.verifiedCommandNotes} command note(s)`,
 	});
 
+	// Test-only files do not count toward the size threshold: a large test suite is not itself a
+	// reason to review. `input.diff.files` is still reported by the Apply phase event; the trigger
+	// counts are recomputed here from `changedPaths` minus the test patterns.
+	const productFiles = input.changedPaths.filter((p) => !matchesAnyGlob(p, input.testPaths)).length;
 	const lines = input.diff.added + input.diff.deleted;
 	evaluated.push({
 		name: "diff-size",
-		fired: input.diff.files > input.thresholds.maxFiles || lines > input.thresholds.maxLines,
-		value: `${input.diff.files} files, ${lines} lines`,
+		fired: productFiles > input.thresholds.maxFiles || lines > input.thresholds.maxLines,
+		value: `${productFiles} non-test file(s), ${lines} lines`,
 	});
 
 	const firedSensitivePaths = input.thresholds.sensitivePaths
@@ -105,6 +119,16 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 		name: "sensitive-path",
 		fired: firedSensitivePaths.length > 0,
 		value: firedSensitivePaths.length > 0 ? `${firedSensitivePaths.length} sensitive path(s)` : "none",
+	});
+
+	const firedProtected = input.protectedPatterns
+		.filter((pattern, index, all) => all.indexOf(pattern) === index)
+		.filter((pattern) => input.changedPaths.some((path) => matchesAnyGlob(path, [pattern])))
+		.sort();
+	evaluated.push({
+		name: "protected-path",
+		fired: firedProtected.length > 0,
+		value: firedProtected.length > 0 ? `${firedProtected.length} protected path(s)` : "none",
 	});
 
 	evaluated.push({

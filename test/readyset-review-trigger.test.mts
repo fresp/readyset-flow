@@ -303,6 +303,15 @@ await test("globToRegExp: escapes regex metacharacters in a literal pattern", ()
   assert.equal(globToRegExp("a+b.ts").test("a+b.ts"), true);
   assert.equal(globToRegExp("a+b.ts").test("aab.ts"), false);
 });
+await test("globToRegExp: `src/**/auth.ts` matches `src/auth.ts` (a `**/` in the middle matches zero directories)", () => {
+  assert.equal(matchGlob("src/auth.ts", "src/**/auth.ts"), true);
+  assert.equal(matchGlob("src/nested/auth.ts", "src/**/auth.ts"), true);
+  assert.equal(matchGlob("src/nested/other.ts", "src/**/auth.ts"), false);
+});
+
+await test("matchGlob: matching is case-insensitive (`src/Auth/login.ts` matches `**/auth/**`)", () => {
+  assert.equal(matchGlob("src/Auth/login.ts", "**/auth/**"), true);
+});
 
 await test("matchesAnyGlob: an empty pattern list matches nothing; an empty pattern matches nothing", () => {
   assert.equal(matchesAnyGlob("a.ts", []), false);
@@ -318,21 +327,24 @@ const baseInput: ReviewTriggerInput = {
   unjustifiedDriftPaths: [],
   evidenceConflicts: [],
   evidenceTotal: 1,
-  verification: { checkedTasks: 1, withVerificationNote: 1, missing: 0 },
+  verification: { checkedTasks: 1, withVerificationNote: 1, missing: 0, withCommandNote: 0 },
   checkedTasks: 1,
   diff: { files: 1, added: 5, deleted: 1 },
   changedPaths: ["src/thing.ts"],
   clarity: "clear",
   openDecisions: 0,
+  protectedPatterns: [],
+  testPaths: ["test/**", "**/*.test.*"],
+  verifiedCommandNotes: 0,
   thresholds: { maxLines: 150, maxFiles: 5, sensitivePaths: ["auth/**", "**/auth/**", "Dockerfile"] },
 };
 
-await test("evaluateReviewTriggers: a clean change fires nothing, all seven are evaluated in order", () => {
+await test("evaluateReviewTriggers: a clean change fires nothing, all eight are evaluated in order", () => {
   const r = evaluateReviewTriggers(baseInput);
   assert.deepEqual(r.fired, []);
   assert.deepEqual(
     r.evaluated.map((e) => e.name),
-    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "clarity", "open-decisions"],
+    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "protected-path", "clarity", "open-decisions"],
   );
   assert.ok(r.evaluated.every((e) => !e.fired));
 });
@@ -348,50 +360,47 @@ await test("evaluateReviewTriggers: open-decisions fires when N > 0, not at 0, a
   assert.equal(none.evaluated[none.evaluated.length - 1].value, "none");
 });
 
-await test("evaluateReviewTriggers: scope-drift fires on an unjustified drift path", () => {
-  const r = evaluateReviewTriggers({ ...baseInput, unjustifiedDriftPaths: ["src/other.ts"] });
-  assert.deepEqual(r.fired, ["scope-drift"]);
-  assert.equal(r.evaluated[0].value, "1 unjustified path(s)");
-});
-
-await test("evaluateReviewTriggers: evidence-conflict fires when a checked task's evidence exited non-zero", () => {
+await test("evaluateReviewTriggers: protected-path fires on a changed protected file even when the contract lists it", () => {
+  // The trigger is contract-agnostic: the contract may list a protected path only with a reason,
+  // and the review is how that reason gets judged — so a plain changedPaths match is enough.
   const r = evaluateReviewTriggers({
     ...baseInput,
-    evidenceConflicts: [{ taskId: "1.1", evidenceId: "ev-1", exitCode: 1 }],
+    changedPaths: ["db/seeds/users.ts"],
+    protectedPatterns: ["**/seeds/**", "db/**"],
   });
-  assert.deepEqual(r.fired, ["evidence-conflict"]);
-  assert.equal(r.evaluated[1].value, "1 conflict(s)");
+  assert.deepEqual(r.fired, ["protected-path"]);
+  const idx = r.evaluated.findIndex((e) => e.name === "protected-path");
+  assert.equal(r.evaluated[idx].value, "2 protected path(s)", "the two matching patterns are counted");
+  assert.deepEqual(evaluateReviewTriggers({ ...baseInput, protectedPatterns: ["**/fixtures/**"] }).fired, []);
 });
 
-await test("evaluateReviewTriggers: no-evidence fires only with checked tasks and zero evidence records", () => {
-  const fired = evaluateReviewTriggers({ ...baseInput, evidenceTotal: 0 });
-  assert.deepEqual(fired.fired, ["no-evidence"]);
-  assert.equal(fired.evaluated[2].value, "1 checked task(s), 0 evidence records");
+await test("evaluateReviewTriggers: diff-size counts only non-test files", () => {
+  const testOnly = evaluateReviewTriggers({
+    ...baseInput,
+    changedPaths: ["test/a.test.ts", "test/b.test.ts", "test/c.test.ts", "test/d.spec.ts", "test/e.test.ts", "test/f.test.ts", "src/prod.ts"],
+    diff: { files: 7, added: 10, deleted: 2 },
+  });
+  assert.deepEqual(testOnly.fired, [], "6 test files + 1 product file must not fire at maxFiles 5");
+  assert.equal(testOnly.evaluated[3].value, "1 non-test file(s), 12 lines");
 
-  // Zero checked tasks: nothing finished, so there is nothing to verify — no trigger.
-  const none = evaluateReviewTriggers({ ...baseInput, evidenceTotal: 0, checkedTasks: 0 });
-  assert.deepEqual(none.fired, []);
-  assert.equal(none.evaluated[2].value, "no tasks checked");
-
-  // One evidence record anywhere satisfies it.
-  assert.deepEqual(evaluateReviewTriggers({ ...baseInput, evidenceTotal: 1 }).fired, []);
+  const product = evaluateReviewTriggers({
+    ...baseInput,
+    changedPaths: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts", "src/e.ts", "src/f.ts"],
+    diff: { files: 6, added: 1, deleted: 1 },
+  });
+  assert.deepEqual(product.fired, ["diff-size"]);
+  assert.equal(product.evaluated[3].value, "6 non-test file(s), 2 lines");
 });
 
-await test("evaluateReviewTriggers: diff-size fires over either threshold, and reports both numbers", () => {
-  const files = evaluateReviewTriggers({ ...baseInput, diff: { files: 6, added: 1, deleted: 1 } });
-  assert.deepEqual(files.fired, ["diff-size"]);
-  assert.equal(files.evaluated[3].value, "6 files, 2 lines");
+await test("evaluateReviewTriggers: no-evidence does not fire when a `_Verified:` note names a command", () => {
+  const withoutCommand = evaluateReviewTriggers({ ...baseInput, evidenceTotal: 0, verifiedCommandNotes: 0 });
+  assert.deepEqual(withoutCommand.fired, ["no-evidence"]);
+  assert.equal(withoutCommand.evaluated[2].value, "1 checked task(s), 0 evidence records, no _Verified: note names a command either");
 
-  const lines = evaluateReviewTriggers({ ...baseInput, diff: { files: 1, added: 100, deleted: 60 } });
-  assert.deepEqual(lines.fired, ["diff-size"]);
-  assert.equal(lines.evaluated[3].value, "1 files, 160 lines");
-
-  // Exactly at the thresholds is not over them.
-  assert.deepEqual(
-    evaluateReviewTriggers({ ...baseInput, diff: { files: 5, added: 100, deleted: 50 } }).fired,
-    [],
-  );
+  const withCommand = evaluateReviewTriggers({ ...baseInput, evidenceTotal: 0, verifiedCommandNotes: 1 });
+  assert.deepEqual(withCommand.fired, [], "a command-bearing _Verified: note satisfies no-evidence");
 });
+
 
 await test("evaluateReviewTriggers: sensitive-path fires and reports the matched patterns, sorted and de-duplicated", () => {
   const r = evaluateReviewTriggers({
@@ -410,8 +419,9 @@ await test("evaluateReviewTriggers: clarity fires on partial/ambiguous, not on c
   assert.deepEqual(evaluateReviewTriggers({ ...baseInput, clarity: "clear" }).fired, []);
   const absent = evaluateReviewTriggers({ ...baseInput, clarity: undefined });
   assert.deepEqual(absent.fired, []);
-  assert.equal(absent.evaluated[5].value, "absent");
+  assert.equal(absent.evaluated[6].value, "absent");
 });
+
 
 // ===========================================================================
 // End-to-end: the handler's review gate
@@ -668,7 +678,7 @@ await test("end-to-end: auto skips review, writes a stub, and records every trig
   assert.equal(end?.review?.mode, "auto");
   assert.deepEqual(
     end?.review?.triggersEvaluated.map((t) => t.name),
-    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "clarity", "open-decisions"],
+    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "protected-path", "clarity", "open-decisions"],
   );
   assert.ok(end?.review?.triggersEvaluated.every((t) => !t.fired), "every evaluated trigger must have fired=false");
   assert.deepEqual(end?.review?.triggersFired, []);

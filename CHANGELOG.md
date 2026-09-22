@@ -42,6 +42,18 @@ by phase events, so the benchmark can tune them from real data.
 - **A dependency-free glob matcher** (`src/lib/readyset-glob.ts`) for the sensitive-path patterns,
   supporting `*` (not across `/`), `**` (across `/`, with a leading `**/` matching zero
   directories), and `?`.
+- **`readyset.scope.protectedPaths`** (default `**/seed*`, `**/seeds/**`, `**/fixtures/**`,
+  `**/*.fixture.*`) and the **`protected-path` review trigger**. A changed path matching one of
+  these patterns warns after Apply and fires review even when the scope contract lists it with a
+  reason; the contract may name such a path only alongside that reason, and review judges whether
+  the change was warranted.
+- **`readyset.review.testPaths`** (default `test/**`, `tests/**`, `**/*.test.*`, `**/*.spec.*`,
+  `__tests__/**`) and test-aware **`diff-size`** evaluation. Matched test-only paths are excluded
+  from the trigger’s non-test file count; a large test suite alone is not a reason to review.
+- **Requested-doc contract repair.** The request/brainstorm text is scanned for README, CHANGELOG,
+  docs, release-note, migration-guide, and deprecation mentions, and any mentioned doc missing
+  from `## Files This Change Will Touch` is shown in the gate and added to the same one-shot
+  contract-repair turn, marked `(new)` when the file does not yet exist.
 - **A `review` field on the `review` `end` phase event** carrying the resolved mode, every
   trigger evaluated (name, fired, observed value), the fired trigger names, and the outcome
   (`ran` / `skipped-no-trigger` / `skipped-flag` / `on-demand`). The existing string `outcome`
@@ -94,6 +106,13 @@ by phase events, so the benchmark can tune them from real data.
   pre-turn snapshot; anything the turn changed or deleted outside its candidate list is restored
   byte-for-byte from that snapshot, logged loudly in `CONTEXT.md`, and surfaced at the archive
   prompt.
+- **Minimal-diff and doc-contract wording.** The Apply/Propose prompts now forbid modifying seed,
+  fixture, or sample data in production paths, adding runtime self-checks/assertions to production
+  code, and changing existing tests' expectations unless the requested behavior changes them; the
+  Apply prompt also requires updating every doc the scope contract lists. The `no-evidence` review
+  trigger is now satisfied by a command-bearing `_Verified:` note as well as by a runtime
+  evidence record, and the glob matcher treats `**/` as zero-or-more directories at any position
+  and matches case-insensitively (which also affects `sensitivePaths`).
 
 ## 0.14.0
 

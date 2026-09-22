@@ -391,6 +391,69 @@ export async function readReviewThresholds(configPath: string = OMP_CONFIG_PATH)
 	return parseReviewThresholds(raw);
 }
 
+/** Default `readyset.scope.protectedPaths` patterns: production seed/fixture/sample data that a
+ *  change must not modify unless the request asks for it. Deliberately broad — a false positive is
+ *  a warning, not a block. */
+export const DEFAULT_SCOPE_PROTECTED_PATHS: string[] = [
+	"**/seed*", "**/seeds/**", "**/fixtures/**", "**/*.fixture.*",
+];
+
+/** Default `readyset.review.testPaths` patterns: paths whose changes are test-only and so do not
+ *  count toward the `diff-size` review trigger (a large test suite is not itself a reason to
+ *  review). */
+export const DEFAULT_TEST_PATH_PATTERNS: string[] = [
+	"test/**", "tests/**", "**/*.test.*", "**/*.spec.*", "__tests__/**",
+];
+
+/** The shape both path-list readers return: the resolved list plus a warning when a present key
+ *  was not a list. */
+export interface PathListResult { paths: string[]; warning: string | undefined }
+
+/** Parses a `readyset.*` key holding a list of glob strings. Absent → the default list; a present
+ *  but non-list (or all-empty) value → the default list plus a warning. Same shape as
+ *  `parseReviewThresholds`'s `sensitivePaths` handling. */
+function parsePathList(raw: string, key: string, defaults: string[]): PathListResult {
+	const doc = parseYamlSubset(raw);
+	const value = getPath(doc, key);
+	if (value === undefined) return { paths: [...defaults], warning: undefined };
+	if (Array.isArray(value)) {
+		const kept = value
+			.filter((v): v is string => typeof v === "string")
+			.map((v) => v.trim())
+			.filter((v) => v !== "");
+		if (kept.length > 0) return { paths: kept, warning: undefined };
+		return { paths: [...defaults], warning: undefined };
+	}
+	return { paths: [...defaults], warning: `${key} isn't a list — using the defaults.` };
+}
+
+/** Parses `readyset.scope.protectedPaths` (a list of globs). Absent → the default list; a present
+ *  but non-list value → the default list plus a warning. */
+export function parseScopeProtectedPaths(raw: string): PathListResult {
+	return parsePathList(raw, "readyset.scope.protectedPaths", DEFAULT_SCOPE_PROTECTED_PATHS);
+}
+
+/** Reads `readyset.scope.protectedPaths` (or `configPath`). Never throws; a missing file → the
+ *  default list. */
+export async function readScopeProtectedPaths(configPath: string = OMP_CONFIG_PATH): Promise<PathListResult> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { paths: [...DEFAULT_SCOPE_PROTECTED_PATHS], warning: undefined };
+	return parseScopeProtectedPaths(raw);
+}
+
+/** Parses `readyset.review.testPaths` (a list of globs). Absent → the default list. */
+export function parseTestPaths(raw: string): PathListResult {
+	return parsePathList(raw, "readyset.review.testPaths", DEFAULT_TEST_PATH_PATTERNS);
+}
+
+/** Reads `readyset.review.testPaths` (or `configPath`). Never throws; a missing file → the
+ *  default list. */
+export async function readTestPaths(configPath: string = OMP_CONFIG_PATH): Promise<PathListResult> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { paths: [...DEFAULT_TEST_PATH_PATTERNS], warning: undefined };
+	return parseTestPaths(raw);
+}
+
 /** Per-artifact character budgets for one lane. Each value bounds the artifact's raw text
  *  length; `Infinity` means "no budget on this lane". `specs` is the TOTAL across every
  *  specs/**\/spec.md file, not a per-file cap. */

@@ -3147,6 +3147,10 @@ await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   assert.match(applyCall.prompt, /touch ONLY files/);
   assert.match(applyCall.prompt, /## Scope deviations/);
   assert.match(applyCall.prompt, /smallest change/);
+  assert.match(applyCall.prompt, /Never modify seed data, fixtures, or sample data/);
+  assert.match(applyCall.prompt, /Never add runtime self-checks or assertions/);
+  assert.match(applyCall.prompt, /Never change an existing test's expectations/);
+  assert.match(applyCall.prompt, /every doc the contract lists must be updated/);
 });
 
 // --- F1: safe scope reconciliation (baseline-subtracted candidates, backups, restore) ---------
@@ -3617,6 +3621,108 @@ await test("F2: the archive prompt counts blocking findings", async () => {
   const archivePrompt = fakeUiWrap.selectPrompts.find((p) => /Archive now\?/.test(p));
   assert.ok(archivePrompt, "an archive prompt exists");
   assert.match(archivePrompt, /blocking: 1 found, 1 fixed/);
+});
+
+// --- F4/F5: protected paths and requested docs --------------------------------------------------
+
+await test("F4: a changed protected path is warned post-Apply and fires the protected-path trigger", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await clearConfig();
+  await writeBrainstorm(cwd, "2026-06-01-f4protected.md", {
+    title: "F4 Protected",
+    status: "proposed",
+    created: "2026-06-01",
+    change_id: "f4protected",
+  });
+  const dir = await writeProposedChange(cwd, "f4protected", [
+    "- src/keep.ts",
+    "- db/seeds/users.ts — requested production seed update",
+  ]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-06-01 · F4 Protected");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran `npm test`, all pass_\n", "utf8");
+    await mkdir(join(cwd, "db", "seeds"), { recursive: true });
+    await writeFile(join(cwd, "db/seeds/users.ts"), "export const users = [];\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakeUiWrap.notifications.some(
+      (n) => /changed protected path\(s\) \(db\/seeds\/users\.ts\)/.test(n.message) && n.level === "warning",
+    ),
+    "a protected-path warning names the changed seed file",
+  );
+  const events = await readPhaseEvents(cwd, "f4protected");
+  const reviewEnd = events.find((e) => e.phase === "review" && e.edge === "end");
+  assert.ok(reviewEnd?.review?.triggersFired.includes("protected-path"), "the protected-path trigger fired");
+});
+
+await test("F5: a doc mention missing from the contract is shown in the gate and the repair turn adds it as (new)", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  await writeBrainstorm(
+    cwd,
+    "2026-06-02-f5docs.md",
+    { title: "F5 Docs", status: "proposed", created: "2026-06-02", change_id: "f5docs" },
+    `${VALID_BRAINSTORM_BODY}\n\nPlease update CHANGELOG.md to document this behavior change.\n`,
+  );
+  const dir = await writeProposedChange(cwd, "f5docs", ["- src/keep.ts"]);
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-06-02 · F5 Docs");
+  fakeUiWrap.selectQueue.push("Refine");
+  fakeUiWrap.inputQueue.push("tighten the scope wording");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n- CHANGELOG.md (new)\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const panel = fakeUiWrap.widgetHistory.flat();
+  assert.ok(
+    panel.some((line) => /requested doc missing from contract: changelog/.test(line)),
+    "the gate panel names the requested doc missing from the contract",
+  );
+  assert.ok(
+    fakeUiWrap.editorTextHistory.join("\n\n").includes("requested doc missing from contract: changelog"),
+    "the review document Scope section names the requested doc",
+  );
+  const repair = fakePiWrap.calls.find((call) => /scope contract in proposal\.md is wrong/.test(call.prompt));
+  assert.ok(repair, "a contract-repair turn fired");
+  assert.match(repair.prompt, /requested doc missing from contract: changelog/);
+  assert.match(repair.prompt, /marked \(new\) if the file does not exist yet/);
+
+  const proposal = await readFile(join(dir, "proposal.md"), "utf8");
+  assert.match(proposal, /- CHANGELOG\.md \(new\)/, "the repaired contract lists the requested doc as (new)");
+  const events = await readPhaseEvents(cwd, "f5docs");
+  const repairEnd = events.find((event) => event.phase === "contract-repair" && event.edge === "end");
+  assert.equal(repairEnd?.outcome, "fixed", "the post-repair contract check passes");
 });
 
 // --- Conditional / model-aware compaction (C1-C8) ---------------------------------------------

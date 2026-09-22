@@ -439,10 +439,17 @@ Picks a brainstorm, then depending on its status:
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
   implementation legitimately touches more files than planning.
-  - Apply is also told to keep the **diff minimal**: touch only files in the scope contract, make
-    no refactors/renames/reformatting the task doesn't need, add no unrequested helper modules,
-    scripts, or docs, and only add or modify tests that exercise the specs' WHEN/THEN scenarios.
-    If a file outside the contract is genuinely required, Apply must record it under a
+  - Apply is also told to keep the **diff minimal**: touch only files in the scope contract and
+    update every doc it lists (a listed doc left untouched is a dropped requirement, not a saving).
+    Make no refactors/renames/reformatting the task doesn't need, add no unrequested helper
+    modules, scripts, benchmarks, or docs beyond what the contract lists, and only add or modify
+    tests that exercise the specs' WHEN/THEN scenarios. Never modify seed data, fixtures, or
+    sample data in production paths unless the request asks for it; never add runtime self-checks
+    or assertions to production code to verify your own change (that belongs in tests); and never
+    change an existing test's expectations unless the requested behavior changes them. Changes to
+    protected seed/fixture/sample paths are also warned after Execute (see
+    `readyset.scope.protectedPaths`), even when the contract lists them with a reason. If a file
+    outside the contract is genuinely required, Apply must record it under a
     `## Scope deviations` section in `tasks.md` as `- <path> — <reason>`.
   - After Execute, a file touched outside the contract with **no** deviation entry is
     **reconciled once**: one bounded turn reverts it (`git checkout -- <path>`, or deletes it if
@@ -478,19 +485,26 @@ Picks a brainstorm, then depending on its status:
     `never` skips it and writes a stub; `auto` reviews only when at least one **trigger** fires:
     (1) **scope drift** — a post-Execute path outside the contract with no deviation entry;
     (2) **evidence conflict** — a checked `[x]` task whose latest `readyset_verify` record exited
-    non-zero; (3) **no evidence** — at least one task checked but the change has *zero*
-    `readyset_verify` records (one record anywhere is enough to satisfy this); (4) **diff size** —
-    more than `readyset.review.maxLines` (default 150) changed lines *or* more than
-    `readyset.review.maxFiles` (default 5) files; (5) **sensitive path** — any changed path
-    matching `readyset.review.sensitivePaths` (default list: `auth/**`, `**/auth/**`,
-    `security/**`, `**/security/**`, `**/migrations/**`, `**/*migration*`, `schema/**`,
-    `**/schema/**`, `payment/**`, `**/payment/**`, `crypto/**`, `**/crypto/**`, `**/*.pem`,
-    `**/*.key`, `.github/**`, `Dockerfile`, `**/Dockerfile`, `docker-compose*.yml`,
-    `**/docker-compose*.yml`); (6) **clarity** — the brainstorm's `clarity` is `partial` or
-    `ambiguous`; (7) **open decisions** — `proposal.md`'s `## Open Decisions` still carries one or
+    non-zero; (3) **no evidence** — at least one task checked, but the change has *zero*
+    `readyset_verify` records *and* no command-bearing `_Verified:` note (a note naming a runnable
+    command, such as ``npm test``, also satisfies this); (4) **diff size** — more than
+    `readyset.review.maxLines` (default 150) changed lines *or* more than
+    `readyset.review.maxFiles` (default 5) **non-test** files (`readyset.review.testPaths`,
+    default: `test/**`, `tests/**`, `**/*.test.*`, `**/*.spec.*`, `__tests__/**`);
+    (5) **sensitive path** — any changed path matching `readyset.review.sensitivePaths`
+    (default list: `auth/**`, `**/auth/**`, `security/**`, `**/security/**`,
+    `**/migrations/**`, `**/*migration*`, `schema/**`, `**/schema/**`, `payment/**`,
+    `**/payment/**`, `crypto/**`, `**/crypto/**`, `**/*.pem`, `**/*.key`, `.github/**`,
+    `Dockerfile`, `**/Dockerfile`, `docker-compose*.yml`, `**/docker-compose*.yml`);
+    (6) **protected path** — any changed path matching `readyset.scope.protectedPaths`
+    (default seed/fixture/sample patterns: `**/seed*`, `**/seeds/**`, `**/fixtures/**`,
+    `**/*.fixture.*`), even when the contract lists it with a reason — the contract may name a
+    protected path only alongside that reason, and review judges whether the change was warranted;
+    (7) **clarity** — the brainstorm's `clarity` is `partial` or `ambiguous`;
+    (8) **open decisions** — `proposal.md`'s `## Open Decisions` still carries one or
     more unresolved items at review time. `readyset.review.fullLane` (default `always`) keeps a
-    full-lane change reviewed
-    regardless of triggers; set it to `auto` to let the triggers decide on the full lane too.
+    full-lane change reviewed regardless of triggers; set it to `auto` to let the triggers decide
+    on the full lane too.
     - **Review policy.** Every trigger is recorded, fired or not, in the `review` `end` phase
       event (and in the stub) so the mode/triggers/outcome are auditable. A skipped run writes an
       honest stub — `Review skipped (auto): no risk trigger` with the full evaluated list — in

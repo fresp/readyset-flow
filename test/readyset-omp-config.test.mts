@@ -18,9 +18,13 @@ import {
 	DEFAULT_REVIEW_MAX_FILES,
 	DEFAULT_REVIEW_MAX_LINES,
 	DEFAULT_REVIEW_SENSITIVE_PATHS,
+	DEFAULT_SCOPE_PROTECTED_PATHS,
+	DEFAULT_TEST_PATH_PATTERNS,
 	parseReviewFullLane,
 	parseReviewMode,
 	parseReviewThresholds,
+	parseScopeProtectedPaths,
+	parseTestPaths,
 	readArtifactBudgets,
 	readCompactMinContextPercent,
 	readFallbackChain,
@@ -32,6 +36,8 @@ import {
 	readReviewFullLane,
 	readReviewMode,
 	readReviewThresholds,
+	readScopeProtectedPaths,
+	readTestPaths,
 } from "../src/lib/readyset-omp-config.ts";
 
 let pass = 0;
@@ -584,6 +590,42 @@ await test("readReviewThresholds: a present but non-array sensitivePaths warns a
   const parsed = await readReviewThresholds(configPath);
   assert.deepEqual(parsed.sensitivePaths, DEFAULT_REVIEW_SENSITIVE_PATHS);
   assert.match(parsed.warning ?? "", /isn't a list/);
+});
+
+await test("parseScopeProtectedPaths/readScopeProtectedPaths: defaults, overrides, and non-list warning", async () => {
+  assert.deepEqual(parseScopeProtectedPaths("readyset:\n  scope: {}\n").paths, DEFAULT_SCOPE_PROTECTED_PATHS);
+  const parsed = parseScopeProtectedPaths(
+    "readyset:\n  scope:\n    protectedPaths:\n      - db/seeds/**\n      - src/fixtures/**\n",
+  );
+  assert.deepEqual(parsed.paths, ["db/seeds/**", "src/fixtures/**"]);
+  assert.equal(parsed.warning, undefined);
+
+  const invalid = parseScopeProtectedPaths("readyset:\n  scope:\n    protectedPaths: db/seeds/**\n");
+  assert.deepEqual(invalid.paths, DEFAULT_SCOPE_PROTECTED_PATHS);
+  assert.match(invalid.warning ?? "", /isn't a list/);
+
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  assert.deepEqual((await readScopeProtectedPaths(join(dir, "missing.yml"))).paths, DEFAULT_SCOPE_PROTECTED_PATHS);
+  await writeFile(configPath, "readyset:\n  scope:\n    protectedPaths:\n      - fixtures/**\n", "utf8");
+  assert.deepEqual((await readScopeProtectedPaths(configPath)).paths, ["fixtures/**"]);
+});
+
+await test("parseTestPaths/readTestPaths: defaults, overrides, and non-list warning", async () => {
+  assert.deepEqual(parseTestPaths("readyset:\n  review:\n    mode: auto\n").paths, DEFAULT_TEST_PATH_PATTERNS);
+  const parsed = parseTestPaths("readyset:\n  review:\n    testPaths:\n      - src/test/**\n");
+  assert.deepEqual(parsed.paths, ["src/test/**"]);
+  assert.equal(parsed.warning, undefined);
+
+  const invalid = parseTestPaths("readyset:\n  review:\n    testPaths: src/test/**\n");
+  assert.deepEqual(invalid.paths, DEFAULT_TEST_PATH_PATTERNS);
+  assert.match(invalid.warning ?? "", /isn't a list/);
+
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  assert.deepEqual((await readTestPaths(join(dir, "missing.yml"))).paths, DEFAULT_TEST_PATH_PATTERNS);
+  await writeFile(configPath, "readyset:\n  review:\n    testPaths:\n      - unit/**\n", "utf8");
+  assert.deepEqual((await readTestPaths(configPath)).paths, ["unit/**"]);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

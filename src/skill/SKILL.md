@@ -50,9 +50,15 @@ Each phase exists to catch something the previous one is bad at catching on its 
    back into another Propose-equivalent turn), or Discard. Nothing executes without this, and
    Discard is the default: the gate is fail-closed, so cancelling runs nothing.
 
-4. **Apply** — implements `tasks.md` one task at a time. A task is only checked off once
-   something actually verified it (a test run, a curl, a script execution) — not once code
-   was written that's expected to work. See "The `_Verified:` note" below.
+4. **Apply** — implements `tasks.md` one task at a time. Keep the diff minimal: touch only files
+   in the scope contract, update every doc it lists (an untouched listed doc is a dropped
+   requirement, not a saving), make no unrequested refactors/renames/reformatting/helpers, and
+   change tests only to exercise the specs' WHEN/THEN scenarios. Never modify seed data,
+   fixtures, or sample data in production paths unless the request asks for it; never add runtime
+   self-checks/assertions to production code; and never change an existing test's expectations
+   unless the requested behavior changes them. A task is only checked off once something actually
+   verified it (a test run, a curl, a script execution) — not once code was written that's
+   expected to work. See "The `_Verified:` note" below.
 
 5. **Code review** (`REVIEW.md`) — its own turn, after Apply, before Archive. It is told
    explicitly that its job is to find problems, not confirm the work — the turn that just
@@ -91,7 +97,10 @@ I actually looked at" attached does not belong in this file.
 - `## What Changes` — bullet list of concrete changes.
 - `## Files This Change Will Touch` — exhaustive repo-relative list. This is the **scope
   contract**: the review gate checks the working tree against it and flags anything changed that
-  isn't named. Omitting the section means "no contract", never "everything allowed".
+  isn't named. Omitting the section means "no contract", never "everything allowed". Every doc
+  the request or brainstorm asks for (README, CHANGELOG, docs/…, migration/deprecation notes)
+  must be listed here, marked `(new)` when the change creates it; during Apply, every listed doc
+  must actually be updated.
 - `## Acceptance` — **fast lane only**; the spec delta's replacement. One `- **WHEN** … **THEN** …`
   bullet per scenario, each with a `[S1]`, `[S2]`, … id.
 - `## Open Decisions` — every decision that is still undecided, one `### <question>` block each

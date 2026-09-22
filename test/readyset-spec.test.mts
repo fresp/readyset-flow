@@ -23,6 +23,8 @@ import {
   readOpenDecisions,
   readAssumptions,
   readBlockingFindings,
+  docMentions,
+  findMissingRequestedDocs,
   parseContractLine,
   checkScope,
   checkScopeRefs,
@@ -466,7 +468,31 @@ await test("checkTaskVerification: counts checked tasks missing a _Verified: not
     "utf8",
   );
   const result = await checkTaskVerification(cwd, "verify-change");
-  assert.deepEqual(result, { checkedTasks: 3, withVerificationNote: 2, missing: 1 });
+  // `_Verified: ran \`npm test\`...` has a backticked span; `curl returned 200` starts with a
+  // known runner token; 1.2 has no note at all.
+  assert.deepEqual(result, { checkedTasks: 3, withVerificationNote: 2, missing: 1, withCommandNote: 2 });
+});
+
+await test("checkTaskVerification: withCommandNote counts notes naming a runnable command", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "cmdnote-change");
+  await writeFile(
+    paths.tasks,
+    [
+      "- [x] 1.1 a",
+      "  _Verified: ran `npm test`, 5/5 pass_",
+      "- [x] 1.2 b",
+      "  _Verified: cargo build succeeded_",
+      "- [x] 1.3 c",
+      "  _Verified: looks correct_",
+      "- [x] 1.4 d",
+      "  _Verified: doc-only, no behavior to check_",
+    ].join("\n"),
+    "utf8",
+  );
+  const result = await checkTaskVerification(cwd, "cmdnote-change");
+  assert.equal(result?.withVerificationNote, 4);
+  assert.equal(result?.withCommandNote, 2, "only the backticked and the runner-token notes count");
 });
 
 await test("checkTaskVerification: no tasks.md -> undefined", async () => {
@@ -1297,6 +1323,32 @@ await test("readBlockingFindings: bullets under ## Blocking; 'none' and a missin
   );
   const bullets = await readBlockingFindings(cwd, "blocking");
   assert.deepEqual(bullets, ["scenario S1 is not met", "the deprecation warning is missing its type"]);
+});
+
+await test("docMentions/findMissingRequestedDocs: a CHANGELOG mention absent from the contract is reported", async () => {
+  assert.deepEqual(docMentions("Update the code and CHANGELOG."), ["changelog"]);
+
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "requested-docs");
+  await writeFile(
+    paths.proposal,
+    ["## Why", "", "x", "", "## What Changes", "", "- x", "", "## Files This Change Will Touch", "", "- src/thing.ts"].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual(
+    await findMissingRequestedDocs(cwd, "requested-docs", "Please update CHANGELOG.", "No request text."),
+    ["changelog"],
+  );
+
+  await writeFile(
+    paths.proposal,
+    ["## Why", "", "x", "", "## What Changes", "", "- x", "", "## Files This Change Will Touch", "", "- src/thing.ts", "- CHANGELOG.md (new)"].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual(
+    await findMissingRequestedDocs(cwd, "requested-docs", "Please update CHANGELOG.", "No request text."),
+    [],
+  );
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

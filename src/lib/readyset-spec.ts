@@ -697,6 +697,45 @@ export async function readAssumptions(cwd: string, changeId: string): Promise<st
 	return body;
 }
 
+/** Doc files a change's request/brainstorm text mentions. Scans the given text for the doc
+ *  vocabulary (README, CHANGELOG, "docs", "document", "release note", "migration guide",
+ *  "deprecation") and returns the concrete doc path names found, lower-cased for comparison:
+ *  "readme", "changelog", or "docs/" when the word "docs"/"documentation" appears without a
+ *  concrete file. */
+export function docMentions(text: string): string[] {
+	const found = new Set<string>();
+	const re = /\b(README(?:\.md)?|CHANGELOG(?:\.md)?|docs?\/|documentation|release notes?|migration guide|deprecat\w*)\b/gi;
+	for (const match of text.matchAll(re)) {
+		const raw = match[0].toLowerCase();
+		if (raw.startsWith("readme")) found.add("readme");
+		else if (raw.startsWith("changelog")) found.add("changelog");
+		else if (raw.startsWith("doc/") || raw.startsWith("docs/") || raw.startsWith("documentation")) found.add("docs/");
+		else if (raw.startsWith("release note")) found.add("release notes");
+		else if (raw.startsWith("migration guide")) found.add("migration guide");
+		else if (raw.startsWith("deprecat")) found.add("deprecation");
+	}
+	return [...found].sort();
+}
+
+/** Doc mentions (docMentions) that are NOT named anywhere in proposal.md's
+ *  `## Files This Change Will Touch` contract. Each is reported as
+ *  `requested doc missing from contract: <name>`. */
+export async function findMissingRequestedDocs(cwd: string, changeId: string, requestText: string, brainstormText: string): Promise<string[]> {
+	const mentions = [...new Set([...docMentions(requestText), ...docMentions(brainstormText)])];
+	if (mentions.length === 0) return [];
+	const contract = await readScopeContract(cwd, changeId);
+	if (contract.files === undefined) return [];
+	const entries = [...contract.files, ...contract.newFiles, ...contract.deleteFiles].map((p) => p.toLowerCase());
+	const named = (name: string): boolean => {
+		if (name === "docs/") return entries.some((e) => e.startsWith("docs/") || e.includes("/docs/"));
+		return entries.some((e) => {
+			const base = e.split("/").pop() ?? e;
+			return base === `${name}.md` || base === name || base.startsWith(name) || e.includes(name);
+		});
+	};
+	return mentions.filter((m) => !named(m)).map((m) => m);
+}
+
 export interface ScopeCheck {
 	/** Repo-relative paths outside the contract. Empty when everything is in scope. */
 	outside: string[];
@@ -1095,6 +1134,9 @@ export interface VerificationCheck {
 	checkedTasks: number;
 	withVerificationNote: number;
 	missing: number;
+	/** Checked tasks whose `_Verified:` note text names a runnable command (a backticked span, or a
+	 *  leading token matching a known runner). Used by the review's `no-evidence` trigger. */
+	withCommandNote: number;
 }
 
 /**
@@ -1114,6 +1156,7 @@ export async function checkTaskVerification(cwd: string, changeId: string): Prom
 	const lines = raw.split(/\r?\n/);
 	let checkedTasks = 0;
 	let withVerificationNote = 0;
+	let withCommandNote = 0;
 	for (let i = 0; i < lines.length; i++) {
 		if (!/^\s*-\s*\[[xX]\]/.test(lines[i])) continue;
 		checkedTasks++;
@@ -1121,11 +1164,25 @@ export async function checkTaskVerification(cwd: string, changeId: string): Prom
 		for (let j = i + 1; j < lines.length; j++) {
 			if (lines[j].trim() === "") continue;
 			if (/^\s*-\s*\[[ xX]\]/.test(lines[j])) break; // hit the next task, no note found
-			if (/^\s*_Verified:/i.test(lines[j])) withVerificationNote++;
+			if (/^\s*_Verified:/i.test(lines[j])) {
+				withVerificationNote++;
+				if (noteNamesCommand(lines[j])) withCommandNote++;
+			}
 			break;
 		}
 	}
-	return { checkedTasks, withVerificationNote, missing: checkedTasks - withVerificationNote };
+	return { checkedTasks, withVerificationNote, missing: checkedTasks - withVerificationNote, withCommandNote };
+}
+
+/** Heuristic: does a `_Verified:` note line name a runnable command? True when it contains a
+ *  backticked span, or its text after `_Verified:` starts with a known runner token. Used only to
+ *  decide whether the review's `no-evidence` trigger is satisfied — a false negative costs one
+ *  review turn, a false positive is the reason this is deliberately generous about backticks. */
+function noteNamesCommand(noteLine: string): boolean {
+	const after = noteLine.replace(/^\s*_Verified:\s*/i, "");
+	if (/`[^`]+`/.test(after)) return true;
+	const firstToken = after.match(/^\s*([A-Za-z0-9_.-]+)/)?.[1] ?? "";
+	return /^(npm|pnpm|yarn|bun|node|npx|deno|go|cargo|make|python|python3|pytest|mvn|gradle|dotnet|ruby|php|curl|bash|sh|git|docker)\b/.test(firstToken);
 }
 
 /** Reads REVIEW.md (the code-review phase's output), if it exists. */
