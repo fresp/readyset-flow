@@ -38,6 +38,7 @@ import {
 	listSubmodules,
 	type PhaseEvent,
 	type PhaseName,
+	readAssumedScenarios,
 	readDirtyBaseline,
 	readContext,
 	readPhaseEvents,
@@ -194,13 +195,13 @@ const FULL_LANE_GUIDE_BULLETS = `- design.md — "## Context", "## Goals / Non-G
 const FAST_LANE_ACCEPTANCE_GUIDE = `List every acceptance scenario under \`## Acceptance\` in proposal.md as
 "- **WHEN** ... **THEN** ...", one per bullet, and give it an id in the form \`[S1]\`, \`[S2]\`,
 ... in document order; tasks.md references those ids.`;
-
 const TASKS_GUIDE_BULLET = `- tasks.md — numbered sections, each task a "- [ ] N.M <description>" checkbox line with
   a verification note. Each task must map to an acceptance scenario (the fast lane's
   \`## Acceptance\` ids, or a spec scenario on the full lane); do NOT add
   "cleanup"/"improve"/refactor tasks the request didn't ask for. If you change a file outside
   the scope contract during Apply, record it under a "## Scope deviations" section here as
-  "- <path> — <reason>".`;
+  "- <path> — <reason>". Mark a task that pins an (assumed) scenario's behavior with "(assumed)"
+  in its description.`;
 
 /** Builds the artifact guide for a run's lane and resolved budgets. The full lane lists all
  *  four artifacts; the fast lane lists only proposal.md and tasks.md (no design.md, no spec
@@ -301,7 +302,10 @@ function fastLaneProposeSuffix(): string {
 		"verifiable. Do not pad proposal/design/specs beyond what the change needs — a short " +
 		"change gets a short plan. Behavior-affecting ambiguities are NOT trimmed: if the " +
 		"brainstorm left one open, decide it here with a stated reason or carry it forward " +
-		"explicitly, never silently."
+		"explicitly, never silently. Run the same edge-case checklist grilling uses " +
+		"(empty/case/boundaries/errors/compat/docs/verification) against your own grounding reads, " +
+		"and decide each item; record every decision that changes behavior under the brainstorm's " +
+		"`## Assumed` (or the proposal's `## Assumptions`)."
 	);
 }
 
@@ -339,7 +343,10 @@ function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets
 		"(3) Nothing may be left \"carried open\" inside design.md, specs/, or tasks.md — an undecided item " +
 		"lives in `## Open Decisions` and nowhere else. (4) The brainstorm's `## Assumed` items are decisions, " +
 		"not open questions: restate each under a `## Assumptions` section of proposal.md with the concrete " +
-		"behavior chosen, so a human can see what was assumed rather than asked.\n\n" +
+		"behavior chosen, so a human can see what was assumed rather than asked. Every assumption that " +
+		"changes behavior gets its own WHEN/THEN scenario, marked \"(assumed)\" in the scenario's name or " +
+		"directly after the THEN (e.g. `#### Scenario: empty sort is default order (assumed)`). An " +
+		"assumption with no scenario is a decision the tests cannot see.\n\n" +
 		"If EXPLORATION.md surfaced something the brainstorm didn't anticipate (a submodule it didn't mention, a config " +
 		"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it. Do not " +
 		"implement code in this turn — planning artifacts only." +
@@ -383,7 +390,9 @@ function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): 
 		"below the checked line add an indented note in this exact format: `  _Verified: <what you ran or checked, and the " +
 		"actual result>_` (e.g. `_Verified: ran \\`npm test\\`, 12/12 pass_` or `_Verified: curl'd /health, got 200_`). A task " +
 		"with no real way to verify (e.g. a doc-only change) still gets a note explaining why: `_Verified: doc-only, no " +
-		"behavior to check_` — never check a box with no note at all.\n\n" +
+		"behavior to check_` — never check a box with no note at all. A test that pins behavior decided under an " +
+		"`(assumed)` scenario must say so in its name or an adjacent comment (e.g. `it(\"empty sort returns default " +
+		"order (assumed)\")`), so a reader can tell a spec-mandated expectation from an assumed one.\n\n" +
 		"Pause and ask if a task is unclear, needs scope beyond what the spec describes, or you hit an error or blocker — " +
 		"never silently narrow or drop specified behavior, and never check a box to move on without actually verifying it. " +
 		"\n\nScope discipline: touch ONLY files named in proposal.md's `## Files This Change Will Touch` " +
@@ -693,6 +702,15 @@ function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefau
 			"- Map out the decision branches this idea implies before asking anything (what's actually unresolved: " +
 			"approach, scope boundary, the seam/module it touches, how success is observed), then ask only the " +
 			"questions answerable right now, all in one round.\n" +
+			"- Before asking anything, walk this edge-case checklist and note which items this idea actually " +
+			"touches: empty/missing values; case sensitivity; boundaries (inclusive/exclusive, time zones, " +
+			"rounding); error codes/messages for invalid input; backward compatibility/deprecation; docs and " +
+			"release artifacts (README, CHANGELOG, versioning); how verification is committed (tests in the " +
+			"suite vs a scratch script; relative vs absolute perf thresholds). For each item that applies, ask " +
+			"only if the answer changes the plan AND the repo cannot settle it — otherwise decide it yourself and " +
+			"record it under `## Assumed` with the concrete behavior chosen (`- <decision> — <behavior> — because " +
+			"all answers led to the same plan`). This is the same value-of-information rule as everywhere else in " +
+			"this prompt, applied to the checklist.\n" +
 			"- After the fact-finding pass, count *open decisions* — choices facts cannot settle that change scope, " +
 			"behavior, or interfaces. Stop as soon as no open decisions remain, even in round 1; the round cap is a " +
 			"ceiling, not a target.\n" +
@@ -1746,6 +1764,8 @@ interface ReviewSnapshot {
 	openDecisions: OpenDecision[];
 	/** proposal.md's `## Assumptions` body, or undefined when absent. */
 	assumptions: string | undefined;
+	/** Full-lane `(assumed)` scenario names or fast-lane `(assumed)` acceptance bullets. */
+	assumedScenarios: string[];
 	/** Doc mentions (from `chosen.raw`) that the contract does not name. */
 	missingDocs: string[];
 }
@@ -1773,6 +1793,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const sizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
 	const openDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
 	const assumptions = await readAssumptions(ctx.cwd, chosen.changeId);
+	const assumedScenarios = await readAssumedScenarios(ctx.cwd, chosen.changeId);
 	const missingDocs = await findMissingRequestedDocs(ctx.cwd, chosen.changeId, chosen.raw, chosen.raw);
 	return {
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
@@ -1787,6 +1808,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		sizes,
 		openDecisions,
 		assumptions,
+		assumedScenarios,
 		missingDocs,
 	};
 }
@@ -1847,6 +1869,7 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 					}
 				}
 				parts.push(`Assumptions: ${snapshot.assumptions ?? "_(none.)_"}`);
+				parts.push("", "Assumed scenarios:", ...(snapshot.assumedScenarios.length > 0 ? snapshot.assumedScenarios.map((scenario) => `- ${scenario}`) : ["_(none.)_"]));
 				return parts.join("\n");
 			},
 		},
@@ -2169,8 +2192,9 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 						(d) => `  - ${d.question}${d.recommended ? ` → ${d.recommended}` : " (no recommendation)"}`,
 					),
 					...(snapshot.assumptions !== undefined ? ["assumptions: see proposal.md `## Assumptions`"] : []),
+					...snapshot.assumedScenarios.map((scenario) => `assumed scenario: ${scenario}`),
 				]
-			: []),
+			: snapshot.assumedScenarios.length > 0 ? snapshot.assumedScenarios.map((scenario) => `assumed scenario: ${scenario}`) : []),
 		...snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),

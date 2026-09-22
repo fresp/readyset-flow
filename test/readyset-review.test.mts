@@ -1294,6 +1294,22 @@ await test("--idea skips the picker entirely and fires a grill turn as the first
   assert.match(fakePiWrap.calls[0].prompt, /web search tool/);
 });
 
+await test("F6: the grill prompt contains the edge-case checklist and the ask-only-if-it-changes-the-plan rule", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--idea Add an export feature", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 1);
+  const prompt = fakePiWrap.calls[0].prompt;
+  assert.match(prompt, /edge-case checklist/);
+  assert.match(prompt, /empty\/missing values/);
+  assert.match(prompt, /case sensitivity/);
+  assert.match(prompt, /only if the answer changes the plan/);
+});
+
 await test("--lang before --idea opens grilling's discussion in that language from round 1", async () => {
   const cwd = await freshRepo();
 
@@ -2450,6 +2466,44 @@ async function writeProposedChange(cwd: string, changeId: string, contractLines:
   return dir;
 }
 
+await test("F6: (assumed) scenarios are parsed and shown at the gate", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-06-10-f6assumed.md", {
+    title: "F6 Assumed",
+    status: "proposed",
+    created: "2026-06-10",
+    change_id: "f6assumed",
+  });
+  const dir = await writeProposedChange(cwd, "f6assumed", ["- src/keep.ts"]);
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: empty sort is default order (assumed)\n\n- **WHEN** empty sort is requested\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-06-10 · F6 Assumed");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 0, "a straight discard fires no turns");
+  const panel = fakeUiWrap.widgetHistory.flat();
+  assert.ok(
+    panel.some((line) => /assumed scenario: empty sort is default order \(assumed\)/.test(line)),
+    "the gate panel lists the assumed scenario",
+  );
+  assert.ok(
+    fakeUiWrap.editorTextHistory.join("\n\n").includes("- empty sort is default order (assumed)"),
+    "the review document lists the assumed scenario",
+  );
+});
+
 // Reads phase events from the archived CONTEXT.md if the change was archived, else the live path.
 async function phaseEventsArchivedOrLive(cwd: string, changeId: string) {
   const live = await readPhaseEvents(cwd, changeId);
@@ -3151,6 +3205,7 @@ await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   assert.match(applyCall.prompt, /Never add runtime self-checks or assertions/);
   assert.match(applyCall.prompt, /Never change an existing test's expectations/);
   assert.match(applyCall.prompt, /every doc the contract lists must be updated/);
+  assert.match(applyCall.prompt, /must say so in its name/);
 });
 
 // --- F1: safe scope reconciliation (baseline-subtracted candidates, backups, restore) ---------

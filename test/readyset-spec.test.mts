@@ -22,6 +22,7 @@ import {
   readScopeDeviations,
   readOpenDecisions,
   readAssumptions,
+  readAssumedScenarios,
   readBlockingFindings,
   docMentions,
   findMissingRequestedDocs,
@@ -1324,7 +1325,6 @@ await test("readBlockingFindings: bullets under ## Blocking; 'none' and a missin
   const bullets = await readBlockingFindings(cwd, "blocking");
   assert.deepEqual(bullets, ["scenario S1 is not met", "the deprecation warning is missing its type"]);
 });
-
 await test("docMentions/findMissingRequestedDocs: a CHANGELOG mention absent from the contract is reported", async () => {
   assert.deepEqual(docMentions("Update the code and CHANGELOG."), ["changelog"]);
 
@@ -1349,6 +1349,52 @@ await test("docMentions/findMissingRequestedDocs: a CHANGELOG mention absent fro
     await findMissingRequestedDocs(cwd, "requested-docs", "Please update CHANGELOG.", "No request text."),
     [],
   );
+});
+
+await test("readAssumedScenarios: full-lane spec block and fast-lane acceptance bullet; [] when none", async () => {
+  const cwd = await freshCwd();
+  const full = await scaffoldChange(cwd, "assumed-full");
+  await mkdir(join(full.dir, "specs", "cap"), { recursive: true });
+  await writeFile(
+    join(full.dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: empty sort is default order (assumed)\n\n- **WHEN** empty sort is requested\n- **THEN** the command exits 0\n\n#### Scenario: ordinary behavior\n\n- **WHEN** something else happens\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  assert.deepEqual(await readAssumedScenarios(cwd, "assumed-full"), ["empty sort is default order (assumed)"]);
+
+  const fast = await scaffoldChange(cwd, "assumed-fast");
+  await writeFile(
+    fast.proposal,
+    "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n\n## Acceptance\n\n- **WHEN** a sorted list is empty **THEN** the command exits 0 (assumed)\n- **WHEN** another input arrives **THEN** the command exits 0\n",
+    "utf8",
+  );
+  assert.deepEqual(await readAssumedScenarios(cwd, "assumed-fast"), [
+    "- **WHEN** a sorted list is empty **THEN** the command exits 0 (assumed)",
+  ]);
+
+  const none = await scaffoldChange(cwd, "assumed-none");
+  await mkdir(join(none.dir, "specs", "cap"), { recursive: true });
+  await writeFile(
+    join(none.dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: ordinary behavior\n\n- **WHEN** something happens\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  assert.deepEqual(await readAssumedScenarios(cwd, "assumed-none"), []);
+});
+
+await test("validateChange still passes on an older change with no (assumed) markers", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "assumed-legacy");
+  await mkdir(join(paths.dir, "specs", "cap"), { recursive: true });
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n", "utf8");
+  await writeFile(
+    join(paths.dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: ordinary behavior\n\n- **WHEN** something happens\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  assert.deepEqual(await readAssumedScenarios(cwd, "assumed-legacy"), []);
+  assert.equal((await validateChange(cwd, "assumed-legacy")).ok, true);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

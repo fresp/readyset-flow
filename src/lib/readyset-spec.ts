@@ -697,6 +697,35 @@ export async function readAssumptions(cwd: string, changeId: string): Promise<st
 	return body;
 }
 
+/** Scenarios (full lane, from specs/**\/spec.md) or fast-lane `## Acceptance` bullets whose text
+ *  carries an `(assumed)` marker. Used by the gate to show assumptions before approval. Returns
+ *  [] when nothing is marked. */
+export async function readAssumedScenarios(cwd: string, changeId: string): Promise<string[]> {
+	const lane = await readChangeLane(cwd, changeId);
+	if (lane === "fast") {
+		const raw = await readFile(changePaths(cwd, changeId).proposal, "utf8").catch(() => undefined);
+		if (raw === undefined) return [];
+		const acceptance = sectionBody(raw, "Acceptance");
+		if (!acceptance) return [];
+		return acceptance
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => /^[-*][ \t]+\*\*WHEN\*\*/i.test(line) && /\(assumed\)/i.test(line));
+	}
+	const specsDir = changePaths(cwd, changeId).specsDir;
+	const assumed: string[] = [];
+	for (const specFile of await findSpecFiles(specsDir)) {
+		const raw = await readFile(specFile, "utf8").catch(() => undefined);
+		if (raw === undefined) continue;
+		const blocks = raw.split(/^####[ \t]+Scenario:[ \t]*/m).slice(1);
+		for (const block of blocks) {
+			const firstLine = (block.split(/\r?\n/, 1)[0] ?? "").trim();
+			if (firstLine !== "" && /\(assumed\)/i.test(firstLine)) assumed.push(firstLine);
+		}
+	}
+	return assumed;
+}
+
 /** Doc files a change's request/brainstorm text mentions. Scans the given text for the doc
  *  vocabulary (README, CHANGELOG, "docs", "document", "release note", "migration guide",
  *  "deprecation") and returns the concrete doc path names found, lower-cased for comparison:

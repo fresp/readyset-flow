@@ -125,13 +125,16 @@ I actually looked at" attached does not belong in this file.
   blocks, each followed by one or more `#### Scenario: <name>` blocks written as:
   - `**WHEN** <trigger>`
   - `**THEN** <observable outcome>`
+  - Every behavior-changing assumption gets its own scenario marked `(assumed)`; the gate lists
+    each before approval.
 
 **`tasks.md`** — numbered sections, each task a `- [ ] N.M <description>` checkbox line. Each task
 maps to a scenario (a proposal `## Acceptance` id on the fast lane, a spec scenario on the full
-lane) rather than restating its WHEN/THEN text. A `## Scope deviations` section records any file
-changed outside the scope contract (`- <path> — <reason>`), and a `## Decisions made during Apply`
-section records each open decision applied at the recommended option
-(`- <decision> → <chosen option> → <why>`).
+lane) rather than restating its WHEN/THEN text. A task that pins an `(assumed)` scenario's behavior
+carries `(assumed)` in its description, and a test that pins one says so in its name or an adjacent
+comment. A `## Scope deviations` section records any file changed outside the scope contract
+(`- <path> — <reason>`), and a `## Decisions made during Apply` section records each open decision
+applied at the recommended option (`- <decision> → <chosen option> → <why>`).
 
 ### The `_Verified:` note
 

@@ -163,11 +163,13 @@ repeat until the design tree resolves.
 Grilling asks only questions whose answer changes the plan. Every `readyset_ask` question carries
 a `decision` field naming the plan decision it changes and how the plan differs per answer; a
 round with any question missing it is refused before the picker opens, and does not consume a
-round. A question whose answers would all lead to the same plan is not asked at all — the model
-decides it and records it under a **`## Assumed`** section of the brainstorm, so the assumption is
-reviewable rather than silently held. Grilling counts the *open decisions* (choices facts cannot
-settle that change scope, behavior, or interfaces) after one fact-finding pass and stops as soon
-as none remain, even in round 1 — the round cap is a ceiling, not a target.
+round. Before asking anything, grilling walks an edge-case checklist — empty/missing values, case
+sensitivity, boundaries, error codes/messages, backward compatibility/deprecation, docs/release
+artifacts, and how verification is committed — and asks about an item only when its answer changes
+the plan and the repo cannot settle it. Anything else is decided directly and recorded under
+`## Assumed` with the concrete behavior chosen. The fast lane applies the same checklist to its
+own grounding reads and records behavior-changing decisions under the brainstorm's `## Assumed`
+(or the proposal's `## Assumptions`).
 
 The driving prompt is adapted from mattpocock/skills' actual `grilling` skill, vendored verbatim
 (MIT-licensed) at `src/skill/mattpocock-grilling.md`. One of its rules — "finding facts is your
@@ -434,7 +436,11 @@ Picks a brainstorm, then depending on its status:
     `## Assumptions` and updates the affected scenarios. Approving with open decisions is still
     allowed — warn, never block — recorded as `openDecisions` on the `gate` `end` phase event, and
     any still open at approval are applied using the **recommended** option and recorded under
-    `## Decisions made during Apply` in `tasks.md`.
+    `## Decisions made during Apply` in `tasks.md`. Behavior-changing assumptions also get their own
+    WHEN/THEN scenarios marked `(assumed)`; the gate lists each as `assumed scenario: <text>` and
+    the review document shows them alongside the open decisions, while a task that pins one carries
+    `(assumed)` in its description and a test that pins one says so in its name or an adjacent
+    comment.
 - Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since

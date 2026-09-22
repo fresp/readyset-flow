@@ -79,6 +79,12 @@ by phase events, so the benchmark can tune them from real data.
   approval, recording each as `- <decision> → <chosen option> → <why>` under a `## Decisions made
   during Apply` section of `tasks.md`; the `open-decisions` review trigger fires when any remain,
   and the archive prompt states `blocking: N found, M fixed`.
+- **Assumptions surfaced from grilling through the gate and tests.** Grilling and the fast-lane
+  Propose turn walk an edge-case checklist and record behavior-changing decisions under
+  `## Assumed`/`## Assumptions`; every such assumption gets its own `(assumed)` WHEN/THEN scenario,
+  `readAssumedScenarios` parses them, and the gate lists each before approval. A task that pins one
+  carries `(assumed)` in its description, and a test that pins one says so in its name or an
+  adjacent comment.
 
 ### Changed
 
