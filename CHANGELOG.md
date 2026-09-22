@@ -6,6 +6,62 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## Unreleased
+
+Makes the post-Apply code-review turn risk-based instead of unconditional. The `v0.12` benchmark
+showed that turn is a large share of a run's cost, while review is what protects the test quality
+(91% judge win) and correctness (77%) that are Readyset's strengths — so review stays on risky
+changes and becomes skippable on low-risk ones. The default policy values below are **initial
+values pending benchmark data, not measured optima**; the review/apply split is already recorded
+by phase events, so the benchmark can tune them from real data.
+
+### Added
+
+- **`readyset.review.mode: auto | always | never`** (default `auto`) in
+  `~/.omp/agent/config.yml`, plus a `--review auto|always|never` flag (the flag wins over config
+  for that run). `always` keeps the pre-0.14 behavior of reviewing every run; `never` skips the
+  turn and writes a stub; `auto` runs the review only when at least one **trigger** fires.
+- **A trigger evaluator** (`src/lib/readyset-review-trigger.ts`) driving `auto`: unjustified
+  post-Execute scope drift; an evidence conflict (a checked task whose latest `readyset_verify`
+  record exited non-zero); zero evidence records with at least one task checked; a diff over the
+  size thresholds; a changed path matching a sensitive-path pattern; and `partial`/`ambiguous`
+  clarity. Any one trigger is enough to review. Every trigger is evaluated and recorded whether
+  or not it fires, so the audit trail states what was actually observed.
+- **`readyset.review.fullLane: always | auto`** (default `always`) — a full-lane change keeps its
+  review regardless of triggers unless this is set to `auto`. Never exempts the fast lane.
+- **`readyset.review.maxLines` (default 150), `readyset.review.maxFiles` (default 5), and
+  `readyset.review.sensitivePaths`** (a list; default covers `auth/**`, `security/**`,
+  `**/migrations/**`, `schema/**`, `payment/**`, `crypto/**`, `**/*.pem`, `**/*.key`,
+  `.github/**`, `Dockerfile`, `docker-compose*.yml`, and their nested forms) — the `diff-size` and
+  `sensitive-path` thresholds. The list is deliberately broad: a false-positive trigger costs
+  exactly one review turn.
+- **`--review <change-id>`** — runs exactly one code-review turn on demand for an existing,
+  not-yet-archived change (overwriting any skip stub), then offers archive as usual. The escape
+  hatch when `auto` skipped review but a review is wanted before opening a PR. It uses
+  `fireTurnAndWait`, not the run's turn budget, so it always fires exactly one turn.
+- **A dependency-free glob matcher** (`src/lib/readyset-glob.ts`) for the sensitive-path patterns,
+  supporting `*` (not across `/`), `**` (across `/`, with a leading `**/` matching zero
+  directories), and `?`.
+- **A `review` field on the `review` `end` phase event** carrying the resolved mode, every
+  trigger evaluated (name, fired, observed value), the fired trigger names, and the outcome
+  (`ran` / `skipped-no-trigger` / `skipped-flag` / `on-demand`). The existing string `outcome`
+  values are unchanged; this is a separate, nested field.
+
+### Changed
+
+- **The code-review prompt is diff-first.** It now names the run's changed paths up front and
+  instructs the turn to start from their diff, reading `proposal.md`, `design.md`,
+  `specs/**/spec.md`, and `tasks.md` for the scenarios and any *other* file only when the diff
+  needs context — rather than reading the repo. When triggers fired, the prompt names them and
+  asks the findings to focus there. The 0.12 WHEN/THEN-against-behavior rules, the 0.13.x scope
+  deviation judging, and the fast-lane proportionality note are unchanged.
+- **A skipped review writes an honest stub** to `REVIEW.md`
+  (`Review skipped (auto): no risk trigger`, or `Review skipped (never): readyset.review.mode =
+  never`, followed by every trigger and its observed value), and the archive prompt states the
+  skip plainly instead of claiming a review completed. The archive offer itself — its three
+  options and the archive phase events — is now one shared helper the main path and the on-demand
+  path both call, so they cannot drift.
+
 ## 0.14.0
 
 A scope-and-size pass on top of 0.13.0, still driven by the `v0.12` full-matrix benchmark. It

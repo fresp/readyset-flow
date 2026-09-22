@@ -15,6 +15,12 @@ import {
 	parseLaneDefault,
 	parseArtifactBudgets,
 	DEFAULT_ARTIFACT_BUDGETS,
+	DEFAULT_REVIEW_MAX_FILES,
+	DEFAULT_REVIEW_MAX_LINES,
+	DEFAULT_REVIEW_SENSITIVE_PATHS,
+	parseReviewFullLane,
+	parseReviewMode,
+	parseReviewThresholds,
 	readArtifactBudgets,
 	readCompactMinContextPercent,
 	readFallbackChain,
@@ -23,6 +29,9 @@ import {
 	readPhaseModels,
 	readPinnedModel,
 	readPreferredLanguage,
+	readReviewFullLane,
+	readReviewMode,
+	readReviewThresholds,
 } from "../src/lib/readyset-omp-config.ts";
 
 let pass = 0;
@@ -464,6 +473,117 @@ await test("readArtifactBudgets: missing file -> both lanes' defaults; one block
   assert.equal(read.fast.proposal, 2500, "the flat key overrides the fast lane too");
   assert.equal(read.full.proposal, 2500);
   assert.equal(read.fast.design, Infinity, "the fast lane's design budget stays Infinity");
+});
+
+await test("readReviewMode: absent key -> auto, no warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  lane:\n    default: ask\n", "utf8");
+  const parsed = await readReviewMode(configPath);
+  assert.equal(parsed.mode, "auto");
+  assert.equal(parsed.warning, undefined);
+
+  const missing = await readReviewMode(join(dir, "does-not-exist.yml"));
+  assert.equal(missing.mode, "auto");
+  assert.equal(missing.warning, undefined);
+});
+
+await test("readReviewMode: each valid mode is read, case-insensitively", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  for (const [raw, expected] of [["auto", "auto"], ["always", "always"], ["never", "never"], ["Always", "always"]] as const) {
+    await writeFile(configPath, `readyset:\n  review:\n    mode: ${raw}\n`, "utf8");
+    const parsed = await readReviewMode(configPath);
+    assert.equal(parsed.mode, expected, `mode "${raw}"`);
+    assert.equal(parsed.warning, undefined);
+  }
+});
+
+await test("readReviewMode: a present but invalid value -> auto plus a warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  review:\n    mode: sometimes\n", "utf8");
+  const parsed = await readReviewMode(configPath);
+  assert.equal(parsed.mode, "auto");
+  assert.match(parsed.warning ?? "", /isn't one of auto, always, never/);
+});
+
+await test("readReviewFullLane: absent -> always; each valid value; invalid -> always plus a warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+
+  const missing = await readReviewFullLane(join(dir, "does-not-exist.yml"));
+  assert.equal(missing.fullLane, "always");
+  assert.equal(missing.warning, undefined);
+
+  await writeFile(configPath, "readyset:\n  review:\n    mode: auto\n", "utf8");
+  const absent = await readReviewFullLane(configPath);
+  assert.equal(absent.fullLane, "always");
+  assert.equal(absent.warning, undefined);
+
+  for (const value of ["always", "auto"] as const) {
+    await writeFile(configPath, `readyset:\n  review:\n    fullLane: ${value}\n`, "utf8");
+    const parsed = await readReviewFullLane(configPath);
+    assert.equal(parsed.fullLane, value);
+    assert.equal(parsed.warning, undefined);
+  }
+
+  await writeFile(configPath, "readyset:\n  review:\n    fullLane: sometimes\n", "utf8");
+  const invalid = await readReviewFullLane(configPath);
+  assert.equal(invalid.fullLane, "always");
+  assert.match(invalid.warning ?? "", /isn't one of always, auto/);
+});
+
+await test("readReviewThresholds: missing file and absent keys -> all defaults, no warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const missing = await readReviewThresholds(join(dir, "does-not-exist.yml"));
+  assert.equal(missing.maxLines, DEFAULT_REVIEW_MAX_LINES);
+  assert.equal(missing.maxFiles, DEFAULT_REVIEW_MAX_FILES);
+  assert.deepEqual(missing.sensitivePaths, DEFAULT_REVIEW_SENSITIVE_PATHS);
+  assert.equal(missing.warning, undefined);
+
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  review:\n    mode: auto\n", "utf8");
+  const absent = await readReviewThresholds(configPath);
+  assert.equal(absent.maxLines, DEFAULT_REVIEW_MAX_LINES);
+  assert.equal(absent.maxFiles, DEFAULT_REVIEW_MAX_FILES);
+  assert.deepEqual(absent.sensitivePaths, DEFAULT_REVIEW_SENSITIVE_PATHS);
+  assert.equal(absent.warning, undefined);
+});
+
+await test("readReviewThresholds: a valid override replaces each threshold", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(
+    configPath,
+    "readyset:\n  review:\n    maxLines: 40\n    maxFiles: 2\n    sensitivePaths:\n      - auth/**\n      - \"**/keys/**\"\n",
+    "utf8",
+  );
+  const parsed = await readReviewThresholds(configPath);
+  assert.equal(parsed.maxLines, 40);
+  assert.equal(parsed.maxFiles, 2);
+  assert.deepEqual(parsed.sensitivePaths, ["auth/**", "**/keys/**"]);
+  assert.equal(parsed.warning, undefined);
+});
+
+await test("readReviewThresholds: a rejected maxLines warns and keeps the default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  for (const bad of ["abc", "0", "-5", "2.5", '""']) {
+    await writeFile(configPath, `readyset:\n  review:\n    maxLines: ${bad}\n`, "utf8");
+    const parsed = await readReviewThresholds(configPath);
+    assert.equal(parsed.maxLines, DEFAULT_REVIEW_MAX_LINES, `value "${bad}" must keep the default`);
+    assert.match(parsed.warning ?? "", /maxLines .* isn't a positive integer/, `value "${bad}" must warn`);
+  }
+});
+
+await test("readReviewThresholds: a present but non-array sensitivePaths warns and uses the defaults", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  review:\n    sensitivePaths: auth/**\n", "utf8");
+  const parsed = await readReviewThresholds(configPath);
+  assert.deepEqual(parsed.sensitivePaths, DEFAULT_REVIEW_SENSITIVE_PATHS);
+  assert.match(parsed.warning ?? "", /isn't a list/);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

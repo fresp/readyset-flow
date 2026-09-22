@@ -242,6 +242,155 @@ export async function readCompactMinContextPercent(configPath: string = OMP_CONF
 	return { percent: parsed.percent, warning: parsed.warning };
 }
 
+/** How the post-Apply code-review turn decides whether to run: `auto` = only when a risk
+ *  trigger fires (see `readyset-review-trigger.ts`), `always` = every run (the pre-0.14
+ *  behavior), `never` = no run at all (a stub is written in place of findings). */
+export type ReviewMode = "auto" | "always" | "never";
+export const DEFAULT_REVIEW_MODE: ReviewMode = "auto";
+
+/** Parses `readyset.review.mode` — one of `auto|always|never` (case-insensitive). Any other
+ *  value returns undefined so the caller warns and falls back to `auto`. */
+export function parseReviewMode(raw: string): ReviewMode | undefined {
+	const value = getPath(parseYamlSubset(raw), "readyset.review.mode");
+	if (typeof value !== "string") return undefined;
+	const v = value.trim().toLowerCase();
+	return v === "auto" || v === "always" || v === "never" ? v : undefined;
+}
+
+export interface ResolvedReviewMode { mode: ReviewMode; warning: string | undefined }
+
+/** Reads `readyset.review.mode` (or `configPath`). Never throws; missing file/key → auto. */
+export async function readReviewMode(configPath: string = OMP_CONFIG_PATH): Promise<ResolvedReviewMode> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { mode: DEFAULT_REVIEW_MODE, warning: undefined };
+	const parsed = parseReviewMode(raw);
+	if (parsed === undefined) {
+		const present = getPath(parseYamlSubset(raw), "readyset.review.mode");
+		if (present === undefined) return { mode: DEFAULT_REVIEW_MODE, warning: undefined };
+		const text = typeof present === "string" ? present.trim() : String(present);
+		return {
+			mode: DEFAULT_REVIEW_MODE,
+			warning: `readyset.review.mode ("${text}") isn't one of auto, always, never — using the default (auto).`,
+		};
+	}
+	return { mode: parsed, warning: undefined };
+}
+
+/** Whether `auto` reviews a full-lane change unconditionally: `always` (the default, so a full
+ *  lane keeps its review) or `auto` (the trigger list decides on full-lane changes too). Has no
+ *  effect when the mode is `always`/`never`, and never exempts a fast-lane change. */
+export type ReviewFullLane = "always" | "auto";
+export const DEFAULT_REVIEW_FULL_LANE: ReviewFullLane = "always";
+
+/** Parses `readyset.review.fullLane` — one of `always|auto` (case-insensitive). Any other value
+ *  returns undefined so the caller warns and falls back to `always`. */
+export function parseReviewFullLane(raw: string): ReviewFullLane | undefined {
+	const value = getPath(parseYamlSubset(raw), "readyset.review.fullLane");
+	if (typeof value !== "string") return undefined;
+	const v = value.trim().toLowerCase();
+	return v === "always" || v === "auto" ? v : undefined;
+}
+
+export interface ResolvedReviewFullLane { fullLane: ReviewFullLane; warning: string | undefined }
+
+/** Reads `readyset.review.fullLane` (or `configPath`). Never throws; missing file/key → always. */
+export async function readReviewFullLane(configPath: string = OMP_CONFIG_PATH): Promise<ResolvedReviewFullLane> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { fullLane: DEFAULT_REVIEW_FULL_LANE, warning: undefined };
+	const parsed = parseReviewFullLane(raw);
+	if (parsed === undefined) {
+		const present = getPath(parseYamlSubset(raw), "readyset.review.fullLane");
+		if (present === undefined) return { fullLane: DEFAULT_REVIEW_FULL_LANE, warning: undefined };
+		const text = typeof present === "string" ? present.trim() : String(present);
+		return {
+			fullLane: DEFAULT_REVIEW_FULL_LANE,
+			warning: `readyset.review.fullLane ("${text}") isn't one of always, auto — using the default (always).`,
+		};
+	}
+	return { fullLane: parsed, warning: undefined };
+}
+
+/** Default diff-size thresholds for `auto`'s `diff-size` trigger. */
+export const DEFAULT_REVIEW_MAX_LINES = 150;
+export const DEFAULT_REVIEW_MAX_FILES = 5;
+
+/** Default `auto` sensitive-path patterns. Deliberately broad: a false-positive trigger costs
+ *  exactly one review turn, while a missed risky change can ship unexamined. Matched against
+ *  repo-relative POSIX paths by the dependency-free matcher in `readyset-glob.ts`. */
+export const DEFAULT_REVIEW_SENSITIVE_PATHS: string[] = [
+	"auth/**", "**/auth/**",
+	"security/**", "**/security/**",
+	"**/migrations/**", "**/*migration*",
+	"schema/**", "**/schema/**",
+	"payment/**", "**/payment/**",
+	"crypto/**", "**/crypto/**",
+	"**/*.pem", "**/*.key",
+	".github/**", "Dockerfile", "**/Dockerfile", "docker-compose*.yml", "**/docker-compose*.yml",
+];
+
+export interface ParsedReviewThresholds {
+	maxLines: number;
+	maxFiles: number;
+	sensitivePaths: string[];
+	/** Colon-joined warnings for every key present but rejected; undefined when clean. */
+	warning: string | undefined;
+}
+
+/** The full default threshold set (no warning) — handy for tests and callers that never read a
+ *  file. */
+export const DEFAULT_REVIEW_THRESHOLDS = {
+	maxLines: DEFAULT_REVIEW_MAX_LINES,
+	maxFiles: DEFAULT_REVIEW_MAX_FILES,
+	sensitivePaths: DEFAULT_REVIEW_SENSITIVE_PATHS,
+};
+
+/** Parses `readyset.review.maxLines`/`maxFiles`/`sensitivePaths`. Each threshold accepts a
+ *  positive finite integer; anything else keeps its default and adds a warning. A present but
+ *  non-list `sensitivePaths` falls back to the default list with a warning; an absent key is
+ *  never a warning. */
+export function parseReviewThresholds(raw: string): ParsedReviewThresholds {
+	const doc = parseYamlSubset(raw);
+	const warnings: string[] = [];
+
+	const integer = (key: "maxLines" | "maxFiles", fallback: number): number => {
+		const value = getPath(doc, `readyset.review.${key}`);
+		if (value === undefined) return fallback;
+		const text = typeof value === "string" ? value.trim() : String(value);
+		const num = Number(text);
+		if (text === "" || !Number.isInteger(num) || !Number.isFinite(num) || num < 1) {
+			warnings.push(`readyset.review.${key} ("${text}") isn't a positive integer — using the default (${fallback}).`);
+			return fallback;
+		}
+		return num;
+	};
+
+	const maxLines = integer("maxLines", DEFAULT_REVIEW_MAX_LINES);
+	const maxFiles = integer("maxFiles", DEFAULT_REVIEW_MAX_FILES);
+
+	let sensitivePaths = DEFAULT_REVIEW_SENSITIVE_PATHS;
+	const rawPaths = getPath(doc, "readyset.review.sensitivePaths");
+	if (rawPaths !== undefined) {
+		if (Array.isArray(rawPaths)) {
+			const kept = rawPaths
+				.filter((v): v is string => typeof v === "string")
+				.map((v) => v.trim())
+				.filter((v) => v !== "");
+			if (kept.length > 0) sensitivePaths = kept;
+		} else {
+			warnings.push("readyset.review.sensitivePaths isn't a list — using the defaults.");
+		}
+	}
+
+	return { maxLines, maxFiles, sensitivePaths, warning: warnings.length > 0 ? warnings.join(" ") : undefined };
+}
+
+/** Reads the review thresholds (or `configPath`). Never throws; a missing file → all defaults. */
+export async function readReviewThresholds(configPath: string = OMP_CONFIG_PATH): Promise<ParsedReviewThresholds> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { ...DEFAULT_REVIEW_THRESHOLDS, warning: undefined };
+	return parseReviewThresholds(raw);
+}
+
 /** Per-artifact character budgets for one lane. Each value bounds the artifact's raw text
  *  length; `Infinity` means "no budget on this lane". `specs` is the TOTAL across every
  *  specs/**\/spec.md file, not a per-file cap. */

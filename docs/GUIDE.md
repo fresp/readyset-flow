@@ -452,6 +452,31 @@ Picks a brainstorm, then depending on its status:
   to find problems, not confirm the work) and writes `REVIEW.md`. Only then does Readyset offer to
   archive — merging delta specs into `readyset/specs/` append-only, now warning explicitly if a
   delta held a MODIFIED/REMOVED requirement the merge couldn't apply.
+  - **Risk-based code review.** The code-review turn is not unconditional: it is gated by
+    `readyset.review.mode` (default `auto`) and the `--review auto|always|never` flag (the flag
+    wins over config for that run). `always` keeps the pre-0.14 behavior — review every run;
+    `never` skips it and writes a stub; `auto` reviews only when at least one **trigger** fires:
+    (1) **scope drift** — a post-Execute path outside the contract with no deviation entry;
+    (2) **evidence conflict** — a checked `[x]` task whose latest `readyset_verify` record exited
+    non-zero; (3) **no evidence** — at least one task checked but the change has *zero*
+    `readyset_verify` records (one record anywhere is enough to satisfy this); (4) **diff size** —
+    more than `readyset.review.maxLines` (default 150) changed lines *or* more than
+    `readyset.review.maxFiles` (default 5) files; (5) **sensitive path** — any changed path
+    matching `readyset.review.sensitivePaths` (default list: `auth/**`, `**/auth/**`,
+    `security/**`, `**/security/**`, `**/migrations/**`, `**/*migration*`, `schema/**`,
+    `**/schema/**`, `payment/**`, `**/payment/**`, `crypto/**`, `**/crypto/**`, `**/*.pem`,
+    `**/*.key`, `.github/**`, `Dockerfile`, `**/Dockerfile`, `docker-compose*.yml`,
+    `**/docker-compose*.yml`); (6) **clarity** — the brainstorm's `clarity` is `partial` or
+    `ambiguous`. `readyset.review.fullLane` (default `always`) keeps a full-lane change reviewed
+    regardless of triggers; set it to `auto` to let the triggers decide on the full lane too.
+    - **Review policy.** Every trigger is recorded, fired or not, in the `review` `end` phase
+      event (and in the stub) so the mode/triggers/outcome are auditable. A skipped run writes an
+      honest stub — `Review skipped (auto): no risk trigger` with the full evaluated list — in
+      place of findings, so "nothing was checked" is distinguishable from "checked and clean."
+      `--review <change-id>` runs the review **on demand** for an existing, not-yet-archived
+      change (overwriting any stub), which is the escape hatch when `auto` skipped it but you want
+      a review before opening a PR. The default values here are **initial, pending benchmark
+      data — not measured optima**.
 
 ## Uninstall
 

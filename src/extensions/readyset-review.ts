@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionAskDialogQuestion, ExtensionAskDialogResult
 import {
 	BRAINSTORM_DIR,
 	type BrainstormMeta,
+	changeState,
 	isProposed,
 	type Lane,
 	loadBrainstorms,
@@ -12,7 +13,7 @@ import {
 	recommendLane,
 	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
@@ -36,6 +37,7 @@ import {
 	type PhaseName,
 	readDirtyBaseline,
 	readContext,
+	readPhaseEvents,
 	readChangeLane,
 	readArtifactSizes,
 	type ArtifactSizes,
@@ -51,6 +53,7 @@ import {
 import {
 	DEFAULT_ARTIFACT_BUDGETS,
 	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+	DEFAULT_REVIEW_THRESHOLDS,
 	type ArtifactBudgets,
 	type LaneDefault,
 	readArtifactBudgets,
@@ -60,7 +63,18 @@ import {
 	readPhaseModels,
 	readPinnedModel,
 	readPreferredLanguage,
+	readReviewFullLane,
+	readReviewMode,
+	readReviewThresholds,
+	type ParsedReviewThresholds,
+	type ReviewFullLane,
+	type ReviewMode,
 } from "../lib/readyset-omp-config.ts";
+import {
+	evaluateReviewTriggers,
+	type ReviewTriggerInput,
+	type ReviewTriggerResult,
+} from "../lib/readyset-review-trigger.ts";
 import {
 	ReviewSidebarOverlay,
 	type OverlaySection,
@@ -473,13 +487,28 @@ function compactBeforeProposeGuidance(changeId: string, brainstormFile: string, 
  * mitigation, not a claim of independence. Do not re-add "fresh context" wording here
  * without a mechanism that actually provides it.
  */
-function codeReviewTurnPrompt(changeId: string, lane: "full" | "fast" = "full", deviations: ScopeDeviation[] = []): string {
+function codeReviewTurnPrompt(
+	changeId: string,
+	lane: "full" | "fast" = "full",
+	deviations: ScopeDeviation[] = [],
+	triggerResult?: ReviewTriggerResult,
+	changedPaths: string[] = [],
+): string {
 	const paths = changePaths("", changeId);
+	const triggerLine = triggerResult && triggerResult.fired.length > 0
+		? `This review was triggered by: ${triggerResult.fired.join(", ")}. Focus your findings on these.\n\n`
+		: "";
 	return (
-		`Critically review the implementation of Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, ` +
-		`every specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} (including its _Verified: notes) — then read ` +
-		"the actual diff/files this change touched. You did not write this implementation; your job is to find problems " +
+		`Critically review the implementation of Readyset change "${changeId}". This review must start from the diff, not from the repo: ` +
+		(changedPaths.length > 0
+			? `the files this run changed are ${changedPaths.join(", ")}. `
+			: "read the diff of the files this run changed. ") +
+		`Then read ${paths.proposal}, ${paths.design}, every specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} ` +
+		"(including its _Verified: notes) for the scenarios those files are supposed to satisfy. Read any other file only " +
+		"when the diff needs context to be judged — do not read the whole repo. You did not write this implementation; " +
+		"your job is to find problems " +
 		"in it, not to confirm it's fine.\n\n" +
+		triggerLine +
 		"Write " +
 		paths.review +
 		" covering: (1) does the implementation actually match every requirement's WHEN/THEN scenarios, or does it narrow, " +
@@ -1949,6 +1978,63 @@ async function classicGateSelect(
 }
 
 /**
+ * Assembles the trigger input from the change's own on-disk state plus the values the caller
+ * already has in scope. One place, so the main path and `runOnDemandReview` cannot disagree
+ * about what "this run's diff/changed paths" means.
+ *
+ * `changedPaths` is passed in rather than re-derived: the caller already subtracted the dirty
+ * baseline (`pathsChangedThisRun`), and re-running it here could observe a different tree.
+ */
+async function buildReviewTriggerInput(
+	cwd: string,
+	changeId: string,
+	unjustifiedDriftPaths: string[],
+	changedPaths: string[],
+	clarity: ReviewTriggerInput["clarity"],
+	thresholds: ParsedReviewThresholds,
+): Promise<ReviewTriggerInput> {
+	const [conflicts, evidence, verification, progress, events] = await Promise.all([
+		findEvidenceConflicts(cwd, changeId),
+		checkTaskEvidence(cwd, changeId),
+		checkTaskVerification(cwd, changeId),
+		getProgress(cwd, changeId),
+		readPhaseEvents(cwd, changeId),
+	]);
+	// The Apply `end` event carries the run's diff stats. Take the LAST one with
+	// outcome "applied" so a send-back/re-apply cycle reports the final implementation.
+	const applyEnd = [...events].reverse().find((e) => e.phase === "apply" && e.edge === "end" && e.outcome === "applied" && e.diff !== undefined);
+	return {
+		unjustifiedDriftPaths,
+		evidenceConflicts: conflicts,
+		evidenceTotal: evidence.totalRecords,
+		verification,
+		checkedTasks: progress?.done ?? 0,
+		diff: applyEnd?.diff ?? { files: 0, added: 0, deleted: 0 },
+		changedPaths,
+		clarity,
+		thresholds,
+	};
+}
+
+/**
+ * Writes the honest skip stub in place of a review turn's findings: what policy decided this,
+ * and every trigger the evaluator looked at with its observed value. The point is that a reader
+ * of REVIEW.md can tell "nothing was checked" from "everything was checked and it was clean" —
+ * a missing file would read as the former.
+ */
+async function writeReviewSkipStub(cwd: string, changeId: string, result: ReviewTriggerResult, mode: string): Promise<void> {
+	const header = mode === "never"
+		? "Review skipped (never): readyset.review.mode = never"
+		: "Review skipped (auto): no risk trigger";
+	const lines = result.evaluated.map((e) => `- ${e.name}: ${e.value} — ${e.fired ? "fired" : "not fired"}`);
+	await writeFile(
+		changePaths(cwd, changeId).review,
+		`# Code review\n\n${header}\n\nMode: ${mode}\nTriggers evaluated:\n${lines.join("\n")}\n`,
+		"utf8",
+	);
+}
+
+/**
  * The fused review+refine loop. Runs after propose-equivalent artifacts exist for `chosen`.
  * Loops on "Refine" until the user picks Approve or Discard, so refinement doesn't require
  * re-invoking the command either.
@@ -1976,6 +2062,9 @@ async function reviewAndMaybeExecute(
 	compactMode: "auto" | "always" | "never" = "auto",
 	minContextPercent: number = DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
 	artifactBudgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full,
+	reviewMode: ReviewMode = "auto",
+	reviewFullLane: ReviewFullLane = "always",
+	reviewThresholds: ParsedReviewThresholds = { ...DEFAULT_REVIEW_THRESHOLDS, warning: undefined },
 ): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
@@ -1988,7 +2077,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"] } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"] } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -2233,105 +2322,287 @@ async function reviewAndMaybeExecute(
 
 		const finalStatus = await getProgress(ctx.cwd, chosen.changeId);
 		ctx.ui.notify(
-			`Implementation complete: ${finalStatus?.done ?? "?"}/${finalStatus?.total ?? "?"} tasks. Running code review...`,
+			`Implementation complete: ${finalStatus?.done ?? "?"}/${finalStatus?.total ?? "?"} tasks.`,
 			"info",
 		);
+
+		// Risk-based review policy (readyset.review.mode). `auto` evaluates the triggers below
+		// and reviews only when one fires; `always` keeps the pre-0.14 unconditional turn;
+		// `never` skips it outright. Triggers are evaluated even when `fullLane: always` makes
+		// them moot, so the recorded audit trail says what was actually observed.
 		let reviewContent: string | undefined;
 		let reviewOutcome = "aborted";
-		await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
-		try {
-			const deviationsForReview = await readScopeDeviations(ctx.cwd, chosen.changeId);
-			const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-				spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane, deviationsForReview)),
+		let triggerResult: ReviewTriggerResult | undefined;
+		let skipReason: "skipped-flag" | "skipped-no-trigger" | undefined;
+		const fullLaneExempt = reviewMode === "auto" && reviewLane === "full" && reviewFullLane === "always";
+		if (reviewMode === "never") {
+			skipReason = "skipped-flag";
+		} else if (reviewMode === "auto") {
+			triggerResult = evaluateReviewTriggers(
+				await buildReviewTriggerInput(
+					ctx.cwd, chosen.changeId, archiveDriftPaths, changedThisRun, chosen.clarity, reviewThresholds,
+				),
 			);
-			if (!reviewFired) return;
-			reviewContent = await readReview(ctx.cwd, chosen.changeId);
-			reviewOutcome = reviewContent ? "review-written" : "no-review";
-			await appendContext(
-				ctx.cwd,
-				chosen.changeId,
-				"Code review",
-				reviewContent ? "REVIEW.md written — see file for findings." : "Code review turn ran but REVIEW.md is empty or missing.",
+			if (!fullLaneExempt && triggerResult.fired.length === 0) skipReason = "skipped-no-trigger";
+		}
+
+		if (skipReason) {
+			await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
+			await writeReviewSkipStub(ctx.cwd, chosen.changeId, triggerResult ?? { evaluated: [], fired: [], firedSensitivePaths: [] }, reviewMode);
+			reviewOutcome = skipReason;
+			await appendContext(ctx.cwd, chosen.changeId, "Code review", `Skipped by readyset.review.mode — ${skipReason}.`);
+			await recordPhase(chosen.changeId, "review", "end", {
+				model: phaseModels.get("review")?.model,
+				outcome: reviewOutcome,
+				review: {
+					mode: reviewMode,
+					triggersEvaluated: triggerResult?.evaluated ?? [],
+					triggersFired: [],
+					outcome: skipReason,
+				},
+			});
+			ctx.ui.notify(
+				reviewMode === "never"
+					? `Code review skipped (never): readyset.review.mode = never.`
+					: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`,
+				"info",
 			);
-		} finally {
-			await recordPhase(chosen.changeId, "review", "end", { model: phaseModels.get("review")?.model, outcome: reviewOutcome });
+		} else {
+			ctx.ui.notify(`Running code review for "${chosen.changeId}"...`, "info");
+			await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
+			try {
+				const deviationsForReview = await readScopeDeviations(ctx.cwd, chosen.changeId);
+				const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
+					spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane, deviationsForReview, triggerResult, changedThisRun)),
+				);
+				if (!reviewFired) return;
+				reviewContent = await readReview(ctx.cwd, chosen.changeId);
+				reviewOutcome = reviewContent ? "review-written" : "no-review";
+				await appendContext(
+					ctx.cwd,
+					chosen.changeId,
+					"Code review",
+					reviewContent ? "REVIEW.md written — see file for findings." : "Code review turn ran but REVIEW.md is empty or missing.",
+				);
+			} finally {
+				await recordPhase(chosen.changeId, "review", "end", {
+					model: phaseModels.get("review")?.model,
+					outcome: reviewOutcome,
+					review: {
+						mode: reviewMode,
+						triggersEvaluated: triggerResult?.evaluated ?? [],
+						triggersFired: triggerResult?.fired ?? [],
+						outcome: "ran",
+					},
+				});
+			}
 		}
 
 		if (reviewContent) {
 			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
 		}
 
-		const driftLine = archiveDriftPaths.length > 0
-			? `Apply touched ${archiveDriftPaths.length} file(s) outside the contract (${archiveDriftPaths.join(", ")}). `
-			: "";
-		const archiveChoice = await ctx.ui.select(
-			`${driftLine}Code review done for "${chosen.changeId}"${reviewContent ? " — see readyset/changes/" + chosen.changeId + "/REVIEW.md" : ""}. Archive now?`,
-			[
-				{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
-				{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
-				{ label: "Not yet", description: "leave it in readyset/changes/ for now" },
-			],
-		);
-		if (archiveChoice === "Archive now") {
-			await recordPhase(chosen.changeId, "archive", "start");
-			try {
-				// The fast lane carries no spec delta. Record that in CONTEXT.md *before*
-				// archiveChange runs — the rename moves the change dir, so the append must land
-				// while the live path still exists (same ordering as the pre-archive phase events).
-				const archiveLane = await readChangeLane(ctx.cwd, chosen.changeId);
-				if (archiveLane === "fast") {
-					await appendContext(ctx.cwd, chosen.changeId, "Archive", "Fast lane: no spec delta to merge (skipped by design).");
-				}
-				const result = await archiveChange(ctx.cwd, chosen.changeId);
-				if (result.specsMergeSkipped) {
-					// Fast lane: nothing was merged *by design*, not because something failed. The
-					// usual baseNotice warning path reads as if a merge went wrong, so it is skipped.
-					ctx.ui.notify(
-						`Archived to ${result.archivedDir}. Fast lane: this change carried no spec delta, so nothing was merged into readyset/specs/.`,
-						"info",
-					);
-				} else {
-					const baseNotice =
-						`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
-						"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
-					if (result.unappliedModifications.length === 0) {
-						ctx.ui.notify(baseNotice, "info");
-					} else {
-						// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
-						// the old requirement text is still sitting in the canonical spec, untouched, right next to the
-						// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
-						// than the same generic notice an ADDED-only archive gets.
-						const items = result.unappliedModifications
-							.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
-							.join("\n");
-						ctx.ui.notify(
-							`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
-								"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
-								"old text is still there. Manual cleanup needed:\n" +
-								items,
-							"warning",
-						);
-					}
-				}
-				// archiveChange renamed the change dir to changes/archive/<date>-<id>/, so the
-				// archive `end` event must target that location — writing to the live id would
-				// find no CONTEXT.md (the move already happened). READYSET_ROOT is "readyset".
-				const archivedChangeId = result.archivedDir.slice(join(ctx.cwd, "readyset", "changes").length + 1);
-				await recordPhase(archivedChangeId, "archive", "end", { outcome: "archived" });
-			} catch (err) {
-				// Close the archive boundary before rethrowing: the caller must still see the
-				// original error, but the phase log should record that archive did not complete.
-				await recordPhase(chosen.changeId, "archive", "end", { outcome: "error" });
-				throw err;
-			}
-		} else {
-			// Every non-archive path still closes the boundary, so the compile step sees a single
-			// `end` per archive window. `archiveChoice` is falsy on Esc/dismissed.
-			await recordPhase(chosen.changeId, "archive", "end", { outcome: archiveChoice || "dismissed" });
-		}
+		await offerArchive(ctx, chosen, reviewContent, archiveDriftPaths, recordPhase, skipReason);
 		return;
 	}
 }
+
+/**
+ * The archive offer shared by the main path and `runOnDemandReview` — one implementation, so a
+ * skipped review and an on-demand one cannot drift on wording, options, or the archive
+ * start/end phase events. `skipReason` selects the leading sentence; the drift prefix and the
+ * three options are identical either way.
+ */
+async function offerArchive(
+	ctx: ReviewCtx,
+	chosen: BrainstormMeta,
+	reviewContent: string | undefined,
+	archiveDriftPaths: string[],
+	recordPhase: (
+		changeId: string,
+		phase: PhaseName,
+		edge: "start" | "end",
+		extra?: { outcome?: string },
+	) => Promise<void>,
+	skipReason: "skipped-flag" | "skipped-no-trigger" | undefined,
+): Promise<void> {
+	const driftLine = archiveDriftPaths.length > 0
+		? `Apply touched ${archiveDriftPaths.length} file(s) outside the contract (${archiveDriftPaths.join(", ")}). `
+		: "";
+	const reviewLine = reviewContent
+		? `Code review done for "${chosen.changeId}" — see ${changePaths(ctx.cwd, chosen.changeId).review}.`
+		: skipReason === "skipped-flag"
+			? `Code review skipped (never): readyset.review.mode = never.`
+			: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
+	const archiveChoice = await ctx.ui.select(
+		`${driftLine}${reviewLine} Archive now?`,
+		[
+			{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
+			{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
+			{ label: "Not yet", description: "leave it in readyset/changes/ for now" },
+		],
+	);
+
+	if (archiveChoice !== "Archive now") {
+		// Every non-archive path still closes the boundary, so the compile step sees a single
+		// `end` per archive window. `archiveChoice` is falsy on Esc/dismissed.
+		await recordPhase(chosen.changeId, "archive", "end", { outcome: archiveChoice || "dismissed" });
+		return;
+	}
+
+	await recordPhase(chosen.changeId, "archive", "start");
+	try {
+		// The fast lane carries no spec delta. Record that in CONTEXT.md *before*
+		// archiveChange runs — the rename moves the change dir, so the append must land
+		// while the live path still exists (same ordering as the pre-archive phase events).
+		const archiveLane = await readChangeLane(ctx.cwd, chosen.changeId);
+		if (archiveLane === "fast") {
+			await appendContext(ctx.cwd, chosen.changeId, "Archive", "Fast lane: no spec delta to merge (skipped by design).");
+		}
+		const result = await archiveChange(ctx.cwd, chosen.changeId);
+		if (result.specsMergeSkipped) {
+			// Fast lane: nothing was merged *by design*, not because something failed. The
+			// usual baseNotice warning path reads as if a merge went wrong, so it is skipped.
+			ctx.ui.notify(
+				`Archived to ${result.archivedDir}. Fast lane: this change carried no spec delta, so nothing was merged into readyset/specs/.`,
+				"info",
+			);
+		} else {
+			const baseNotice =
+				`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
+				"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
+			if (result.unappliedModifications.length === 0) {
+				ctx.ui.notify(baseNotice, "info");
+			} else {
+				// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
+				// the old requirement text is still sitting in the canonical spec, untouched, right next to the
+				// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
+				// than the same generic notice an ADDED-only archive gets.
+				const items = result.unappliedModifications
+					.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
+					.join("\n");
+				ctx.ui.notify(
+					`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
+						"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
+						"old text is still there. Manual cleanup needed:\n" +
+						items,
+					"warning",
+				);
+			}
+		}
+		// archiveChange renamed the change dir to changes/archive/<date>-<id>/, so the
+		// archive `end` event must target that location — writing to the live id would
+		// find no CONTEXT.md (the move already happened). READYSET_ROOT is "readyset".
+		const archivedChangeId = result.archivedDir.slice(join(ctx.cwd, "readyset", "changes").length + 1);
+		await recordPhase(archivedChangeId, "archive", "end", { outcome: "archived" });
+	} catch (err) {
+		// Close the archive boundary before rethrowing: the caller must still see the
+		// original error, but the phase log should record that archive did not complete.
+		await recordPhase(chosen.changeId, "archive", "end", { outcome: "error" });
+		throw err;
+	}
+}
+
+
+/**
+ * `/readyset --review <change-id>`: fire exactly one code-review turn for an existing,
+ * not-yet-archived change and then offer archive as usual. Used when `auto` skipped review but
+ * the user wants it before opening a PR. Overwrites any REVIEW.md stub.
+ *
+ * Uses `fireTurnAndWait` rather than `spendTurn`: on-demand review has no run budget of its own,
+ * and it must always fire exactly one turn — a budget check here could silently fire none.
+ */
+async function runOnDemandReview(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	changeId: string,
+	phaseModels: Map<string, { model: string; source: string }>,
+	mode: ReviewMode,
+	thresholds: ParsedReviewThresholds,
+): Promise<void> {
+	const state = await changeState(ctx.cwd, changeId);
+	if (state === "archived") {
+		ctx.ui.notify(
+			`Change "${changeId}" is already archived — review runs only on a not-yet-archived change. ` +
+				"Run /readyset on a new brainstorm for follow-up work.",
+			"error",
+		);
+		return;
+	}
+	if (state === "none") {
+		ctx.ui.notify(
+			`No active change "${changeId}" found under readyset/changes/ — check the id (it is the change directory name, not the brainstorm title).`,
+			"error",
+		);
+		return;
+	}
+
+	const lane = (await readChangeLane(ctx.cwd, changeId)) ?? "full";
+	const recordPhase = async (
+		id: string,
+		phase: PhaseName,
+		edge: "start" | "end",
+		extra: { model?: string; outcome?: string; review?: PhaseEvent["review"] } = {},
+	): Promise<void> => {
+		await appendPhaseEvent(ctx.cwd, id, { phase, edge, at: new Date().toISOString(), lane, laneSource: "brainstorm", ...extra }).catch(() => {});
+	};
+
+	const changedPaths = await pathsChangedThisRun(ctx.cwd, changeId);
+	const scope = await checkScope(ctx.cwd, changeId, changedPaths);
+	const justified = new Set((await readScopeDeviations(ctx.cwd, changeId)).map((d) => d.path));
+	const driftPaths = (scope.noContract ? [] : scope.outside).filter((p) => !justified.has(p));
+	const brainstorm = await loadBrainstorms(ctx.cwd).then((all) => all.find((b) => b.changeId === changeId));
+	const triggerResult = evaluateReviewTriggers(
+		await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds),
+	);
+
+	let reviewContent: string | undefined;
+	let reviewOutcome = "aborted";
+	await recordPhase(changeId, "review", "start", { model: phaseModels.get("review")?.model });
+	try {
+		const deviationsForReview = await readScopeDeviations(ctx.cwd, changeId);
+		await withPhaseModel(pi, ctx, "review", phaseModels, () =>
+			fireTurnAndWait(pi, ctx, codeReviewTurnPrompt(changeId, lane, deviationsForReview, triggerResult, changedPaths)),
+		);
+		reviewContent = await readReview(ctx.cwd, changeId);
+		reviewOutcome = reviewContent ? "review-written" : "no-review";
+		await appendContext(
+			ctx.cwd,
+			changeId,
+			"Code review",
+			reviewContent ? "On-demand review — REVIEW.md written." : "On-demand review turn ran but REVIEW.md is empty or missing.",
+		);
+	} finally {
+		await recordPhase(changeId, "review", "end", {
+			model: phaseModels.get("review")?.model,
+			outcome: reviewOutcome,
+			review: {
+				mode,
+				triggersEvaluated: triggerResult.evaluated,
+				triggersFired: triggerResult.fired,
+				outcome: "on-demand",
+			},
+		});
+	}
+
+	if (reviewContent) {
+		ctx.ui.setWidget?.("readyset", [`Change: ${changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
+	}
+	ctx.ui.notify(`Code review for "${changeId}" done — see ${changePaths(ctx.cwd, changeId).review}.`, "info");
+
+	// offerArchive needs a BrainstormMeta; an on-demand target may have no matching brainstorm
+	// (a change recorded outside the brainstorm flow), so fall back to a minimal shape carrying
+	// only what the archive path actually reads: the change id.
+	await offerArchive(
+		ctx,
+		brainstorm ?? ({ changeId } as BrainstormMeta),
+		reviewContent,
+		driftPaths,
+		recordPhase,
+		undefined,
+	);
+}
+
 
 /**
  * Shape of `readyset_ask`'s params. Declared explicitly and cast to inside `execute()` because
@@ -2675,6 +2946,12 @@ export interface ReadysetArgs {
 	lane?: string;
 	/** `--compact auto|always|never` — when to compact at a phase boundary. Defaults to "auto". */
 	compact?: "auto" | "always" | "never";
+	/** `--review auto|always|never`: force the code-review policy for this run. Wins over
+	 *  `readyset.review.mode`. */
+	review?: ReviewMode;
+	/** `--review <change-id>`: anything else after `--review` is an on-demand review target —
+	 *  run exactly one review turn for that existing change and then offer archive as usual. */
+	reviewTarget?: string;
 	lang?: string;
 	model?: string;
 	fallbackModel?: string;
@@ -2752,6 +3029,20 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 				parsed.compact = value;
 				i++;
 			}
+		} else if (token === "--review") {
+			// `--review auto|always|never` sets the policy for this run; any OTHER non-empty
+			// value is an on-demand target (a change id). A bare `--review` (no value) leaves
+			// both unset and the handler warns -- same "unset is distinguishable from bad"
+			// pattern as --lane/--compact.
+			const value = (tokens[i + 1] ?? "").trim();
+			const mode = value.toLowerCase();
+			if (mode === "auto" || mode === "always" || mode === "never") {
+				parsed.review = mode;
+				i++;
+			} else if (value !== "") {
+				parsed.reviewTarget = value;
+				i++;
+			}
 		} else if (token === "--lang") parsed.lang = tokens[i + 1];
 		else if (token === "--model") parsed.model = tokens[i + 1];
 		else if (token === "--fallback-model") parsed.fallbackModel = tokens[i + 1];
@@ -2785,7 +3076,8 @@ export default function (pi: ExtensionAPI) {
 			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --lang <language> to open " +
 			"grilling's discussion in that language from round 1 (must come before --idea), --model <spec> to pin a model " +
 			"for this run's turns, --fallback-model <spec> if the pin fails to apply, " +
-			"--lane <fast|full> to force the lane for the run (note: --fast only filters the picker; it does not force a lane))",
+			"--lane <fast|full> to force the lane for the run (note: --fast only filters the picker; it does not force a lane), " +
+			"--review auto|always|never|<change-id> to control (or re-run) the code-review turn)",
 		handler: async (args, ctx) => {
 			// `args` is the raw string omp hands a registered command (see parseReadysetArgs).
 			const parsedArgs = parseReadysetArgs(args);
@@ -2795,6 +3087,46 @@ export default function (pi: ExtensionAPI) {
 			// Standalone: bootstrap readyset/{changes,specs} ourselves if missing — there is no
 			// separate init step or CLI to run first.
 			await ensureReadysetRoot(ctx.cwd);
+
+			// Risk-based code-review policy, resolved once for the run. `--review
+			// auto|always|never` (flag) wins over readyset.review.mode (config); the trigger
+			// thresholds and the full-lane exemption come from config only. Read here, before
+			// the picker, so the on-demand `--review <change-id>` path below can use them too.
+			const resolvedReviewMode = await readReviewMode();
+			if (resolvedReviewMode.warning) ctx.ui.notify(resolvedReviewMode.warning, "warning");
+			const resolvedReviewFullLane = await readReviewFullLane();
+			if (resolvedReviewFullLane.warning) ctx.ui.notify(resolvedReviewFullLane.warning, "warning");
+			const reviewThresholds = await readReviewThresholds();
+			if (reviewThresholds.warning) ctx.ui.notify(reviewThresholds.warning, "warning");
+			const effectiveReviewMode: ReviewMode = parsedArgs.review ?? resolvedReviewMode.mode;
+			const reviewFullLane: ReviewFullLane = resolvedReviewFullLane.fullLane;
+			if (parsedArgs.review === undefined && /(^|\s)--review(\s|$)/.test(args)) {
+				ctx.ui.notify(
+					"Ignoring --review with no mode or change id — expected auto, always, never, or a change id.",
+					"warning",
+				);
+			}
+
+			// `--review <change-id>`: on-demand, exactly one code-review turn for an existing
+			// change, then the usual archive offer. Used when `auto` skipped review but the user
+			// wants it before opening a PR. Handled before the brainstorm picker so it never
+			// needs one.
+			if (parsedArgs.reviewTarget !== undefined) {
+				const reviewCtxForTarget = ctx as unknown as ReviewCtx;
+				const resolvedPhaseModels = new Map<string, { model: string; source: string }>();
+				for (const e of (await readPhaseModels()).entries) {
+					if (!resolvedPhaseModels.has(e.phase)) resolvedPhaseModels.set(e.phase, { model: e.model, source: e.source });
+				}
+				await runOnDemandReview(
+					pi,
+					reviewCtxForTarget,
+					parsedArgs.reviewTarget,
+					resolvedPhaseModels,
+					effectiveReviewMode,
+					reviewThresholds,
+				);
+				return;
+			}
 
 			// --lane fast|full forces the lane for this run, bypassing the brainstorm's recorded
 			// lane. It is the operator's explicit answer to the same question grilling asks at
@@ -3026,7 +3358,7 @@ export default function (pi: ExtensionAPI) {
 				edge: "start" | "end",
 				lane: "fast" | "full",
 				laneSource: PhaseEvent["laneSource"],
-				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"]; artifactChars?: PhaseEvent["artifactChars"] } = {},
+				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"] } = {},
 			): Promise<void> => {
 				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
 			};
@@ -3044,7 +3376,7 @@ export default function (pi: ExtensionAPI) {
 					// Defensive: a change that predates the baseline mechanism has no capture
 					// yet. This never overwrites an existing baseline (first capture wins).
 					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds);
 					return;
 				}
 
@@ -3300,7 +3632,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds);
 		});
 		},
 	});

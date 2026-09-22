@@ -327,6 +327,16 @@ export interface PhaseEvent {
 		laneReason?: string;
 		riskFlag?: RiskFlag;
 	};
+	/** `review` `end` only: how the risk-based review policy resolved for this run. */
+	review?: {
+		mode: "auto" | "always" | "never";
+		/** One entry per trigger evaluated, in evaluateReviewTriggers' fixed order. Empty when the
+		 *  mode was never/always (triggers were not evaluated). */
+		triggersEvaluated: { name: string; fired: boolean; value: string }[];
+		/** Names of the triggers that fired (subset of `triggersEvaluated`). */
+		triggersFired: string[];
+		outcome: "ran" | "skipped-no-trigger" | "skipped-flag" | "on-demand";
+	};
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */

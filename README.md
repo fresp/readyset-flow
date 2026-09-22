@@ -59,7 +59,9 @@ Plans drift from the repo, reviews get skipped under pressure, and "done" ends u
 model said so." Readyset turns each of those into a structural gate instead of a habit:
 ambiguity gets interrogated before anything is written, every claim about the repo is grounded in
 a dedicated explore phase, nothing executes without an explicit human approve, and "done" needs
-verification, not just a claim.
+verification, not just a claim. The code-review turn is risk-based: it runs automatically on
+risky changes and is skipped, with an honest stub, when nothing raises a flag (`--review always`
+forces it, `--review <id>` runs it on demand).
 
 ## Learn more
 
