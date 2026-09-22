@@ -72,25 +72,36 @@ one-line summary of each.
 
 ## File formats
 
+**Which artifacts exist depends on the lane**, recorded as the first line of `proposal.md`'s
+frontmatter (`lane: full` or `lane: fast`; a missing line reads as `full`). The **full lane**
+writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`. The **fast lane** writes
+`proposal.md` and `tasks.md` only — no `design.md`, no spec delta — and puts its acceptance
+scenarios under a `## Acceptance` section in `proposal.md` instead (each bullet
+`- **WHEN** … **THEN** …`, with a `[S1]`, `[S2]`, … id in document order that `tasks.md` references
+rather than restating).
+
 **`EXPLORATION.md`** — a findings log. One entry per thing checked: what was checked (exact
 file path / command / commit), what was found (the actual value/output). No fixed section
 headers required, but every entry needs a checked-vs-found pair — a claim with no "here's what
 I actually looked at" attached does not belong in this file.
 
 **`proposal.md`**
+- `lane:` frontmatter line (`full` or `fast`) — the on-disk source of truth for the lane.
 - `## Why` — 1-2 paragraphs on the problem.
 - `## What Changes` — bullet list of concrete changes.
 - `## Files This Change Will Touch` — exhaustive repo-relative list. This is the **scope
   contract**: the review gate checks the working tree against it and flags anything changed that
   isn't named. Omitting the section means "no contract", never "everything allowed".
+- `## Acceptance` — **fast lane only**; the spec delta's replacement. One `- **WHEN** … **THEN** …`
+  bullet per scenario, each with a `[S1]`, `[S2]`, … id.
 
-**`design.md`**
+**`design.md`** — **full lane only**
 - `## Context`
 - `## Goals / Non-Goals`
 - `## Decisions` — numbered, each with Rationale and Alternatives considered.
 - `## Risks / Trade-offs`
 
-**`specs/<capability-slug>/spec.md`**
+**`specs/<capability-slug>/spec.md`** — **full lane only**
 - `## Purpose`
 - `## ADDED Requirements` (or `MODIFIED`/`REMOVED` when changing existing behavior already
   covered by an existing spec under `readyset/specs/`) — one or more `### Requirement: <name>`
@@ -98,7 +109,9 @@ I actually looked at" attached does not belong in this file.
   - `**WHEN** <trigger>`
   - `**THEN** <observable outcome>`
 
-**`tasks.md`** — numbered sections, each task a `- [ ] N.M <description>` checkbox line.
+**`tasks.md`** — numbered sections, each task a `- [ ] N.M <description>` checkbox line. Each task
+maps to a scenario (a proposal `## Acceptance` id on the fast lane, a spec scenario on the full
+lane) rather than restating its WHEN/THEN text.
 
 ### The `_Verified:` note
 

@@ -19,6 +19,7 @@
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
+import { parseFrontmatter } from "./readyset-brainstorm.ts";
 import type { Clarity, Lane, RiskFlag } from "./readyset-brainstorm.ts";
 
 export const READYSET_ROOT = "readyset";
@@ -292,7 +293,7 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
 /** The phases a Readyset run records boundaries for. */
 export type PhaseName =
 	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"
-	| "contract-repair" | "scope-reconcile" | "compact";
+	| "contract-repair" | "scope-reconcile" | "trim" | "compact";
 
 /** One boundary event in the machine-parseable phase log. */
 export interface PhaseEvent {
@@ -311,6 +312,12 @@ export interface PhaseEvent {
 	boundary?: "explore" | "propose" | "apply";
 	/** `compact` only: context usage before/after when the host reported it. */
 	context?: { beforePercent?: number; afterPercent?: number };
+	/** `propose`/`trim` only: per-artifact character counts, for the bench's planning-size
+	 *  report. `lane` on this same event already carries the lane, so the bench can split
+	 *  planning size by lane. On `propose`, `before` and `after` are the same measurement
+	 *  (the Propose turn's output) — a trim turn, which has its own event, is the only thing
+	 *  that changes them afterward. */
+	artifactChars?: { before: ArtifactSizes; after: ArtifactSizes };
 	/** `grill` `end` only: the grilling signal behind this run's lane. */
 	grill?: {
 		clarity: Clarity;
@@ -425,6 +432,26 @@ export interface ScopeContract {
 	deleteFiles: string[];
 	/** Raw section body, for display in the gate. */
 	raw: string | undefined;
+}
+
+/** The frontmatter key that records the lane on disk, in proposal.md. */
+export const PROPOSAL_FRONTMATTER_LANE_KEY = "lane";
+
+/** The lane a change runs on. Recorded on disk in proposal.md's frontmatter (see
+ *  `readChangeLane`), so validate/archive/review can read it with no run context and no phase
+ *  log — the standalone `readyset-flow validate` CLI included. */
+export type ChangeLane = "fast" | "full";
+
+/** Reads the lane from proposal.md's flat frontmatter (`lane: fast|full`). Returns "full"
+ *  when proposal.md is missing/unreadable or the line is absent or unrecognized — the
+ *  full-lane requirements are the safe default (validate asks for more, never less). */
+export async function readChangeLane(cwd: string, changeId: string): Promise<ChangeLane> {
+	const paths = changePaths(cwd, changeId);
+	const raw = await readFile(paths.proposal, "utf8").catch(() => undefined);
+	if (raw === undefined) return "full";
+	const { meta } = parseFrontmatter(raw);
+	const value = (meta[PROPOSAL_FRONTMATTER_LANE_KEY] ?? "").trim().toLowerCase();
+	return value === "fast" ? "fast" : "full";
 }
 
 /** Result of parsing one line of a `## Files This Change Will Touch` body. */
@@ -773,9 +800,54 @@ function hasObservableThen(body: string): boolean {
 	return false;
 }
 
+/** Character counts per artifact for one change: proposal.md and tasks.md by their raw
+ *  text length, specs by the SUM of every specs/**\/spec.md. An absent file has no key
+ *  (proposal/design/tasks) or contributes 0 (specs). */
+export interface ArtifactSizes { proposal?: number; design?: number; specs: number; tasks?: number }
+
+/** Measures this change's artifact sizes. Pure fs work (no LLM turn); used by the Propose
+ *  prompt's budgets, the gate's overrun line, and the bounded Trim turn's before/after report. */
+export async function readArtifactSizes(cwd: string, changeId: string): Promise<ArtifactSizes> {
+	const paths = changePaths(cwd, changeId);
+	const [proposalRaw, designRaw, tasksRaw] = await Promise.all([
+		readFile(paths.proposal, "utf8").catch(() => undefined),
+		readFile(paths.design, "utf8").catch(() => undefined),
+		readFile(paths.tasks, "utf8").catch(() => undefined),
+	]);
+	let specs = 0;
+	for (const specFile of await findSpecFiles(paths.specsDir)) {
+		const raw = await readFile(specFile, "utf8").catch(() => undefined);
+		if (raw !== undefined) specs += raw.length;
+	}
+	const sizes: ArtifactSizes = { specs };
+	if (proposalRaw !== undefined) sizes.proposal = proposalRaw.length;
+	if (designRaw !== undefined) sizes.design = designRaw.length;
+	if (tasksRaw !== undefined) sizes.tasks = tasksRaw.length;
+	return sizes;
+}
+
+/**
+ * Extracts the body of a `## <heading>` (or `###`) section: from just after the heading line up
+ * to the next `#{}`-level heading or EOF. Used by the fast-lane Acceptance check to hand
+ * `hasObservableThen` the section text the same way the spec-delta check hands it a requirement
+ * block's body. Heading match is exact (case-insensitive), not a substring: `## Acceptance` does
+ * not match `## Acceptance Criteria Extra`.
+ */
+function sectionBody(raw: string, heading: string): string {
+	const re = new RegExp(`^#{2,3}[ \\t]*${heading}[ \\t]*$`, "im");
+	const match = raw.match(re);
+	if (!match || match.index === undefined) return "";
+	const rest = raw.slice(match.index + match[0].length);
+	const boundary = rest.match(/^#{2,3}[ \t]/m);
+	return (boundary && boundary.index !== undefined ? rest.slice(0, boundary.index) : rest).trim();
+}
+
 /**
  * Structural validation — not a real schema check (see file header), but scoped per
- * requirement rather than per file (see `splitRequirementBlocks`). Verifies:
+ * requirement rather than per file (see `splitRequirementBlocks`). The required set depends on
+ * the change's lane (read from proposal.md's `lane:` frontmatter; see `readChangeLane`):
+ *
+ * Full lane (the default):
  *   - proposal.md exists with a "## Why" and a "## What Changes" section
  *   - at least one specs/<capability>/spec.md exists
  *   - each spec.md has at least one "## ADDED/MODIFIED/REMOVED Requirements" section —
@@ -785,48 +857,93 @@ function hasObservableThen(body: string): boolean {
  *     carries its own WHEN and THEN — not just one requirement in the file having a scenario
  *     while its siblings have none
  *   - tasks.md exists with at least one checkbox line
+ *
+ * Fast lane (proposal.md carries `lane: fast`):
+ *   - proposal.md exists with "## Why", "## What Changes", "## Files This Change Will Touch",
+ *     and "## Acceptance" sections
+ *   - the "## Acceptance" body has at least one observable WHEN/THEN pair (same observability
+ *     rule the full lane's spec-delta check applies)
+ *   - tasks.md exists with at least one checkbox line
+ *   - no specs/ requirement at all — the fast lane carries no delta spec
+ *
+ * design.md is not checked on either lane (it never was).
  */
-export async function validateChange(cwd: string, changeId: string): Promise<ValidateResult> {
+export async function validateChange(cwd: string, changeId: string, lane?: ChangeLane): Promise<ValidateResult> {
 	const paths = changePaths(cwd, changeId);
 	const issues: ValidationIssue[] = [];
+	const effectiveLane = lane ?? (await readChangeLane(cwd, changeId));
 
-	const proposalRaw = (await readFile(paths.proposal, "utf8").catch(() => undefined)) as string | undefined;
-	if (proposalRaw === undefined) {
-		issues.push({ file: "proposal.md", problem: "missing" });
-	} else {
-		if (!/^##\s*Why\b/im.test(proposalRaw)) issues.push({ file: "proposal.md", problem: "missing '## Why' section" });
-		if (!/^##\s*What Changes\b/im.test(proposalRaw))
-			issues.push({ file: "proposal.md", problem: "missing '## What Changes' section" });
-	}
-
-	const specFiles = await findSpecFiles(paths.specsDir);
-	if (specFiles.length === 0) {
-		issues.push({ file: "specs/", problem: "no spec.md found under specs/<capability>/" });
-	} else {
-		for (const specFile of specFiles) {
-			const raw = await readFile(specFile, "utf8").catch(() => "");
-
-			if (!/^##[ \t]*(ADDED|MODIFIED|REMOVED)[ \t]+Requirements\b/im.test(raw)) {
-				issues.push({ file: specFile, problem: "no '## ADDED/MODIFIED/REMOVED Requirements' section found" });
-			}
-
-			const requirements = splitRequirementBlocks(raw);
-			if (requirements.length === 0) {
-				issues.push({ file: specFile, problem: "no '### Requirement:' found" });
-				continue;
-			}
-			for (const req of requirements) {
-				const hasWhen = /\*\*WHEN\*\*/im.test(req.body);
-				const hasThen = /\*\*THEN\*\*/im.test(req.body);
+	if (effectiveLane === "fast") {
+		const proposalRaw = (await readFile(paths.proposal, "utf8").catch(() => undefined)) as string | undefined;
+		if (proposalRaw === undefined) {
+			issues.push({ file: "proposal.md", problem: "missing" });
+		} else {
+			if (!/^##\s*Why\b/im.test(proposalRaw)) issues.push({ file: "proposal.md", problem: "missing '## Why' section (fast lane)" });
+			if (!/^##\s*What Changes\b/im.test(proposalRaw))
+				issues.push({ file: "proposal.md", problem: "missing '## What Changes' section (fast lane)" });
+			if (!/^##[ \t]*Files This Change Will Touch[ \t]*\r?$/im.test(proposalRaw))
+				issues.push({ file: "proposal.md", problem: "missing '## Files This Change Will Touch' section (fast lane)" });
+			if (!/^#{2,3}[ \t]*Acceptance[ \t]*$/im.test(proposalRaw)) {
+				issues.push({ file: "proposal.md", problem: "missing '## Acceptance' section (fast lane)" });
+			} else {
+				const acceptance = sectionBody(proposalRaw, "Acceptance");
+				// Fast lane deliberately does NOT require `[Sn]` scenario ids — only >=1 observable
+				// WHEN/THEN pair. Do not add an id requirement here.
+				const hasWhen = /\*\*WHEN\*\*/im.test(acceptance);
+				const hasThen = /\*\*THEN\*\*/im.test(acceptance);
 				if (!hasWhen || !hasThen) {
-					issues.push({ file: specFile, problem: `Requirement "${req.name}" has no WHEN/THEN scenario` });
+					issues.push({ file: "proposal.md", problem: "fast lane: '## Acceptance' has no WHEN/THEN scenario" });
+				} else if (!hasObservableThen(acceptance)) {
+					// Same observability rule the full lane's spec-delta check uses (hasObservableThen).
+					issues.push({
+						file: "proposal.md",
+						problem: "fast lane: '## Acceptance' has a THEN that no test or run could observe — describe an externally checkable behavior (exit code, stdout, HTTP status, file content), not a code property",
+					});
+				}
+			}
+		}
+		// Fast lane: no specs/ requirement at all — do not run findSpecFiles, do not push a
+		// specs/ issue. A stray spec file under a fast-lane change is not merged at archive either
+		// (see archiveChange), so it is simply out of scope for this lane.
+	} else {
+		const proposalRaw = (await readFile(paths.proposal, "utf8").catch(() => undefined)) as string | undefined;
+		if (proposalRaw === undefined) {
+			issues.push({ file: "proposal.md", problem: "missing" });
+		} else {
+			if (!/^##\s*Why\b/im.test(proposalRaw)) issues.push({ file: "proposal.md", problem: "missing '## Why' section" });
+			if (!/^##\s*What Changes\b/im.test(proposalRaw))
+				issues.push({ file: "proposal.md", problem: "missing '## What Changes' section" });
+		}
+
+		const specFiles = await findSpecFiles(paths.specsDir);
+		if (specFiles.length === 0) {
+			issues.push({ file: "specs/", problem: "no spec.md found under specs/<capability>/" });
+		} else {
+			for (const specFile of specFiles) {
+				const raw = await readFile(specFile, "utf8").catch(() => "");
+
+				if (!/^##[ \t]*(ADDED|MODIFIED|REMOVED)[ \t]+Requirements\b/im.test(raw)) {
+					issues.push({ file: specFile, problem: "no '## ADDED/MODIFIED/REMOVED Requirements' section found" });
+				}
+
+				const requirements = splitRequirementBlocks(raw);
+				if (requirements.length === 0) {
+					issues.push({ file: specFile, problem: "no '### Requirement:' found" });
 					continue;
 				}
-				if (!hasObservableThen(req.body)) {
-					issues.push({
-						file: specFile,
-						problem: `Requirement "${req.name}" has a THEN that no test or run could observe — describe an externally checkable behavior (exit code, stdout, HTTP status, file content), not a code property`,
-					});
+				for (const req of requirements) {
+					const hasWhen = /\*\*WHEN\*\*/im.test(req.body);
+					const hasThen = /\*\*THEN\*\*/im.test(req.body);
+					if (!hasWhen || !hasThen) {
+						issues.push({ file: specFile, problem: `Requirement "${req.name}" has no WHEN/THEN scenario` });
+						continue;
+					}
+					if (!hasObservableThen(req.body)) {
+						issues.push({
+							file: specFile,
+							problem: `Requirement "${req.name}" has a THEN that no test or run could observe — describe an externally checkable behavior (exit code, stdout, HTTP status, file content), not a code property`,
+						});
+					}
 				}
 			}
 		}
@@ -945,6 +1062,9 @@ export interface ArchiveResult {
 	 * the change only added things or actually needs manual cleanup.
 	 */
 	unappliedModifications: { specFile: string; verb: "MODIFIED" | "REMOVED"; requirement: string }[];
+	/** Fast lane only: no delta specs exist, so nothing was merged. The merge loop was
+	 *  skipped by design, not because it found nothing. */
+	specsMergeSkipped: boolean;
 }
 
 interface VerbSection {
@@ -988,6 +1108,9 @@ function splitVerbSections(raw: string): VerbSection[] {
  */
 export async function archiveChange(cwd: string, changeId: string): Promise<ArchiveResult> {
 	const paths = changePaths(cwd, changeId);
+	// Read the lane before the rename: the change dir is gone after it, and proposal.md (the
+	// lane's source of truth) moves with it.
+	const lane = await readChangeLane(cwd, changeId);
 	const date = new Date().toISOString().slice(0, 10);
 	const archivedDir = join(cwd, READYSET_ROOT, "changes", "archive", `${date}-${changeId}`);
 	await mkdir(join(cwd, READYSET_ROOT, "changes", "archive"), { recursive: true });
@@ -995,8 +1118,11 @@ export async function archiveChange(cwd: string, changeId: string): Promise<Arch
 
 	const mergedSpecFiles: string[] = [];
 	const unappliedModifications: ArchiveResult["unappliedModifications"] = [];
+	// Fast lane: there is no delta spec to merge. Gate on the lane rather than relying on
+	// findSpecFiles returning [] — a stray spec file under a fast-lane change must not be merged.
+	const specsMergeSkipped = lane === "fast";
 	const archivedSpecsDir = join(archivedDir, "specs");
-	const specFiles = await findSpecFiles(archivedSpecsDir).catch(() => [] as string[]);
+	const specFiles = specsMergeSkipped ? [] : await findSpecFiles(archivedSpecsDir).catch(() => [] as string[]);
 	for (const deltaSpec of specFiles) {
 		const rel = deltaSpec.slice(archivedSpecsDir.length + 1); // "<capability>/spec.md" (or deeper)
 		const targetPath = join(cwd, READYSET_ROOT, "specs", rel);
@@ -1021,5 +1147,5 @@ export async function archiveChange(cwd: string, changeId: string): Promise<Arch
 		mergedSpecFiles.push(targetPath);
 	}
 
-	return { archivedDir, mergedSpecFiles, unappliedModifications };
+	return { archivedDir, mergedSpecFiles, unappliedModifications, specsMergeSkipped };
 }

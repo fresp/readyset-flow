@@ -36,6 +36,10 @@ import {
 	type PhaseName,
 	readDirtyBaseline,
 	readContext,
+	readChangeLane,
+	readArtifactSizes,
+	type ArtifactSizes,
+	type ChangeLane,
 	readReview,
 	readScopeContract,
 	readScopeDeviations,
@@ -45,8 +49,11 @@ import {
 	validateChange,
 } from "../lib/readyset-spec.ts";
 import {
+	DEFAULT_ARTIFACT_BUDGETS,
 	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+	type ArtifactBudgets,
 	type LaneDefault,
+	readArtifactBudgets,
 	readCompactMinContextPercent,
 	readFallbackChain,
 	readLaneDefault,
@@ -127,9 +134,12 @@ interface OverlayKeybindings {
  * /plan's native Plan Review surface.
  */
 
-const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (create directories as needed):
+const ARTIFACT_GUIDE_HEADER = `Write proposal.md with a YAML frontmatter block whose first line is \`lane: full\` or \`lane: fast\` matching this run's lane, then the required sections below.
 
-- proposal.md — must have a "## Why" section (1-2 paragraphs on the problem), a
+Write exactly these files under readyset/changes/<id>/ (create directories as needed):
+`;
+
+const PROPOSAL_GUIDE_BULLET = `- proposal.md — must have a "## Why" section (1-2 paragraphs on the problem), a
   "## What Changes" section (bullet list of concrete changes), and a "## Files This Change
   Will Touch" section: an exhaustive repo-relative path list of every existing file Apply is
   allowed to modify plus every new file it may create. Mark each new file with a trailing
@@ -140,8 +150,9 @@ const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
   arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
   the change actually needs — nothing speculative. A file not on this list may not
-  be written during Apply without asking first.
-- design.md — "## Context", "## Goals / Non-Goals", "## Decisions" (numbered, each with
+  be written during Apply without asking first.`;
+
+const FULL_LANE_GUIDE_BULLETS = `- design.md — "## Context", "## Goals / Non-Goals", "## Decisions" (numbered, each with
   Rationale and Alternatives considered), "## Risks / Trade-offs".
 - specs/<capability-slug>/spec.md — "## Purpose", then "## ADDED Requirements" with one
   or more "### Requirement: <name>" blocks, each followed by one or more
@@ -149,12 +160,59 @@ const ARTIFACT_GUIDE = `Write exactly these files under readyset/changes/<id>/ (
     - **WHEN** <trigger>
     - **THEN** <observable outcome>
   Use MODIFIED/REMOVED Requirements sections instead of ADDED when changing or removing
-  existing behavior already covered by an existing spec.
-- tasks.md — numbered sections, each task a "- [ ] N.M <description>" checkbox line with
-  a verification note. Each task must map to a spec scenario; do NOT add
+  existing behavior already covered by an existing spec.`;
+
+const FAST_LANE_ACCEPTANCE_GUIDE = `List every acceptance scenario under \`## Acceptance\` in proposal.md as
+"- **WHEN** ... **THEN** ...", one per bullet, and give it an id in the form \`[S1]\`, \`[S2]\`,
+... in document order; tasks.md references those ids.`;
+
+const TASKS_GUIDE_BULLET = `- tasks.md — numbered sections, each task a "- [ ] N.M <description>" checkbox line with
+  a verification note. Each task must map to an acceptance scenario (the fast lane's
+  \`## Acceptance\` ids, or a spec scenario on the full lane); do NOT add
   "cleanup"/"improve"/refactor tasks the request didn't ask for. If you change a file outside
   the scope contract during Apply, record it under a "## Scope deviations" section here as
   "- <path> — <reason>".`;
+
+/** Builds the artifact guide for a run's lane and resolved budgets. The full lane lists all
+ *  four artifacts; the fast lane lists only proposal.md and tasks.md (no design.md, no spec
+ *  delta) and folds the acceptance scenarios into proposal.md's `## Acceptance` section. Both
+ *  lanes end with the character budgets and the no-restating rules. */
+function artifactGuide(lane: ChangeLane, budgets: ArtifactBudgets): string {
+	const budgetOf = (n: number) => (Number.isFinite(n) ? String(n) : "unlimited");
+	const bullets =
+		lane === "fast"
+			? [PROPOSAL_GUIDE_BULLET, FAST_LANE_ACCEPTANCE_GUIDE, TASKS_GUIDE_BULLET].join("\n")
+			: [PROPOSAL_GUIDE_BULLET, FULL_LANE_GUIDE_BULLETS, TASKS_GUIDE_BULLET].join("\n");
+
+	const budgetLines =
+		lane === "fast"
+			? [
+					`- proposal.md <= ${budgetOf(budgets.proposal)}`,
+					`- tasks.md <= ${budgetOf(budgets.tasks)}`,
+				]
+			: [
+					`- proposal.md <= ${budgetOf(budgets.proposal)}`,
+					`- design.md <= ${budgetOf(budgets.design)}`,
+					`- specs/** total <= ${budgetOf(budgets.specs)}`,
+					`- tasks.md <= ${budgetOf(budgets.tasks)}`,
+				];
+
+	return (
+		ARTIFACT_GUIDE_HEADER +
+		bullets +
+		"\n\nBudgets (characters, hard guidance — stay under them):\n" +
+		budgetLines.join("\n") +
+		"\n\nDo not restate another artifact's content:\n" +
+		(lane === "fast"
+			? ""
+			: "- design.md explains decisions and risks only; never re-list `## What Changes`.\n") +
+		"- tasks.md references scenario ids (`[S1]`, `[S2]`, ... assigned in order in the\n" +
+		"  `## Acceptance` section) instead of restating their WHEN/THEN text.\n" +
+		"- No prose summary of proposal.md" +
+		(lane === "fast" ? "" : ", design.md, or specs/") +
+		" inside any other artifact."
+	);
+}
 
 /**
  * Explore turn — new in pipeline v2. Runs before Propose and writes EXPLORATION.md.
@@ -217,7 +275,7 @@ function fastLaneProposeSuffix(): string {
 	);
 }
 
-function proposeTurnPrompt(b: BrainstormMeta, lane: "full" | "fast" = "full"): string {
+function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
 	const paths = changePaths("", b.changeId);
 	return (
 		`Create a Readyset change named "${b.changeId}" from the brainstorm at ${b.file}. ` +
@@ -237,7 +295,7 @@ function proposeTurnPrompt(b: BrainstormMeta, lane: "full" | "fast" = "full"): s
 		"so a reviewer can check each claim without re-reading the repo. An unanchored claim about the repo is " +
 		"indistinguishable from a guess, and the benchmark measured such plans as no better grounded than a " +
 		"single read-only pass.\n\n" +
-		ARTIFACT_GUIDE +
+		artifactGuide(lane, budgets) +
 		"\n\nCarry over the brainstorm's Decision, Seam, Scope and Acceptance Criteria (keep the criteria as WHEN/THEN " +
 		"scenarios), and use its Spec Impact section to shape the delta specs. Do not reopen options the brainstorm " +
 		"already decided; carry its Open Questions into the proposal rather than answering them silently.\n\n" +
@@ -248,13 +306,14 @@ function proposeTurnPrompt(b: BrainstormMeta, lane: "full" | "fast" = "full"): s
 	);
 }
 
-function refineTurnPrompt(changeId: string, feedback: string, issues: string[]): string {
+function refineTurnPrompt(changeId: string, feedback: string, issues: string[], lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
 	const issuesLine = issues.length > 0 ? `\n\nStructural check also flagged: ${issues.join("; ")}.` : "";
 	return (
 		`Revise the Readyset change "${changeId}" under readyset/changes/${changeId}/ per this feedback: ${feedback}` +
 		issuesLine +
 		"\n\nRead the existing proposal.md/design.md/specs/tasks.md first. " +
-		ARTIFACT_GUIDE +
+		"Keep proposal.md's existing `lane:` frontmatter line unchanged. " +
+		artifactGuide(lane, budgets) +
 		"\n\nDo not implement code in this turn — planning artifacts only."
 	);
 }
@@ -1227,6 +1286,121 @@ async function runContractRepair(
 	return after;
 }
 
+/** A single over-budget artifact: its name (as it appears to the user), its measured size, and
+ *  the budget it blew past. */
+interface TrimOverrun { file: string; chars: number; budget: number }
+
+/** The artifacts a lane can trim, in the order the prompt lists them. Fast lane: the fast lane
+ *  writes no design.md and no spec delta, so only proposal.md and tasks.md are candidates. */
+function trimmableSizes(sizes: ArtifactSizes, lane: ChangeLane): { file: keyof ArtifactBudgets; size: number | undefined }[] {
+	const all: { file: keyof ArtifactBudgets; size: number | undefined }[] = [
+		{ file: "proposal", size: sizes.proposal },
+		{ file: "design", size: sizes.design },
+		{ file: "specs", size: lane === "fast" ? undefined : sizes.specs },
+		{ file: "tasks", size: sizes.tasks },
+	];
+	return all;
+}
+
+/** Which artifacts exceed `1.5 * budget` right now (the only ones that trigger a trim turn). */
+function trimOverruns(sizes: ArtifactSizes, budgets: ArtifactBudgets, lane: ChangeLane): TrimOverrun[] {
+	const out: TrimOverrun[] = [];
+	for (const { file, size } of trimmableSizes(sizes, lane)) {
+		const budget = budgets[file];
+		if (!Number.isFinite(budget) || size === undefined) continue;
+		if (size > 1.5 * budget) out.push({ file, chars: size, budget });
+	}
+	return out;
+}
+
+/** Prompt for the one-shot Trim turn: rewrite ONLY the over-budget planning artifacts down to
+ *  their budget by removing restated content — never drop a scenario, a task, or a contract
+ *  file. Reuses the exact "do not touch code" wording from contractRepairPrompt. */
+function trimPrompt(overruns: TrimOverrun[]): string {
+	return (
+		"Some planning artifacts for this Readyset change are far over their character budget. " +
+		"Rewrite ONLY the files listed below so each is at or under its budget — do not touch code, " +
+		"and do not restructure any other part of proposal.md, design.md, specs/, or tasks.md.\n\n" +
+		"Over budget:\n" +
+		overruns.map((o) => `- ${o.file}: ${o.chars} chars (budget ${o.budget})`).join("\n") +
+		"\n\nTrim by removing restated content: prose that repeats another artifact, duplicated " +
+		"WHEN/THEN text that tasks.md could reference by scenario id instead, and filler. Do NOT drop " +
+		"a scenario, do NOT drop a task, and do NOT remove a file from the `## Files This Change Will " +
+		"Touch` scope contract — the change must still describe the same work. Planning artifacts only, " +
+		"no code in this turn."
+	);
+}
+
+/**
+ * Bounded, one-shot Trim turn: if a planning artifact exceeds 1.5x its budget, fire ONE turn
+ * (riding the propose phase model) that rewrites it down to budget by removing restated content,
+ * then re-check the planning boundary and re-measure. Never loops — one turn per Propose/Refine.
+ * An ordinary overrun (<= 1.5x) does not reach here at all: it only warns in the gate panel.
+ *
+ * `record` is the caller's `recordPhase`/`recordRepair` so the event carries the run's
+ * lane/laneSource. The turn is reserved — it fires only if Apply + Review + one spare turn would
+ * still remain (`turnsAvailableFor(budget, 3)`); otherwise the overrun only warns in the gate.
+ */
+async function runTrim(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	budget: TurnBudget,
+	changeId: string,
+	phaseModels: Map<string, { model: string; source: string }>,
+	budgets: ArtifactBudgets,
+	lane: ChangeLane,
+	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string; artifactChars?: PhaseEvent["artifactChars"] }) => Promise<void>,
+): Promise<void> {
+	const before = await readArtifactSizes(ctx.cwd, changeId);
+	const overruns = trimOverruns(before, budgets, lane);
+	if (overruns.length === 0) return; // nothing past 1.5x: no event, no turn
+
+	if (!turnsAvailableFor(budget, 3)) {
+		ctx.ui.notify(
+			`The planning artifacts for "${changeId}" are far over budget (${overruns.map((o) => `${o.file} ${o.chars}/${o.budget}`).join(", ")}), ` +
+				"but trimming them now would starve Apply/Review of their turns — keeping the turns and only warning in the gate.",
+			"warning",
+		);
+		await record("trim", "end", { outcome: "skipped-budget", artifactChars: { before, after: before } });
+		return;
+	}
+
+	ctx.ui.notify(`Trimming over-budget planning artifacts for "${changeId}" (${overruns.map((o) => o.file).join(", ")})...`, "info");
+	await record("trim", "start", { model: phaseModels.get("propose")?.model });
+	await withPhaseModel(pi, ctx, "propose", phaseModels, () =>
+		spendTurn(pi, ctx, budget, "Trim", trimPrompt(overruns)),
+	);
+
+	// The trim turn is a planning turn: it may only touch the change directory. Checked the same
+	// way the Propose turn is; a violation treats the trim as failed (mirrors runContractRepair).
+	const violations = await checkPhaseViolations(ctx.cwd, changeId, await pathsChangedThisRun(ctx.cwd, changeId));
+	const after = await readArtifactSizes(ctx.cwd, changeId);
+	if (violations.length > 0) {
+		ctx.ui.notify(
+			`The trim turn for "${changeId}" changed files outside the change directory (${violations.map((v) => v.path).join(", ")}) — treating the trim as failed.`,
+			"error",
+		);
+		await appendContext(ctx.cwd, changeId, "Trim", `Trim turn wrote outside the change dir: ${violations.map((v) => `${v.path} (${v.detail})`).join("; ")}.`);
+		await record("trim", "end", { model: phaseModels.get("propose")?.model, outcome: "partial", artifactChars: { before, after } });
+		return;
+	}
+
+	// Trimmed when every file that was over 1.5x is now at or under its budget.
+	const remaining = trimOverruns(after, budgets, lane);
+	await appendContext(
+		ctx.cwd,
+		changeId,
+		"Trim",
+		`${overruns.length} artifact(s) over 1.5x budget before: ${overruns.map((o) => `${o.file} ${o.chars}/${o.budget}`).join(", ")}; ` +
+			`${remaining.length} still over after.`,
+	);
+	await record("trim", "end", {
+		model: phaseModels.get("propose")?.model,
+		outcome: remaining.length === 0 ? "trimmed" : "partial",
+		artifactChars: { before, after },
+	});
+}
+
 /** Prompt for the one-shot post-Apply scope reconciliation turn. */
 function scopeReconcilePrompt(changeId: string, paths: string[]): string {
 	return (
@@ -1340,6 +1514,8 @@ interface ReviewSnapshot {
 	 *  `findEvidenceConflicts`'s doc comment for exactly what "conflict" means here. */
 	evidenceTotal: number;
 	evidenceConflicts: Awaited<ReturnType<typeof findEvidenceConflicts>>;
+	/** Per-artifact character counts, for the gate's budget line. */
+	sizes: ArtifactSizes;
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -1362,6 +1538,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const review = await readReview(ctx.cwd, chosen.changeId);
 	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
 	const evidenceConflicts = await findEvidenceConflicts(ctx.cwd, chosen.changeId);
+	const sizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
 	return {
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
 		validated,
@@ -1372,6 +1549,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		reviewed: !!review,
 		evidenceTotal,
 		evidenceConflicts,
+		sizes,
 	};
 }
 
@@ -1401,7 +1579,8 @@ interface ReviewSection {
  */
 async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot): Promise<ReviewSection[]> {
 	const paths = changePaths(ctx.cwd, chosen.changeId);
-	const specFiles = await findSpecFiles(paths.specsDir).catch(() => [] as string[]);
+	const lane = await readChangeLane(ctx.cwd, chosen.changeId);
+	const specFiles = lane === "fast" ? [] : await findSpecFiles(paths.specsDir).catch(() => [] as string[]);
 
 	return [
 		{
@@ -1462,26 +1641,38 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 				].join("\n");
 			},
 		},
-		{
-			id: "design",
-			heading: "Design",
-			status: "design.md",
-			render: () => readOrPlaceholder(paths.design, "_(design.md not found.)_"),
-		},
-		{
-			id: "specs",
-			heading: `Specs (${specFiles.length})`,
-			status: specFiles.length > 0 ? `${specFiles.length} file(s)` : "none found",
-			render: async () => {
-				if (specFiles.length === 0) return "_(no specs/**/spec.md found.)_";
-				const parts: string[] = [];
-				for (const specFile of specFiles) {
-					const rel = specFile.slice(paths.specsDir.length + 1);
-					parts.push(`### specs/${rel}`, "", await readOrPlaceholder(specFile, "_(empty)_"));
-				}
-				return parts.join("\n\n");
-			},
-		},
+		...(lane === "fast"
+			? [
+					{
+						id: "artifacts",
+						heading: "Artifact set",
+						status: "fast lane: proposal + tasks",
+						render: async () =>
+							"Fast lane — this change carries proposal.md and tasks.md only; no design.md and no spec delta.",
+					} satisfies ReviewSection,
+				]
+			: [
+					{
+						id: "design",
+						heading: "Design",
+						status: "design.md",
+						render: () => readOrPlaceholder(paths.design, "_(design.md not found.)_"),
+					} satisfies ReviewSection,
+					{
+						id: "specs",
+						heading: `Specs (${specFiles.length})`,
+						status: specFiles.length > 0 ? `${specFiles.length} file(s)` : "none found",
+						render: async () => {
+							if (specFiles.length === 0) return "_(no specs/**/spec.md found.)_";
+							const parts: string[] = [];
+							for (const specFile of specFiles) {
+								const rel = specFile.slice(paths.specsDir.length + 1);
+								parts.push(`### specs/${rel}`, "", await readOrPlaceholder(specFile, "_(empty)_"));
+							}
+							return parts.join("\n\n");
+						},
+					} satisfies ReviewSection,
+				]),
 		{
 			id: "tasks",
 			heading: snapshot.counted ? `Tasks (${snapshot.counted.done}/${snapshot.counted.total})` : "Tasks",
@@ -1660,7 +1851,21 @@ async function browseReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snap
 	}
 }
 
-function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot, budget: TurnBudget): void {
+/** One gate line per artifact that has a real budget and a measured size, e.g.
+ *  `artifacts: proposal 3,120 chars (budget 4,000)`; an overrun appends ` — OVER by N`.
+ *  Artifacts whose budget is `Infinity` or whose size key is absent are skipped. */
+function artifactBudgetLines(sizes: ArtifactSizes, budgets: ArtifactBudgets, lane: ChangeLane): string[] {
+	const lines: string[] = [];
+	for (const { file, size } of trimmableSizes(sizes, lane)) {
+		const budget = budgets[file];
+		if (!Number.isFinite(budget) || size === undefined) continue;
+		const over = size > budget ? ` — OVER by ${(size - budget).toLocaleString()}` : "";
+		lines.push(`artifacts: ${file} ${size.toLocaleString()} chars (budget ${budget.toLocaleString()})${over}`);
+	}
+	return lines;
+}
+
+function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot, budget: TurnBudget, lane: ChangeLane, budgets: ArtifactBudgets): void {
 	// Informational only -- doesn't gate which CTAs are offered (Approve & Compact is always
 	// there; see reviewAndMaybeExecute). Lets the user judge for themselves whether it's worth
 	// reaching for right now instead of Readyset guessing at a threshold.
@@ -1697,6 +1902,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 							.join(" · "),
 				]
 			: []),
+		...artifactBudgetLines(snapshot.sizes, budgets, lane),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -1769,6 +1975,7 @@ async function reviewAndMaybeExecute(
 	reviewLaneSource: PhaseEvent["laneSource"] = "brainstorm",
 	compactMode: "auto" | "always" | "never" = "auto",
 	minContextPercent: number = DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+	artifactBudgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full,
 ): Promise<void> {
 	let chosen = initial;
 	let verificationSendbacks = 0;
@@ -1781,7 +1988,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"] } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"] } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -1793,7 +2000,7 @@ async function reviewAndMaybeExecute(
 		}).catch(() => {});
 	};
 
-	const recordRepair = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string } = {}) =>
+	const recordRepair = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; artifactChars?: PhaseEvent["artifactChars"] } = {}) =>
 		recordPhase(chosen.changeId, phase, edge, extra);
 
 	const recordReconcile = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; counts?: PhaseEvent["counts"] } = {}) =>
@@ -1804,7 +2011,7 @@ async function reviewAndMaybeExecute(
 		// closes once `choice` is resolved. The gate is UI, not a model turn, so no `model` field.
 		await recordPhase(chosen.changeId, "gate", "start");
 		const snapshot = await takeReviewSnapshot(ctx, chosen);
-		showReviewPanel(ctx, chosen, snapshot, budget);
+		showReviewPanel(ctx, chosen, snapshot, budget, reviewLane, artifactBudgets);
 		ctx.ui.setEditorText(await buildReviewDocument(ctx, chosen, snapshot));
 		const taskSummary = snapshot.counted
 			? `${snapshot.counted.done}/${snapshot.counted.total} tasks ticked`
@@ -1899,13 +2106,14 @@ async function reviewAndMaybeExecute(
 						ctx,
 						budget,
 						"Refine",
-						refineTurnPrompt(chosen.changeId, feedback, snapshot.validated.issues.map((i) => `${i.file}: ${i.problem}`)),
+						refineTurnPrompt(chosen.changeId, feedback, snapshot.validated.issues.map((i) => `${i.file}: ${i.problem}`), reviewLane, artifactBudgets),
 					),
 				);
 				if (!refineFired) return;
 				refineOutcome = "refined";
 				await appendContext(ctx.cwd, chosen.changeId, "Refine", `User feedback: ${feedback}`);
 				await runContractRepair(pi, ctx, budget, chosen.changeId, phaseModels, recordRepair);
+				await runTrim(pi, ctx, budget, chosen.changeId, phaseModels, artifactBudgets, reviewLane, recordRepair);
 			} finally {
 				await recordPhase(chosen.changeId, "refine", "end", { model: phaseModels.get("propose")?.model, outcome: refineOutcome });
 			}
@@ -2067,27 +2275,43 @@ async function reviewAndMaybeExecute(
 		if (archiveChoice === "Archive now") {
 			await recordPhase(chosen.changeId, "archive", "start");
 			try {
+				// The fast lane carries no spec delta. Record that in CONTEXT.md *before*
+				// archiveChange runs — the rename moves the change dir, so the append must land
+				// while the live path still exists (same ordering as the pre-archive phase events).
+				const archiveLane = await readChangeLane(ctx.cwd, chosen.changeId);
+				if (archiveLane === "fast") {
+					await appendContext(ctx.cwd, chosen.changeId, "Archive", "Fast lane: no spec delta to merge (skipped by design).");
+				}
 				const result = await archiveChange(ctx.cwd, chosen.changeId);
-				const baseNotice =
-					`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
-					"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
-				if (result.unappliedModifications.length === 0) {
-					ctx.ui.notify(baseNotice, "info");
-				} else {
-					// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
-					// the old requirement text is still sitting in the canonical spec, untouched, right next to the
-					// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
-					// than the same generic notice an ADDED-only archive gets.
-					const items = result.unappliedModifications
-						.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
-						.join("\n");
+				if (result.specsMergeSkipped) {
+					// Fast lane: nothing was merged *by design*, not because something failed. The
+					// usual baseNotice warning path reads as if a merge went wrong, so it is skipped.
 					ctx.ui.notify(
-						`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
-							"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
-							"old text is still there. Manual cleanup needed:\n" +
-							items,
-						"warning",
+						`Archived to ${result.archivedDir}. Fast lane: this change carried no spec delta, so nothing was merged into readyset/specs/.`,
+						"info",
 					);
+				} else {
+					const baseNotice =
+						`Archived to ${result.archivedDir}. Merged into: ${result.mergedSpecFiles.join(", ") || "(no spec files found to merge)"} ` +
+						"— this was an append-only merge, not a real ADDED/MODIFIED/REMOVED diff; review the merged spec.";
+					if (result.unappliedModifications.length === 0) {
+						ctx.ui.notify(baseNotice, "info");
+					} else {
+						// MODIFIED/REMOVED specifically: the append-only merge did NOT actually change or remove these --
+						// the old requirement text is still sitting in the canonical spec, untouched, right next to the
+						// appended delta that claims it changed/disappeared. Worth a sharper, itemized warning rather
+						// than the same generic notice an ADDED-only archive gets.
+						const items = result.unappliedModifications
+							.map((u) => `  - ${u.verb}: "${u.requirement}" (in ${u.specFile})`)
+							.join("\n");
+						ctx.ui.notify(
+							`${baseNotice}\n\n⚠ ${result.unappliedModifications.length} requirement(s) below were declared MODIFIED/REMOVED ` +
+								"in this change but were only appended, NOT actually changed or removed in the canonical spec -- the " +
+								"old text is still there. Manual cleanup needed:\n" +
+								items,
+							"warning",
+						);
+					}
 				}
 				// archiveChange renamed the change dir to changes/archive/<date>-<id>/, so the
 				// archive `end` event must target that location — writing to the live id would
@@ -2786,6 +3010,12 @@ export default function (pi: ExtensionAPI) {
 			if (resolvedCompactMin.warning) ctx.ui.notify(resolvedCompactMin.warning, "warning");
 			const minContextPercent = resolvedCompactMin.percent;
 
+			// Per-artifact character budgets, resolved once for the run. The lane's own set is
+			// picked once `effectiveLane` is known (it is by this point): the fast lane only
+			// budgets proposal.md and tasks.md.
+			const artifactBudgetsByLane = await readArtifactBudgets();
+			const artifactBudgets = artifactBudgetsByLane[effectiveLane];
+
 			// Writes one phase boundary event. Never throws: a phase log is diagnostics, not control
 			// flow -- a write failure must not abort the run (mirrors appendContext's callers, which
 			// also never guard). Notably the archive `end` event lands *after* archiveChange moved
@@ -2796,12 +3026,12 @@ export default function (pi: ExtensionAPI) {
 				edge: "start" | "end",
 				lane: "fast" | "full",
 				laneSource: PhaseEvent["laneSource"],
-				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"] } = {},
+				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"]; artifactChars?: PhaseEvent["artifactChars"] } = {},
 			): Promise<void> => {
 				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
 			};
 
-			const recordPhaseFor = async (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string } = {}) =>
+			const recordPhaseFor = async (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; artifactChars?: PhaseEvent["artifactChars"] } = {}) =>
 				recordPhase(chosen.changeId, phase, edge, phaseLane, phaseLaneSource, extra);
 
 			const fallbackFromFlag = parsedArgs.fallbackModel;
@@ -2814,7 +3044,7 @@ export default function (pi: ExtensionAPI) {
 					// Defensive: a change that predates the baseline mechanism has no capture
 					// yet. This never overwrites an existing baseline (first capture wins).
 					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent);
+					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets);
 					return;
 				}
 
@@ -2978,12 +3208,17 @@ export default function (pi: ExtensionAPI) {
 				});
 				const proposeBudget = startPhaseBudget();
 				let proposeOutcome = "aborted";
+				let proposeSizes: ArtifactSizes | undefined;
 				await recordPhase(chosen.changeId, "propose", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("propose") });
 				try {
 					const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
-						spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane)),
+						spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane, artifactBudgets)),
 					);
 					if (!proposeFired) return;
+					// Measure the Propose turn's output for the bench's planning-size report and the
+					// gate's budget line. Taken on both outcome paths (proposed and stopped-violation):
+					// the sizes are still useful even when the turn leaked outside its boundary.
+					proposeSizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
 					// Gate invariant (R2): a planning turn may only leave planning artifacts. The
 					// T11/T12 benchmark runs implemented the change out of the Propose turn and
 					// archived it themselves, shipping with no approval. That is checked here —
@@ -3016,10 +3251,16 @@ export default function (pi: ExtensionAPI) {
 						ctx.cwd,
 						chosen.changeId,
 						"Propose",
-						`Propose turn ran; see proposal.md/design.md/specs/tasks.md. (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
+						`Propose turn ran; see proposal.md/design.md/specs/tasks.md.` +
+							(proposeSizes ? ` Planning size: proposal ${proposeSizes.proposal ?? 0}, design ${proposeSizes.design ?? 0}, specs ${proposeSizes.specs}, tasks ${proposeSizes.tasks ?? 0} chars (lane ${phaseLane}).` : "") +
+							` (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
 					);
 				} finally {
-					await recordPhase(chosen.changeId, "propose", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("propose"), outcome: proposeOutcome });
+					await recordPhase(chosen.changeId, "propose", "end", phaseLane, phaseLaneSource, {
+						model: phaseModelFor("propose"),
+						outcome: proposeOutcome,
+						artifactChars: proposeSizes ? { before: proposeSizes, after: proposeSizes } : undefined,
+					});
 				}
 			if (phaseBudgetExceeded(proposeBudget)) {
 				ctx.ui.notify(
@@ -3030,6 +3271,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			await runContractRepair(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, recordPhaseFor);
+			await runTrim(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, artifactBudgets, effectiveLane, recordPhaseFor);
 
 			const reloaded = await loadBrainstorms(ctx.cwd);
 			await reconcileStatuses(ctx.cwd, reloaded);
@@ -3058,7 +3300,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent);
+			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets);
 		});
 		},
 	});

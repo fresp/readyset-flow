@@ -29,6 +29,8 @@ import {
   readPhaseEvents,
   PHASE_MARKER,
   type PhaseEvent,
+  readChangeLane,
+  readArtifactSizes,
 } from "../src/lib/readyset-spec.ts";
 
 let pass = 0;
@@ -105,6 +107,109 @@ await test("validateChange: full valid artifact passes", async () => {
   const result = await validateChange(cwd, "good-change");
   assert.deepEqual(result.issues, []);
   assert.equal(result.ok, true);
+});
+
+const FAST_PROPOSAL = (acceptance: string) =>
+  `---\nlane: fast\n---\n## Why\n\nBecause reasons.\n\n## What Changes\n\n- did a thing\n\n## Files This Change Will Touch\n\n- src/thing.ts (new)\n\n## Acceptance\n\n${acceptance}\n`;
+
+await test("validateChange: fast lane pass (no specs/ dir, acceptance in proposal)", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "fast-ok");
+  await rm(paths.specsDir, { recursive: true, force: true });
+  await writeFile(paths.proposal, FAST_PROPOSAL("- **WHEN** a\n- **THEN** the command exits 0\n"), "utf8");
+  await writeFile(paths.tasks, "- [ ] 1.1 do the thing\n", "utf8");
+  const result = await validateChange(cwd, "fast-ok");
+  assert.deepEqual(result.issues, []);
+  assert.equal(result.ok, true);
+});
+
+await test("validateChange: fast lane with an explicit lane arg also passes", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "fast-arg");
+  await rm(paths.specsDir, { recursive: true, force: true });
+  // proposal has no lane: line — the explicit "fast" arg must still select the fast-lane set.
+  await writeFile(
+    paths.proposal,
+    "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- x (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "fast-arg", "fast");
+  assert.equal(result.ok, true);
+});
+
+await test("validateChange: fast lane missing '## Acceptance' is flagged by name", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "fast-noaccept");
+  await rm(paths.specsDir, { recursive: true, force: true });
+  await writeFile(paths.proposal, "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- x (new)\n", "utf8");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "fast-noaccept");
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some((i) => i.file === "proposal.md" && i.problem.includes("## Acceptance")));
+  assert.ok(!result.issues.some((i) => i.file === "specs/"), "fast lane must not require a spec delta");
+});
+
+await test("validateChange: fast lane '## Acceptance' with only prose (no WHEN/THEN) is flagged", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "fast-prose");
+  await rm(paths.specsDir, { recursive: true, force: true });
+  await writeFile(paths.proposal, FAST_PROPOSAL("It should work well and be nice."), "utf8");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "fast-prose");
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some((i) => i.problem.includes("no WHEN/THEN scenario")));
+});
+
+await test("validateChange: fast lane '## Acceptance' THEN that is a code property is flagged as unobservable", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "fast-unobservable");
+  await rm(paths.specsDir, { recursive: true, force: true });
+  await writeFile(paths.proposal, FAST_PROPOSAL("- **WHEN** src/registry.ts is inspected\n- **THEN** it contains no direct calls\n"), "utf8");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "fast-unobservable");
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some((i) => i.problem.includes("no test or run could observe")));
+});
+
+await test("validateChange: fast lane with no tasks.md is flagged", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "fast-notasks");
+  await rm(paths.specsDir, { recursive: true, force: true });
+  await writeFile(paths.proposal, FAST_PROPOSAL("- **WHEN** a\n- **THEN** the command exits 0\n"), "utf8");
+  const result = await validateChange(cwd, "fast-notasks");
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some((i) => i.file === "tasks.md" && i.problem === "missing"));
+});
+
+await test("validateChange: full lane with explicit 'lane: full' + spec delta passes; removing the delta fails on specs/", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "full-explicit");
+  await writeFile(paths.proposal, "---\nlane: full\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await mkdir(join(paths.specsDir, "cap"), { recursive: true });
+  await writeFile(
+    join(paths.specsDir, "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const okResult = await validateChange(cwd, "full-explicit");
+  assert.equal(okResult.ok, true);
+
+  await rm(paths.specsDir, { recursive: true, force: true });
+  const failResult = await validateChange(cwd, "full-explicit");
+  assert.equal(failResult.ok, false);
+  assert.ok(failResult.issues.some((i) => i.file === "specs/"));
+});
+
+await test("readChangeLane: missing proposal -> full; unrecognized -> full; lane: fast -> fast", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "lane-read");
+  assert.equal(await readChangeLane(cwd, "lane-read"), "full", "missing proposal defaults to full");
+  await writeFile(paths.proposal, "---\nlane: sideways\n---\n## Why\n\nx\n", "utf8");
+  assert.equal(await readChangeLane(cwd, "lane-read"), "full", "unrecognized lane defaults to full");
+  await writeFile(paths.proposal, "---\nlane: FAST\n---\n## Why\n\nx\n", "utf8");
+  assert.equal(await readChangeLane(cwd, "lane-read"), "fast", "trimmed, lowercased value matches");
 });
 
 await test("validateChange: requirement without WHEN/THEN flagged", async () => {
@@ -201,6 +306,7 @@ await test("archiveChange: moves dir and creates new spec file", async () => {
   const result = await archiveChange(cwd, "archive-change-1");
   assert.match(result.archivedDir, /archive-change-1$/);
   assert.equal(result.mergedSpecFiles.length, 1);
+  assert.equal(result.specsMergeSkipped, false, "full lane merges specs");
 
   const mergedContent = await readFile(result.mergedSpecFiles[0], "utf8");
   assert.ok(mergedContent.includes("Spin"));
@@ -213,6 +319,47 @@ await test("archiveChange: moves dir and creates new spec file", async () => {
     stillThere = false;
   }
   assert.equal(stillThere, false);
+});
+
+await test("archiveChange: fast lane skips the spec merge and reports it", async () => {
+  const cwd = await freshCwd();
+  await ensureReadysetRoot(cwd);
+  const paths = await scaffoldChange(cwd, "archive-fast");
+  await writeFile(paths.proposal, "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  // A stray spec file under a fast-lane change must NOT be merged — the lane, not the file
+  // search, is what gates the merge.
+  await mkdir(join(paths.specsDir, "stray"), { recursive: true });
+  await writeFile(join(paths.specsDir, "stray", "spec.md"), "## Purpose\n\nstray\n", "utf8");
+  await writeFile(paths.tasks, "- [x] 1.1 done\n", "utf8");
+
+  const result = await archiveChange(cwd, "archive-fast");
+  assert.equal(result.specsMergeSkipped, true);
+  assert.deepEqual(result.mergedSpecFiles, []);
+  assert.deepEqual(result.unappliedModifications, []);
+
+  // The canonical readyset/specs/ tree is untouched: no stray/ capability was created.
+  const created = await readFile(join(cwd, "readyset", "specs", "stray", "spec.md"), "utf8").catch(() => undefined);
+  assert.equal(created, undefined, "fast lane must not merge any delta spec");
+});
+
+await test("readArtifactSizes: absent proposal -> no key; two spec files sum into specs", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "sizes");
+  const empty = await readArtifactSizes(cwd, "sizes");
+  assert.equal(empty.proposal, undefined);
+  assert.equal(empty.tasks, undefined);
+  assert.equal(empty.specs, 0);
+
+  await writeFile(paths.proposal, "hello", "utf8");
+  await writeFile(paths.tasks, "tasks!", "utf8");
+  await mkdir(join(paths.specsDir, "a"), { recursive: true });
+  await mkdir(join(paths.specsDir, "b"), { recursive: true });
+  await writeFile(join(paths.specsDir, "a", "spec.md"), "12345", "utf8");
+  await writeFile(join(paths.specsDir, "b", "spec.md"), "678", "utf8");
+  const sizes = await readArtifactSizes(cwd, "sizes");
+  assert.equal(sizes.proposal, 5);
+  assert.equal(sizes.tasks, 6);
+  assert.equal(sizes.specs, 8);
 });
 
 await test("archiveChange: appends to existing spec rather than overwriting", async () => {
@@ -407,6 +554,7 @@ await test("archiveChange: MODIFIED/REMOVED delta is flagged as unappliedModific
   await writeFile(paths.tasks, "- [x] 1.1 done\n", "utf8");
 
   const result = await archiveChange(cwd, "archive-mod-removed");
+  assert.equal(result.specsMergeSkipped, false, "full lane merges specs");
   assert.equal(result.unappliedModifications.length, 2);
   assert.ok(result.unappliedModifications.some((u) => u.verb === "MODIFIED" && u.requirement === "Spin"));
   assert.ok(result.unappliedModifications.some((u) => u.verb === "REMOVED" && u.requirement === "LegacyExport"));

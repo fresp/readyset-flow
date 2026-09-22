@@ -35,10 +35,12 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 
 - **Grill** interrogates the idea until it's unambiguous — a real Q&A, not a rubber stamp. It also
   proposes a **lane** (`--lane fast|full` to force one): fast folds Explore into Propose, caps the
-  plan, and skips the heavier review probes; full is the workflow below.
+  plan, skips the heavier review probes, and writes a smaller artifact set (proposal + tasks only);
+  full is the workflow below.
 - **Explore** greps the actual repo before anything gets proposed, instead of assuming.
 - **Propose** writes a proposal, design, specs, and tasks — grounded in what Explore found, and
-  with a `## Files This Change Will Touch` scope contract the gate checks against.
+  with a `## Files This Change Will Touch` scope contract the gate checks against. (The fast lane
+  writes just `proposal.md` and `tasks.md`, with acceptance scenarios under `## Acceptance`.)
 - **Review** stops for your Approve / Refine / Discard — **Discard is the default**, so nothing
   executes without a deliberate look. Approve & Execute compacts first (Explore/Propose context is
   already persisted to disk); "keep context" is the escape hatch.

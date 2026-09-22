@@ -56,6 +56,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { ChangeLane } from "./readyset-spec.ts";
 
 // readyset-review.ts's handler calls readPreferredLanguage()/readPinnedModel()/readFallbackChain()
 // with NO argument by design -- see readyset-review.ts's own comment on that invariant (the
@@ -239,6 +240,54 @@ export async function readCompactMinContextPercent(configPath: string = OMP_CONF
 	if (raw === undefined) return { percent: DEFAULT_COMPACT_MIN_CONTEXT_PERCENT, warning: undefined };
 	const parsed = parseCompactMinContextPercent(raw);
 	return { percent: parsed.percent, warning: parsed.warning };
+}
+
+/** Per-artifact character budgets for one lane. Each value bounds the artifact's raw text
+ *  length; `Infinity` means "no budget on this lane". `specs` is the TOTAL across every
+ *  specs/**\/spec.md file, not a per-file cap. */
+export interface ArtifactBudgets { proposal: number; design: number; specs: number; tasks: number }
+
+/** Default budgets per lane. Full lane: a real cap on every planning artifact. Fast lane: only
+ *  proposal.md and tasks.md carry a budget (the fast lane writes no design.md and no spec delta,
+ *  so those stay `Infinity`). */
+export const DEFAULT_ARTIFACT_BUDGETS: Record<ChangeLane, ArtifactBudgets> = {
+	fast: { proposal: 4000, design: Infinity, specs: Infinity, tasks: 3000 },
+	full: { proposal: 4000, design: 5000, specs: 6000, tasks: 4000 },
+};
+
+/** Parses `readyset.artifacts.budget.<file>` for `<file>` in `proposal|design|specs|tasks`,
+ *  starting from `base` and overriding only the keys actually present and valid. A value is
+ *  accepted only when it is a positive finite integer; anything else (non-numeric, <= 0,
+ *  Infinity, empty) keeps `base`'s value. No warning is surfaced for an invalid budget (unlike
+ *  `readyset.lane.default`): a budget is a soft signal that only drives a warning, so a typo
+ *  must not block a run. */
+export function parseArtifactBudgets(raw: string, base: ArtifactBudgets): ArtifactBudgets {
+	const doc = parseYamlSubset(raw);
+	const out: ArtifactBudgets = { ...base };
+	for (const file of ["proposal", "design", "specs", "tasks"] as const) {
+		const value = getPath(doc, `readyset.artifacts.budget.${file}`);
+		if (value === undefined) continue;
+		const text = typeof value === "string" ? value.trim() : String(value);
+		const num = Number(text);
+		if (text === "" || !Number.isInteger(num) || !Number.isFinite(num) || num <= 0) continue;
+		out[file] = num;
+	}
+	return out;
+}
+
+/** Resolves the artifact budgets for both lanes, reading the omp config file the same way every
+ *  other reader here does (default `OMP_CONFIG_PATH`, never throws). One config block overrides
+ *  the same key on both lanes: the key is not lane-scoped, so a fast-lane `design: Infinity`
+ *  default can only be lowered by config, never raised to a real budget on the fast lane. */
+export async function readArtifactBudgets(
+	configPath: string = OMP_CONFIG_PATH,
+): Promise<Record<ChangeLane, ArtifactBudgets>> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { fast: { ...DEFAULT_ARTIFACT_BUDGETS.fast }, full: { ...DEFAULT_ARTIFACT_BUDGETS.full } };
+	return {
+		fast: parseArtifactBudgets(raw, DEFAULT_ARTIFACT_BUDGETS.fast),
+		full: parseArtifactBudgets(raw, DEFAULT_ARTIFACT_BUDGETS.full),
+	};
 }
 
 /** Readyset's own fallback chain: `readyset.model.fallbackChains` (an ordered list, current

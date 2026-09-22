@@ -292,10 +292,21 @@ model, and fallback chain) — `readyset.model.phases` is hand-edited YAML.
 A change runs on one of two lanes. The lane decides how heavy the later phases are, and it is a
 real run input — not just a label on the brainstorm picker.
 
-- **Full** (default) — the five stages as described above, including a separate Explore turn.
+- **Full** (default) — the five stages as described above, including a separate Explore turn. It
+  writes the full artifact set: `proposal.md`, `design.md`, `specs/**/spec.md`, `tasks.md`.
 - **Fast** — for a small, well-understood change. Explore is folded into Propose (no separate turn;
   a few targeted reads, noted inline in `CONTEXT.md`), Propose carries a tight-planning suffix
   (roughly 8 tasks, no padding), and the code-review turn skips mutation-testing-style probes.
+  It also writes a **smaller artifact set**: `proposal.md` and `tasks.md` only — **no `design.md`
+  and no spec delta**. The acceptance scenarios that a spec delta would carry live under a
+  `## Acceptance` section in `proposal.md` instead, one `- **WHEN** … **THEN** …` bullet per
+  scenario, each given an id (`[S1]`, `[S2]`, … in document order) that `tasks.md` references.
+
+Whichever lane runs, `proposal.md` opens with a small YAML frontmatter block whose first line
+records the lane (`lane: full` or `lane: fast`). That line is the on-disk source of truth for the
+lane: `validateChange`, `archiveChange`, the review overlay, and the standalone `readyset-flow
+validate` CLI all read it, so they agree without any run context or phase log. A proposal with no
+`lane:` line (an older change) reads as **full**.
 
 The lane follows the grilling signal. Grilling writes a clarity score onto the brainstorm
 (`clear` = 0 open decisions after fact-finding, `partial` = 1–2, `ambiguous` = 3+ or an undefined
@@ -329,6 +340,43 @@ language, model, and fallback chain.
 
 The lane trims **volume**, never the questions that change behavior: grilling still asks everything
 whose answer would change what gets built on either lane.
+
+### Artifact budgets
+
+Each planning artifact has a character budget. The Propose prompt states them (and the rules that
+keep the artifacts from restating each other), the gate panel shows a measured line per artifact
+(`artifacts: proposal 3,120 chars (budget 4,000)`, with `— OVER by N` when it runs long), and an
+overrun is only ever a **warning** — it never blocks the gate.
+
+The defaults, per lane:
+
+| artifact | full lane | fast lane |
+| --- | --- | --- |
+| `proposal.md` | 4,000 | 4,000 |
+| `design.md` | 5,000 | unlimited (no design.md) |
+| `specs/**` **total** | 6,000 | unlimited (no spec delta) |
+| `tasks.md` | 4,000 | 3,000 |
+
+`specs` is a **total** across every `specs/**/spec.md` file, not a per-file cap. Override any of
+them under `readyset.artifacts.budget.<file>` in `~/.omp/agent/config.yml`:
+
+```yaml
+readyset:
+  artifacts:
+    budget:
+      proposal: 3000
+      specs: 8000
+```
+
+The key is not lane-scoped: one block sets the same value on both lanes, so a fast-lane
+`design`/`specs` budget (which defaults to unlimited) can only be *lowered* by config, never
+raised to a real budget. An invalid value (non-numeric, `0`, negative, empty) silently keeps the
+default — a budget is a soft signal, so a typo must not block a run.
+
+A file that runs **more than 1.5× its budget** fires at most **one** Trim turn (planning-only,
+never code; skipped when the turn budget is too tight to keep Apply and Review), which rewrites
+just the over-budget artifacts down to budget by removing restated content. The turn is recorded
+as a `trim` phase event carrying the before/after sizes.
 
 ## The review gate
 
@@ -457,14 +505,15 @@ opposite direction: an alias for `install`, to refresh the linked extension and 
 
 ## Files a change accumulates
 
-Under `readyset/changes/<id>/`, in the order they get written:
+Under `readyset/changes/<id>/`. On the **full lane**, in the order they get written:
 
 ```
 EXPLORATION.md   Explore phase findings — what was actually checked, and what was found
 proposal.md      Why / What Changes, plus the `## Files This Change Will Touch` scope contract
                  (mark files the change will create with `(new)` and files it will delete with
                  `(delete)`, so the gate can tell them from files that must already exist; Readyset
-                 repairs a wrong contract once, automatically, before the gate)
+                 repairs a wrong contract once, automatically, before the gate). Opens with a
+                 `lane: full|fast` frontmatter line — the on-disk source of truth for the lane
 design.md        Context / Goals-Non-Goals / Decisions / Risks
 specs/**/spec.md ADDED/MODIFIED/REMOVED Requirements as WHEN/THEN scenarios
 tasks.md         checkbox tasks; each `- [x]` carries an indented `_Verified:` note
@@ -478,9 +527,25 @@ CONTEXT.md       append-only audit trail — one entry per phase transition, wri
                  timestamp, the effective lane (`fast`/`full`) and its source (`flag`/`brainstorm`),
                  and where relevant the phase model and an outcome. readyset-bench's compile step
                  reads these to split runs by lane and attribute tokens/wall time to phases.
-                 Also carries the once-written pre-existing-dirty baseline the gate invariant
-                 and scope check subtract (see "What it deliberately does not do")
+                 A `propose`/`trim` event also carries per-artifact character counts, so the bench
+                 can report planning size by lane. Also carries the once-written pre-existing-dirty
+                 baseline the gate invariant and scope check subtract (see "What it deliberately
+                 does not do")
 REVIEW.md        code-review phase findings, written after implementation, before archive
+```
+
+The **fast lane** carries a smaller set — no `design.md` and no spec delta:
+
+```
+proposal.md      Why / What Changes / `## Files This Change Will Touch`, plus a `## Acceptance`
+                 section holding the acceptance scenarios (one `- **WHEN** … **THEN** …` bullet
+                 each, with `[S1]`, `[S2]`, … ids that `tasks.md` references). Opens with a
+                 `lane: fast` frontmatter line
+tasks.md         checkbox tasks; each `[Sn]` maps back to a proposal `## Acceptance` scenario and
+                 each `- [x]` carries an indented `_Verified:` note
+evidence/E*.md   same as the full lane
+CONTEXT.md       same as the full lane
+REVIEW.md        same as the full lane
 ```
 
 ## Package layout

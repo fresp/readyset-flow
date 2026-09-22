@@ -13,6 +13,9 @@ import {
 	parsePhaseModels,
 	parseYamlSubset,
 	parseLaneDefault,
+	parseArtifactBudgets,
+	DEFAULT_ARTIFACT_BUDGETS,
+	readArtifactBudgets,
 	readCompactMinContextPercent,
 	readFallbackChain,
 	readFallbackModel,
@@ -422,6 +425,45 @@ await test("readLaneDefault: a present but invalid value -> ask plus a warning",
   const parsed = await readLaneDefault(configPath);
   assert.equal(parsed.laneDefault, "ask");
   assert.ok(parsed.warning && parsed.warning.length > 0);
+});
+
+await test("parseArtifactBudgets: absent key -> base unchanged", () => {
+  assert.deepEqual(parseArtifactBudgets("readyset:\n  lane:\n    default: ask\n", DEFAULT_ARTIFACT_BUDGETS.full), DEFAULT_ARTIFACT_BUDGETS.full);
+});
+
+await test("parseArtifactBudgets: a valid override changes only that file", () => {
+  const out = parseArtifactBudgets("readyset:\n  artifacts:\n    budget:\n      proposal: 1234\n", DEFAULT_ARTIFACT_BUDGETS.full);
+  assert.equal(out.proposal, 1234);
+  assert.equal(out.design, DEFAULT_ARTIFACT_BUDGETS.full.design);
+  assert.equal(out.specs, DEFAULT_ARTIFACT_BUDGETS.full.specs);
+  assert.equal(out.tasks, DEFAULT_ARTIFACT_BUDGETS.full.tasks);
+});
+
+await test("parseArtifactBudgets: non-numeric / 0 / negative / empty each keep the base value", () => {
+  const base = DEFAULT_ARTIFACT_BUDGETS.full;
+  for (const bad of ["abc", "0", "-5", ""]) {
+    const raw = `readyset:\n  artifacts:\n    budget:\n      proposal: ${bad === "" ? '""' : bad}\n`;
+    assert.equal(parseArtifactBudgets(raw, base).proposal, base.proposal, `value "${bad}" must keep the default`);
+  }
+});
+
+await test("parseArtifactBudgets: specs overrides the total", () => {
+  const out = parseArtifactBudgets("readyset:\n  artifacts:\n    budget:\n      specs: 999\n", DEFAULT_ARTIFACT_BUDGETS.fast);
+  assert.equal(out.specs, 999);
+});
+
+await test("readArtifactBudgets: missing file -> both lanes' defaults; one block overrides both lanes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const missing = await readArtifactBudgets(join(dir, "does-not-exist.yml"));
+  assert.deepEqual(missing.fast, DEFAULT_ARTIFACT_BUDGETS.fast);
+  assert.deepEqual(missing.full, DEFAULT_ARTIFACT_BUDGETS.full);
+
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  artifacts:\n    budget:\n      proposal: 2500\n", "utf8");
+  const read = await readArtifactBudgets(configPath);
+  assert.equal(read.fast.proposal, 2500, "the flat key overrides the fast lane too");
+  assert.equal(read.full.proposal, 2500);
+  assert.equal(read.fast.design, Infinity, "the fast lane's design budget stays Infinity");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

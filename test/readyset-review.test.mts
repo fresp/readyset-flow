@@ -391,14 +391,12 @@ await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and
   const dir = join(cwd, "readyset", "changes", "fast-fix");
 
   // No Explore effect queued: the fast lane must never fire an Explore turn.
-  // Propose effect: writes valid artifacts
+  // Propose effect: writes the fast-lane artifact set (proposal.md with lane:+Acceptance, tasks.md).
   fakePiWrap.queueEffect(async () => {
-    await mkdir(join(dir, "specs", "cap"), { recursive: true });
-    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
-    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await mkdir(dir, { recursive: true });
     await writeFile(
-      join(dir, "specs", "cap", "spec.md"),
-      "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      join(dir, "proposal.md"),
+      "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- x (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
       "utf8",
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
@@ -1861,12 +1859,10 @@ await test("the grill end phase event carries the clarity signal from the brains
   const dir = join(cwd, "readyset", "changes", "signal");
   // --lane fast skips Explore, so the first effect is the Propose turn.
   fakePiWrap.queueEffect(async () => {
-    await mkdir(join(dir, "specs", "cap"), { recursive: true });
-    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
-    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await mkdir(dir, { recursive: true });
     await writeFile(
-      join(dir, "specs", "cap", "spec.md"),
-      "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      join(dir, "proposal.md"),
+      "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- x (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
       "utf8",
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
@@ -2346,12 +2342,10 @@ await test("fast-lane run records its effective lane and the full phase-boundary
   const dir = join(cwd, "readyset", "changes", "fast-fix");
   // No Explore effect: fast lane never fires an Explore turn.
   fakePiWrap.queueEffect(async () => {
-    await mkdir(join(dir, "specs", "cap"), { recursive: true });
-    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
-    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await mkdir(dir, { recursive: true });
     await writeFile(
-      join(dir, "specs", "cap", "spec.md"),
-      "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      join(dir, "proposal.md"),
+      "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- x (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
       "utf8",
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
@@ -2484,17 +2478,15 @@ await test("T0: the Propose path repairs a dangling contract before the gate", a
   fakeUiWrap.selectQueue.push("Archive now"); // archive prompt
   fakeUiWrap.selectQueue.push("Approve & Execute"); // gate
 
-  // Propose turn: writes a contract with a dangling line.
+  // Propose turn: writes a fast-lane contract with a dangling line.
   fakePiWrap.queueEffect(async () => {
-    await mkdir(join(dir, "specs", "cap"), { recursive: true });
-    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n", "utf8");
-    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
-    await writeFile(join(dir, "specs", "cap", "spec.md"), "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n", "utf8");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/missing.ts\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n", "utf8");
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
   // Repair turn: rewrites the contract to a path that exists.
   fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n", "utf8");
+    await writeFile(join(dir, "proposal.md"), "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/real.ts\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n", "utf8");
     await mkdir(join(cwd, "src"), { recursive: true });
     await writeFile(join(cwd, "src", "real.ts"), "x\n", "utf8");
   });
@@ -3744,6 +3736,237 @@ await test("D1: the apply diff stats count fully staged (git add-ed) changes", a
   assert.equal(applyEnd.outcome, "applied");
   assert.ok((applyEnd.diff?.files ?? 0) >= 1, "the staged file is counted (git diff --numstat would report 0)");
   assert.ok((applyEnd.diff?.added ?? 0) >= 1, "the staged added lines are counted");
+});
+
+// --- Fast-lane artifact set + per-artifact budgets + the bounded Trim turn -------------------
+
+const FAST_LANE_PROPOSAL = (body: string) =>
+  `---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/thing.ts (new)\n\n${body}`;
+
+/** Writes a minimal, gate-reachable fast-lane change (proposal.md with lane:fast + Acceptance,
+ *  tasks.md) and returns the change dir. No design.md, no spec delta. The brainstorm records
+ *  `lane: full` so the default picker lists it; `--lane fast` overrides the run's lane. */
+async function writeFastLaneChange(cwd: string, changeId: string, title: string, acceptance = "## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n") {
+  await writeBrainstorm(cwd, `2026-05-01-${changeId}.md`, {
+    title,
+    status: "proposed",
+    created: "2026-05-01",
+    change_id: changeId,
+    lane: "full",
+  });
+  const dir = join(cwd, "readyset", "changes", changeId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), FAST_LANE_PROPOSAL(acceptance), "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+  return dir;
+}
+
+await test("fast lane: the review document shows the Artifact set section, not design/specs placeholders", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  await writeFastLaneChange(cwd, "fast-overlay", "Fast Overlay");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-01 · Fast Overlay"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // gate
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  const doc = fakeUiWrap.editorTextHistory.join("\n\n");
+  assert.match(doc, /Artifact set/, "the compiled document names the fast-lane artifact set");
+  assert.match(doc, /no design\.md and no spec delta/, "the fast-lane description is rendered");
+  assert.ok(!doc.includes("_(design.md not found.)_"), "no design.md placeholder on the fast lane");
+  assert.ok(!doc.includes("_(no specs/**/spec.md found.)_"), "no specs placeholder on the fast lane");
+  assert.equal(fakePiWrap.calls.length, 0, "a straight discard fires no turns");
+});
+
+await test("fast lane: an overrun warns in the gate panel and fires exactly one Trim turn", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  // proposal budget on the fast lane is 4,000; 1.5x is 6,000. Blow well past that.
+  const bigBullets = Array.from({ length: 200 }, (_, i) => `- change number ${i} with some padding text`).join("\n");
+  const acceptance = "## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n";
+  const dir = join(cwd, "readyset", "changes", "fast-trim");
+  // status "open" -> an Explore-less fast-lane Propose turn fires, so the handler's post-Propose
+  // trim call site runs (the already-proposed path never reaches it).
+  await writeBrainstorm(cwd, "2026-05-02-fast-trim.md", {
+    title: "Fast Trim", status: "open", created: "2026-05-02", change_id: "fast-trim", lane: "full",
+  }, VALID_BRAINSTORM_BODY);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-02 · Fast Trim"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // gate
+
+  // Propose effect: writes an over-budget proposal (and tasks.md).
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "proposal.md"), FAST_LANE_PROPOSAL(`## What Changes\n\n${bigBullets}\n\n${acceptance}`), "utf8");
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+  });
+  // Trim effect: rewrites proposal.md under budget (the trimmed outcome).
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), FAST_LANE_PROPOSAL(acceptance), "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  // The gate panel shows a budget line for the artifact (the Propose turn's overrun was already
+  // trimmed back under budget before the gate opened — see the trim event assertions below).
+  const panel = fakeUiWrap.widgetHistory.flat().join("\n");
+  assert.match(panel, /artifacts: proposal \d[\d,]* chars \(budget 4,000\)/, "the gate line shows the proposal budget");
+
+  // Exactly one Trim turn fired.
+  const trims = fakePiWrap.calls.filter((c) => /over their character budget/.test(c.prompt));
+  assert.equal(trims.length, 1, "exactly one Trim turn fired, no loop");
+
+  // The trim event records the before/after sizes and a trimmed outcome.
+  const events = await phaseEventsArchivedOrLive(cwd, "fast-trim");
+  const trimEnd = events.find((e) => e.phase === "trim" && e.edge === "end");
+  assert.ok(trimEnd, "a trim end event exists");
+  assert.equal(trimEnd.outcome, "trimmed");
+  assert.ok(trimEnd.artifactChars, "the trim event carries artifactChars");
+  assert.ok((trimEnd.artifactChars!.before.proposal ?? 0) > 1.5 * 4000, "before size is over 1.5x");
+  assert.ok((trimEnd.artifactChars!.after.proposal ?? 0) <= 4000, "after size is under budget");
+});
+
+await test("fast lane: the Trim turn is caught if it writes outside the change directory", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await clearConfig();
+  const bigBullets = Array.from({ length: 200 }, (_, i) => `- change number ${i} with some padding text`).join("\n");
+  const dir = join(cwd, "readyset", "changes", "fast-trim-violation");
+  await writeBrainstorm(cwd, "2026-05-03-fast-trim-violation.md", {
+    title: "Trim Violation", status: "open", created: "2026-05-03", change_id: "fast-trim-violation", lane: "full",
+  }, VALID_BRAINSTORM_BODY);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-03 · Trim Violation");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  // Propose effect: over-budget proposal.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "proposal.md"), FAST_LANE_PROPOSAL(`## What Changes\n\n${bigBullets}\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n`), "utf8");
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+  });
+  // Trim effect: rewrites proposal.md under budget but ALSO writes a file outside the change dir.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), FAST_LANE_PROPOSAL("## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n"), "utf8");
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "leaked.ts"), "x\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  const events = await phaseEventsArchivedOrLive(cwd, "fast-trim-violation");
+  const trimEnd = events.find((e) => e.phase === "trim" && e.edge === "end");
+  assert.ok(trimEnd, "a trim end event exists");
+  assert.equal(trimEnd.outcome, "partial", "a boundary violation fails the trim");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /outside the change directory/.test(n.message) && n.level === "error"),
+    "an error notification names the boundary violation",
+  );
+});
+
+await test("fast lane: an exhausted budget skips the Trim and only warns", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  // A valid scope contract means no contract-repair turn interferes, so each Refine round
+  // consumes exactly one turn. The proposal stays under 1.5x for the first six rounds (where a
+  // trim would still be affordable) and only blows past 1.5x from round seven on — by then
+  // turnsAvailableFor(budget, 3) is false, so the trim is skipped and only warns.
+  const bigBullets = Array.from({ length: 200 }, (_, i) => `- change number ${i} with some padding text`).join("\n");
+  const contract = "## Files This Change Will Touch\n\n- src/thing.ts (new)\n";
+  const small = FAST_LANE_PROPOSAL(`${contract}\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n`);
+  const big = FAST_LANE_PROPOSAL(`## What Changes\n\n${bigBullets}\n\n${contract}\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n`);
+  const dir = join(cwd, "readyset", "changes", "fast-trim-budget");
+  await writeBrainstorm(cwd, "2026-05-04-fast-trim-budget.md", {
+    title: "Trim Budget", status: "proposed", created: "2026-05-04", change_id: "fast-trim-budget", lane: "full",
+  });
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), small, "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  // Many Refine rounds (each consumes a turn + a repair turn) to tighten the budget, then Discard.
+  fakeUiWrap.selectQueue.push("2026-05-04 · Trim Budget");
+  for (let i = 0; i < 8; i++) {
+    fakeUiWrap.selectQueue.push("Refine");
+    fakeUiWrap.inputQueue.push(`refine ${i}`);
+  }
+  fakeUiWrap.selectQueue.push("Discard");
+
+  for (let i = 0; i < 8; i++) {
+    const over = i >= 6;
+    fakePiWrap.queueEffect(async () => {
+      await writeFile(join(dir, "proposal.md"), over ? big : small, "utf8");
+    });
+  }
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  const events = await phaseEventsArchivedOrLive(cwd, "fast-trim-budget");
+  const trimEnds = events.filter((e) => e.phase === "trim" && e.edge === "end");
+  assert.ok(trimEnds.some((e) => e.outcome === "skipped-budget"), "a trim end event records skipped-budget");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /starve Apply\/Review/.test(n.message) && n.level === "warning"),
+    "the trim reserve warns about starving Apply/Review",
+  );
+  // No trim prompt ever fired (every trim that wanted to run was skipped at the reserve boundary).
+  assert.ok(
+    !fakePiWrap.calls.some((c) => /over their character budget/.test(c.prompt)),
+    "no Trim turn fired",
+  );
+});
+
+await test("fast lane: archiving notifies info-level 'no spec delta' and CONTEXT.md records it", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  const dir = await writeFastLaneChange(cwd, "fast-archive", "Fast Archive");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-01 · Fast Archive"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Archive now");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  const infoNotice = fakeUiWrap.notifications.find((n) => /Archived to/.test(n.message) && n.level === "info");
+  assert.ok(infoNotice, "an info-level archive notice fired");
+  assert.match(infoNotice!.message, /no spec delta/);
+  assert.ok(
+    !fakeUiWrap.notifications.some((n) => n.level === "warning" && /append-only merge/.test(n.message)),
+    "no warning-level spec-merge notice on the fast lane",
+  );
+
+  const archiveRoot = join(cwd, "readyset", "changes", "archive");
+  const entries = await (await import("node:fs/promises")).readdir(archiveRoot).catch(() => [] as string[]);
+  const archivedDirName = entries.find((name) => name.endsWith("-fast-archive"));
+  assert.ok(archivedDirName, "the change was archived");
+  const context = await readFile(join(archiveRoot, archivedDirName!, "CONTEXT.md"), "utf8");
+  assert.match(context, /no spec delta to merge/);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
