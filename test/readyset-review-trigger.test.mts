@@ -323,17 +323,29 @@ const baseInput: ReviewTriggerInput = {
   diff: { files: 1, added: 5, deleted: 1 },
   changedPaths: ["src/thing.ts"],
   clarity: "clear",
+  openDecisions: 0,
   thresholds: { maxLines: 150, maxFiles: 5, sensitivePaths: ["auth/**", "**/auth/**", "Dockerfile"] },
 };
 
-await test("evaluateReviewTriggers: a clean change fires nothing, all six are evaluated in order", () => {
+await test("evaluateReviewTriggers: a clean change fires nothing, all seven are evaluated in order", () => {
   const r = evaluateReviewTriggers(baseInput);
   assert.deepEqual(r.fired, []);
   assert.deepEqual(
     r.evaluated.map((e) => e.name),
-    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "clarity"],
+    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "clarity", "open-decisions"],
   );
   assert.ok(r.evaluated.every((e) => !e.fired));
+});
+
+await test("evaluateReviewTriggers: open-decisions fires when N > 0, not at 0, and is evaluated after clarity", () => {
+  const fired = evaluateReviewTriggers({ ...baseInput, openDecisions: 2 });
+  assert.deepEqual(fired.fired, ["open-decisions"]);
+  const last = fired.evaluated[fired.evaluated.length - 1];
+  assert.equal(last.name, "open-decisions");
+  assert.equal(last.value, "2 open decision(s)");
+  const none = evaluateReviewTriggers({ ...baseInput, openDecisions: 0 });
+  assert.deepEqual(none.fired, []);
+  assert.equal(none.evaluated[none.evaluated.length - 1].value, "none");
 });
 
 await test("evaluateReviewTriggers: scope-drift fires on an unjustified drift path", () => {
@@ -656,7 +668,7 @@ await test("end-to-end: auto skips review, writes a stub, and records every trig
   assert.equal(end?.review?.mode, "auto");
   assert.deepEqual(
     end?.review?.triggersEvaluated.map((t) => t.name),
-    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "clarity"],
+    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "clarity", "open-decisions"],
   );
   assert.ok(end?.review?.triggersEvaluated.every((t) => !t.fired), "every evaluated trigger must have fired=false");
   assert.deepEqual(end?.review?.triggersFired, []);

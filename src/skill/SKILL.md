@@ -94,6 +94,14 @@ I actually looked at" attached does not belong in this file.
   isn't named. Omitting the section means "no contract", never "everything allowed".
 - `## Acceptance` — **fast lane only**; the spec delta's replacement. One `- **WHEN** … **THEN** …`
   bullet per scenario, each with a `[S1]`, `[S2]`, … id.
+- `## Open Decisions` — every decision that is still undecided, one `### <question>` block each
+  with `- Options:` / `- Recommended:` / `- Changes per option:` lines (or the single line
+  `none`). Anything the repo, the brainstorm or a lookup can settle must be answered instead of
+  listed here, and nothing may be left "carried open" in `design.md`/`specs/`/`tasks.md`. A
+  decision with no `- Recommended:` line is flagged (warning-only) in the gate.
+- `## Assumptions` — each brainstorm `## Assumed` item restated as
+  `- <assumed decision> — <chosen behavior>` (or `none`), so what was assumed rather than asked is
+  visible at approval.
 
 **`design.md`** — **full lane only**
 - `## Context`
@@ -111,7 +119,10 @@ I actually looked at" attached does not belong in this file.
 
 **`tasks.md`** — numbered sections, each task a `- [ ] N.M <description>` checkbox line. Each task
 maps to a scenario (a proposal `## Acceptance` id on the fast lane, a spec scenario on the full
-lane) rather than restating its WHEN/THEN text.
+lane) rather than restating its WHEN/THEN text. A `## Scope deviations` section records any file
+changed outside the scope contract (`- <path> — <reason>`), and a `## Decisions made during Apply`
+section records each open decision applied at the recommended option
+(`- <decision> → <chosen option> → <why>`).
 
 ### The `_Verified:` note
 
@@ -140,7 +151,14 @@ further along.
 actually match every requirement's WHEN/THEN scenarios (or does it narrow/skip/half-implement
 any of them), are the `_Verified:` notes credible (a vague note like "looks correct" is not a
 verification), and any correctness bug or regression risk visible in the touched files,
-whether or not `tasks.md` mentioned it.
+whether or not `tasks.md` mentioned it. It ends with a `## Blocking` section — one bullet per
+finding that violates a WHEN/THEN scenario, an explicit requirement (including a doc the request
+or the contract asked for that was never written), or a recorded decision, or the literal `none`.
+A non-empty `## Blocking` fires **exactly one** bounded *review-fix* turn (on the apply phase
+model) that fixes only those findings and appends a `## Fix turn` section recording each one fixed
+or not-fixed; no second review runs. That turn's `review-fix` phase event carries `fixed` /
+`partial` / `skipped-budget` / `not-needed`, it re-runs the post-Apply scope check (warning only),
+and the archive prompt states `blocking: N found, M fixed`.
 
 **`CONTEXT.md`** — append-only, one `## <Phase> — <ISO timestamp>` entry per phase
 transition, written by the extension automatically. Never hand-edit this file; it's an audit

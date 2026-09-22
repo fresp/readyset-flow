@@ -423,6 +423,18 @@ Picks a brainstorm, then depending on its status:
     document's **Scope** section, which also shows `contract repair: fixed N of M` when a repair ran.
     Mark files the change will *create* with `(new)` and files it will *delete* with `(delete)` so
     each absence or presence reads as expected.
+  - The panel also shows the **open decisions**: `proposal.md`'s `## Open Decisions` section (one
+    `### <question>` block per decision, each with `Options` / `Recommended` / `Changes per option`)
+    and the `## Assumptions` section (each brainstorm `## Assumed` item restated with the chosen
+    behavior). The panel states the count and lists each question with its recommendation, and the
+    compiled review document gets an **Open decisions** section showing the raw blocks and the
+    assumptions. When any decision is unresolved, the gate offers a **Resolve open decisions** CTA
+    (`[O]` in the sidebar, a menu item otherwise) that refines the change with the list so you can
+    pick (or confirm) the recommended option for each; the refinement moves each resolved item into
+    `## Assumptions` and updates the affected scenarios. Approving with open decisions is still
+    allowed — warn, never block — recorded as `openDecisions` on the `gate` `end` phase event, and
+    any still open at approval are applied using the **recommended** option and recorded under
+    `## Decisions made during Apply` in `tasks.md`.
 - Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
@@ -475,7 +487,9 @@ Picks a brainstorm, then depending on its status:
     `**/schema/**`, `payment/**`, `**/payment/**`, `crypto/**`, `**/crypto/**`, `**/*.pem`,
     `**/*.key`, `.github/**`, `Dockerfile`, `**/Dockerfile`, `docker-compose*.yml`,
     `**/docker-compose*.yml`); (6) **clarity** — the brainstorm's `clarity` is `partial` or
-    `ambiguous`. `readyset.review.fullLane` (default `always`) keeps a full-lane change reviewed
+    `ambiguous`; (7) **open decisions** — `proposal.md`'s `## Open Decisions` still carries one or
+    more unresolved items at review time. `readyset.review.fullLane` (default `always`) keeps a
+    full-lane change reviewed
     regardless of triggers; set it to `auto` to let the triggers decide on the full lane too.
     - **Review policy.** Every trigger is recorded, fired or not, in the `review` `end` phase
       event (and in the stub) so the mode/triggers/outcome are auditable. A skipped run writes an
@@ -485,6 +499,17 @@ Picks a brainstorm, then depending on its status:
       change (overwriting any stub), which is the escape hatch when `auto` skipped it but you want
       a review before opening a PR. The default values here are **initial, pending benchmark
       data — not measured optima**.
+    - **The review-fix turn.** `REVIEW.md` must end with a `## Blocking` section — one bullet per
+      finding that violates a WHEN/THEN scenario, an explicit requirement (including a doc the
+      request or contract asked for that was never written), or a recorded decision; the literal
+      `none` when there are none. When it is non-empty, the run fires **exactly one** bounded
+      review-fix turn (on the apply phase model) that fixes only those findings and appends a
+      `## Fix turn` section recording each one fixed or not-fixed. No second review runs. The fix
+      turn obeys the same minimal-diff rules as Apply and gets the same post-Apply scope check
+      re-run (warning only — no second reconciliation turn). Its `review-fix` phase event carries
+      `fixed` / `partial` / `skipped-budget` / `not-needed`, and the archive prompt states
+      `blocking: N found, M fixed`. With no turn budget left it records `skipped-budget` and only
+      warns.
 
 ## Uninstall
 

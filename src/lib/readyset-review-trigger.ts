@@ -20,7 +20,8 @@ export type ReviewTriggerName =
 	| "no-evidence"
 	| "diff-size"
 	| "sensitive-path"
-	| "clarity";
+	| "clarity"
+	| "open-decisions";
 
 export interface ReviewTriggerInput {
 	/** Unjustified post-reconciliation drift paths (outside contract, no deviation entry). */
@@ -40,6 +41,8 @@ export interface ReviewTriggerInput {
 	changedPaths: string[];
 	/** Brainstorm clarity, when the run's source brainstorm carries one. */
 	clarity: "clear" | "partial" | "ambiguous" | undefined;
+	/** proposal.md's `## Open Decisions` count at review time; > 0 fires the `open-decisions` trigger. */
+	openDecisions: number;
 	thresholds: { maxLines: number; maxFiles: number; sensitivePaths: string[] };
 }
 
@@ -108,6 +111,12 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 		name: "clarity",
 		fired: input.clarity === "partial" || input.clarity === "ambiguous",
 		value: input.clarity ?? "absent",
+	});
+
+	evaluated.push({
+		name: "open-decisions",
+		fired: input.openDecisions > 0,
+		value: input.openDecisions > 0 ? `${input.openDecisions} open decision(s)` : "none",
 	});
 
 	return { evaluated, fired: evaluated.filter((e) => e.fired).map((e) => e.name), firedSensitivePaths };

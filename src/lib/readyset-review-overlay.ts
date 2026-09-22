@@ -115,14 +115,24 @@ export interface OverlaySection {
  * "keep-context" exists for the case where discussion nuance didn't make it into the
  * artifacts.
  */
-export type ReviewOverlayResult = "approve" | "compact" | "keep-context" | "refine" | "discard" | undefined;
+export type ReviewOverlayResult = "approve" | "compact" | "keep-context" | "refine" | "discard" | "resolve-decisions" | undefined;
 
-/** The four CTAs, in on-screen left-to-right / Left-Right-cycling order. Shared between
- *  `renderCtaBar` (display) and `ReviewSidebarOverlay.handleInput` (Left/Right cycling, Enter
- *  confirming `CTA_ACTIONS[actionIndex]`) so the two can never drift out of sync. */
-const CTA_ACTIONS = ["approve", "keep-context", "refine", "discard"] as const;
-type CtaAction = (typeof CTA_ACTIONS)[number];
-const CTA_KEYS: Record<CtaAction, string> = { approve: "A", "keep-context": "K", refine: "R", discard: "D" };
+/** The always-present CTAs, in on-screen left-to-right / Left-Right-cycling order.
+ *  `resolve-decisions` is inserted before `discard` only when the change carries open decisions
+ *  (see the `showResolveDecisions` constructor flag). Shared between `renderCtaBar` (display) and
+ *  `ReviewSidebarOverlay.handleInput` (Left/Right cycling, Enter confirming the focused action) so
+ *  the two can never drift out of sync. */
+const CTA_ACTIONS_BASE = ["approve", "keep-context", "refine", "discard"] as const;
+type CtaAction = "approve" | "keep-context" | "refine" | "resolve-decisions" | "discard";
+const CTA_KEYS: Record<CtaAction, string> = { approve: "A", "keep-context": "K", refine: "R", "resolve-decisions": "O", discard: "D" };
+
+/** The CTA list for a given run: base actions, with `resolve-decisions` before `discard` when the
+ *  change carries open decisions. */
+function ctaActions(showResolveDecisions: boolean): CtaAction[] {
+	const list: CtaAction[] = [...CTA_ACTIONS_BASE];
+	if (showResolveDecisions) list.splice(list.length - 1, 0, "resolve-decisions");
+	return list;
+}
 
 const MIN_SIDEBAR_WIDTH = 22;
 const MAX_SIDEBAR_WIDTH = 36;
@@ -170,14 +180,15 @@ function sidebarParts(heading: string, status: string): { heading: string; statu
  * `actionIndex` through `CTA_ACTIONS`, and Enter confirms whichever one is marked with `›` --
  * i.e. this bar behaves like a real (if compact) select() list, not just three static hints.
  */
-function renderCtaBar(taskSummary: string, focus: "sections" | "actions", actionIndex: number, width: number): string {
+function renderCtaBar(taskSummary: string, focus: "sections" | "actions", actionIndex: number, width: number, actions: CtaAction[]): string {
 	const labels: Record<CtaAction, string> = {
 		approve: `Approve & Execute — ${taskSummary}`,
 		"keep-context": "Keep context",
 		refine: "Refine",
+		"resolve-decisions": "Resolve open decisions",
 		discard: "Discard",
 	};
-	const parts = CTA_ACTIONS.map((action, i) => {
+	const parts = actions.map((action, i) => {
 		const marker = focus === "actions" && i === actionIndex ? "› " : "  ";
 		return `${marker}[${CTA_KEYS[action]}] ${labels[action]}`;
 	});
@@ -196,6 +207,7 @@ export function renderSidebarLayout(
 	taskSummary: string,
 	focus: "sections" | "actions",
 	actionIndex: number,
+	showResolveDecisions: boolean,
 	fg: (text: string) => string,
 	bold: (text: string) => string,
 	dim: (text: string) => string,
@@ -230,7 +242,7 @@ export function renderSidebarLayout(
 	// Discard. So those three actions live here as CTAs instead, bold/undimmed to read as the
 	// primary controls; the quieter nav hint stays dim below it. They also behave like a select()
 	// (see renderCtaBar) once Tab moves focus onto them, not just direct A/R/D keystrokes.
-	lines.push(bold(renderCtaBar(taskSummary, focus, actionIndex, innerWidth)));
+	lines.push(bold(renderCtaBar(taskSummary, focus, actionIndex, innerWidth, ctaActions(showResolveDecisions))));
 	// ↑/↓ scroll the CURRENT section's content and cross into the next/previous one once it's
 	// exhausted (see handleInput); ←/→ jump straight to a section, bypassing its content.
 	const scrollHint = bodyOverflow > 0 ? ` · PgUp/PgDn ±${BODY_SCROLL_STEP} (${scrollOffset}/${section?.bodyLines.length ?? 0})` : "";
@@ -288,6 +300,8 @@ export class ReviewSidebarOverlay implements Component {
 	#scrollOffset = 0;
 	#focus: "sections" | "actions" = "sections";
 	#actionIndex = 0;
+	#showResolveDecisions: boolean;
+	#actions: CtaAction[];
 
 	constructor(
 		theme: OverlayTheme,
@@ -296,6 +310,7 @@ export class ReviewSidebarOverlay implements Component {
 		sections: OverlaySection[],
 		taskSummary: string,
 		done: (result: ReviewOverlayResult) => void,
+		showResolveDecisions = false,
 	) {
 		this.#theme = theme;
 		this.#keybindings = keybindings;
@@ -303,6 +318,8 @@ export class ReviewSidebarOverlay implements Component {
 		this.#sections = sections;
 		this.#taskSummary = taskSummary;
 		this.#done = done;
+		this.#showResolveDecisions = showResolveDecisions;
+		this.#actions = ctaActions(showResolveDecisions);
 	}
 
 	invalidate(): void {}
@@ -351,6 +368,10 @@ export class ReviewSidebarOverlay implements Component {
 			this.#done("refine");
 			return;
 		}
+		if ((data === "o" || data === "O") && this.#showResolveDecisions) {
+			this.#done("resolve-decisions");
+			return;
+		}
 		if (data === "d" || data === "D") {
 			this.#done("discard");
 			return;
@@ -366,15 +387,15 @@ export class ReviewSidebarOverlay implements Component {
 
 		if (this.#focus === "actions") {
 			if (data === "\x1b[D") {
-				this.#actionIndex = (this.#actionIndex + CTA_ACTIONS.length - 1) % CTA_ACTIONS.length;
+				this.#actionIndex = (this.#actionIndex + this.#actions.length - 1) % this.#actions.length;
 				return;
 			}
 			if (data === "\x1b[C") {
-				this.#actionIndex = (this.#actionIndex + 1) % CTA_ACTIONS.length;
+				this.#actionIndex = (this.#actionIndex + 1) % this.#actions.length;
 				return;
 			}
 			if (this.#keybindings.matches(data, "tui.select.confirm") || data === "\n" || data === "\r") {
-				this.#done(CTA_ACTIONS[this.#actionIndex]);
+				this.#done(this.#actions[this.#actionIndex]);
 				return;
 			}
 			return; // section-nav keys are inert while focus is on the CTA bar
@@ -441,6 +462,7 @@ export class ReviewSidebarOverlay implements Component {
 			this.#taskSummary,
 			this.#focus,
 			this.#actionIndex,
+			this.#showResolveDecisions,
 			(text: string) => this.#theme.fg("accent", text),
 			(text: string) => this.#theme.bold(text),
 			(text: string) => this.#theme.fg("dim", text),

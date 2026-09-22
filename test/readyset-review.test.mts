@@ -1091,11 +1091,11 @@ await test("review gate pushes a full compiled document (all sections) to the ed
   assert.equal(fakeUiWrap.editorTextHistory.length, 1);
   const doc = fakeUiWrap.editorTextHistory[0];
   // table of contents lists every section with a status
-  for (const tocEntry of ["1. Exploration", "2. Proposal", "3. Scope", "4. Design", "5. Specs (1)", "6. Tasks (1/1)", "7. Verification summary", "8. Runtime evidence", "9. Code review", "10. Context log"]) {
+  for (const tocEntry of ["1. Exploration", "2. Proposal", "3. Open decisions", "4. Scope", "5. Design", "6. Specs (1)", "7. Tasks (1/1)", "8. Verification summary", "9. Runtime evidence", "10. Code review", "11. Context log"]) {
     assert.ok(doc.includes(tocEntry), `expected table of contents to include "${tocEntry}"`);
   }
   // each section heading appears again as its own header, and the spec file path is shown
-  for (const heading of ["EXPLORATION", "PROPOSAL", "SCOPE", "DESIGN", "SPECS (1)", "specs/widgets/spec.md", "TASKS (1/1)", "VERIFICATION SUMMARY", "RUNTIME EVIDENCE", "CODE REVIEW", "CONTEXT LOG"]) {
+  for (const heading of ["EXPLORATION", "PROPOSAL", "OPEN DECISIONS", "SCOPE", "DESIGN", "SPECS (1)", "specs/widgets/spec.md", "TASKS (1/1)", "VERIFICATION SUMMARY", "RUNTIME EVIDENCE", "CODE REVIEW", "CONTEXT LOG"]) {
     assert.ok(doc.includes(heading), `expected document to include "${heading}"`);
   }
   assert.match(doc, /REDIRECT_URI stale/);
@@ -3318,6 +3318,305 @@ await test("F1: an out-of-list revert by the model is detected and restored", as
   const archivePrompt = fakeUiWrap.selectPrompts.find((p) => /Archive now\?/.test(p));
   assert.ok(archivePrompt, "an archive prompt exists");
   assert.match(archivePrompt, /RESTORED/, "the archive prompt carries the RESTORED line");
+});
+
+// --- F2/F3: open decisions + blocking review findings -----------------------------------------
+
+/** A proposed change whose proposal.md carries an `## Open Decisions` section with one decision. */
+async function writeOpenDecisionChange(cwd: string, changeId: string, opts: { recommended?: boolean; reviewBody?: string } = {}) {
+  const dir = join(cwd, "readyset", "changes", changeId);
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  const rec = opts.recommended === false ? "" : "- Recommended: sqlite — simpler for one process\n";
+  await writeFile(
+    join(dir, "proposal.md"),
+    [
+      "---",
+      "lane: full",
+      "---",
+      "## Why",
+      "",
+      "x",
+      "",
+      "## What Changes",
+      "",
+      "- x",
+      "",
+      "## Files This Change Will Touch",
+      "",
+      "- src/keep.ts",
+      "",
+      "## Open Decisions",
+      "",
+      "### Which store?",
+      "- Options: sqlite | postgres",
+      rec + "- Changes per option: postgres adds a migration step",
+      "",
+      "## Assumptions",
+      "",
+      "- default timeout — 30s",
+    ].join("\n") + "\n",
+    "utf8",
+  );
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+  if (opts.reviewBody !== undefined) await writeFile(join(dir, "REVIEW.md"), opts.reviewBody, "utf8");
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+  return dir;
+}
+
+await test("F3: the gate shows open decisions and lists them in the review document", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-05-10-f3a.md", { title: "F3 A", status: "proposed", created: "2026-05-10", change_id: "f3a" });
+  await writeOpenDecisionChange(cwd, "f3a");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-10 · F3 A");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const panel = fakeUiWrap.widgetHistory.flat();
+  assert.ok(panel.some((l) => /open decisions: 1/.test(l)), "the panel states the open-decision count");
+  assert.ok(panel.some((l) => /Which store\?/.test(l)), "the panel lists the question");
+  const doc = fakeUiWrap.editorTextHistory.join("\n\n");
+  assert.match(doc, /Which store\?/, "the review document names the question");
+  assert.match(doc, /Open decisions/, "the review document has the Open decisions section");
+  assert.match(doc, /default timeout — 30s/, "the review document lists the assumptions");
+});
+
+await test("F3: 'Resolve open decisions' routes to Refine with the list", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-05-11-f3b.md", { title: "F3 B", status: "proposed", created: "2026-05-11", change_id: "f3b" });
+  const dir = await writeOpenDecisionChange(cwd, "f3b");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-11 · F3 B");
+  fakeUiWrap.selectQueue.push("Resolve open decisions");
+  // A Refine turn fires from the resolve branch; then the gate reopens -> Discard.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Discard");
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const refine = fakePiWrap.calls.find((c) => /Revise the Readyset change "f3b"/.test(c.prompt));
+  assert.ok(refine, "a Refine turn fired");
+  assert.match(refine.prompt, /Which store\?/, "the refine feedback carries the question");
+  assert.match(refine.prompt, /recommended:/, "the refine feedback names the recommendation");
+});
+
+await test("F3: the Apply prompt carries the apply-recommended rule when N > 0", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-05-12-f3c.md", { title: "F3 C", status: "proposed", created: "2026-05-12", change_id: "f3c" });
+  const dir = await writeOpenDecisionChange(cwd, "f3c");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-12 · F3 C");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const apply = fakePiWrap.calls.find((c) => /Implement the Readyset change "f3c"/.test(c.prompt));
+  assert.ok(apply, "an Apply turn fired");
+  assert.match(apply.prompt, /apply the RECOMMENDED option/);
+  assert.match(apply.prompt, /## Decisions made during Apply/);
+});
+
+await test("F3: the open-decisions trigger fires and the gate end event records the count", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-05-13-f3d.md", { title: "F3 D", status: "proposed", created: "2026-05-13", change_id: "f3d" });
+  const dir = await writeOpenDecisionChange(cwd, "f3d");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-13 · F3 D");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  // Review turn: leave `## Blocking` as none so no fix turn fires.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const events = await readPhaseEvents(cwd, "f3d");
+  const gateEnd = events.find((e) => e.phase === "gate" && e.edge === "end");
+  assert.ok(gateEnd, "a gate end event exists");
+  assert.equal(gateEnd.openDecisions, 1, "the gate end event records the open-decision count");
+  const reviewEnd = events.find((e) => e.phase === "review" && e.edge === "end");
+  assert.ok(reviewEnd?.review?.triggersFired.includes("open-decisions"), "the open-decisions trigger fired");
+});
+
+await test("F2: blocking findings fire exactly one fix turn", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-05-14-f2a.md", { title: "F2 A", status: "proposed", created: "2026-05-14", change_id: "f2a" });
+  const dir = await writeReconcileChange(cwd, "f2a");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-14 · F2 A");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  // Review writes one blocking finding.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\none problem\n\n## Blocking\n\n- scenario S1 is not met\n", "utf8");
+  });
+  // Fix turn: rewrite REVIEW.md with `## Blocking` empty.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\none problem\n\n## Blocking\n\nnone\n\n## Fix turn\n\n- scenario S1 is not met — fixed: added the branch (ran it)\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const fixCalls = fakePiWrap.calls.filter((c) => /Fix ONLY these|smallest change that addresses/.test(c.prompt));
+  assert.equal(fixCalls.length, 1, "exactly one fix turn fired");
+  const events = await readPhaseEvents(cwd, "f2a");
+  assert.ok(events.some((e) => e.phase === "review-fix" && e.edge === "start"), "a review-fix start event exists");
+  const fixEnd = events.find((e) => e.phase === "review-fix" && e.edge === "end");
+  assert.equal(fixEnd?.outcome, "fixed");
+});
+
+await test("F2: 'none' fires no fix turn and records not-needed", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-05-15-f2b.md", { title: "F2 B", status: "proposed", created: "2026-05-15", change_id: "f2b" });
+  const dir = await writeReconcileChange(cwd, "f2b");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-15 · F2 B");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(!fakePiWrap.calls.some((c) => /Fix ONLY these/.test(c.prompt)), "no fix turn fired");
+  const events = await readPhaseEvents(cwd, "f2b");
+  const fixEnd = events.find((e) => e.phase === "review-fix" && e.edge === "end");
+  assert.equal(fixEnd?.outcome, "not-needed");
+});
+
+await test("F2: an exhausted budget records skipped-budget", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-05-16-f2c.md", { title: "F2 C", status: "proposed", created: "2026-05-16", change_id: "f2c" }, VALID_BRAINSTORM_BODY);
+  const dir = await writeReconcileChange(cwd, "f2c");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-16 · F2 C");
+  // 9 Refine turns, then Apply: the budget (10) is spent before the review turn.
+  for (let i = 0; i < 9; i++) {
+    fakeUiWrap.selectQueue.push("Refine");
+    fakeUiWrap.inputQueue.push(`round ${i}`);
+  }
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  for (let i = 0; i < 9; i++) {
+    fakePiWrap.queueEffect(async () => {
+      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
+    });
+  }
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  // The budget was spent by 9 Refines + Apply, so the review turn never runs and the fix path
+  // is not reached; assert no fix prompt fired and the run stopped at the budget.
+  assert.ok(!fakePiWrap.calls.some((c) => /Fix ONLY these/.test(c.prompt)), "no fix turn fired");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Turn budget \(10 agent turns\) reached/.test(n.message)),
+    "the run stopped at the turn budget",
+  );
+});
+
+await test("F2: the archive prompt counts blocking findings", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-05-17-f2d.md", { title: "F2 D", status: "proposed", created: "2026-05-17", change_id: "f2d" });
+  const dir = await writeReconcileChange(cwd, "f2d");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-05-17 · F2 D");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nx\n\n## Blocking\n\n- S1 not met\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nx\n\n## Blocking\n\nnone\n\n## Fix turn\n\n- S1 not met — fixed: done\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const archivePrompt = fakeUiWrap.selectPrompts.find((p) => /Archive now\?/.test(p));
+  assert.ok(archivePrompt, "an archive prompt exists");
+  assert.match(archivePrompt, /blocking: 1 found, 1 fixed/);
 });
 
 // --- Conditional / model-aware compaction (C1-C8) ---------------------------------------------

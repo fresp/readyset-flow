@@ -20,6 +20,9 @@ import {
   readDirtyBaseline,
   readScopeContract,
   readScopeDeviations,
+  readOpenDecisions,
+  readAssumptions,
+  readBlockingFindings,
   parseContractLine,
   checkScope,
   checkScopeRefs,
@@ -1204,6 +1207,96 @@ await test("readScopeDeviations: missing tasks.md -> empty", async () => {
   const cwd = await freshCwd();
   await scaffoldChange(cwd, "notasks");
   assert.deepEqual(await readScopeDeviations(cwd, "notasks"), []);
+});
+
+await test("readOpenDecisions: parses ### blocks with a Recommended line, ignores 'none', [] when absent", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "opendec");
+
+  // Absent section -> [].
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  assert.deepEqual(await readOpenDecisions(cwd, "opendec"), []);
+
+  // Section whose only content is "none" -> [].
+  await writeFile(paths.proposal, "## Why\n\nx\n\n## Open Decisions\n\nnone\n", "utf8");
+  assert.deepEqual(await readOpenDecisions(cwd, "opendec"), []);
+
+  // Two decisions, the second without a Recommended line.
+  await writeFile(
+    paths.proposal,
+    [
+      "## Why",
+      "",
+      "x",
+      "",
+      "## Open Decisions",
+      "",
+      "### Which store?",
+      "- Options: sqlite | postgres",
+      "- Recommended: sqlite, simpler for one process",
+      "- Changes per option: postgres adds a migration step",
+      "",
+      "### Which port?",
+      "- Options: 3000 | 8080",
+      "",
+      "## Assumptions",
+      "",
+      "- default timeout — 30s",
+    ].join("\n"),
+    "utf8",
+  );
+  const decisions = await readOpenDecisions(cwd, "opendec");
+  assert.equal(decisions.length, 2);
+  assert.equal(decisions[0].question, "Which store?");
+  assert.equal(decisions[0].recommended, "sqlite, simpler for one process");
+  assert.equal(decisions[1].question, "Which port?");
+  assert.equal(decisions[1].recommended, undefined);
+
+  // readAssumptions reads the level-2 section, keeping level-3 lines out of the decision body.
+  assert.equal(await readAssumptions(cwd, "opendec"), "- default timeout — 30s");
+});
+
+await test("validateChange: an open decision without a recommended option is flagged; with one it passes", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "odvalidate");
+  await writeFile(
+    paths.proposal,
+    "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n\n## Open Decisions\n\n### Which store?\n- Options: sqlite | postgres\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const bad = await validateChange(cwd, "odvalidate");
+  assert.ok(
+    bad.issues.some((i) => i.file === "proposal.md" && /open decision "Which store\?" has no recommended option/.test(i.problem)),
+    "a decision with no Recommended line is flagged",
+  );
+
+  await writeFile(
+    paths.proposal,
+    "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n\n## Open Decisions\n\n### Which store?\n- Options: sqlite | postgres\n- Recommended: sqlite\n",
+    "utf8",
+  );
+  const good = await validateChange(cwd, "odvalidate");
+  assert.ok(!good.issues.some((i) => /open decision/.test(i.problem)), "a recommended decision passes");
+});
+
+await test("readBlockingFindings: bullets under ## Blocking; 'none' and a missing section both give []", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "blocking");
+
+  // No REVIEW.md at all.
+  assert.deepEqual(await readBlockingFindings(cwd, "blocking"), []);
+
+  await writeFile(paths.review, "## Findings\n\nlooks fine\n\n## Blocking\n\nnone\n", "utf8");
+  assert.deepEqual(await readBlockingFindings(cwd, "blocking"), []);
+
+  await writeFile(
+    paths.review,
+    "## Findings\n\nx\n\n## Blocking\n\n- scenario S1 is not met\n- the deprecation warning is missing its type\n\n## Fix turn\n\n- fixed the first\n",
+    "utf8",
+  );
+  const bullets = await readBlockingFindings(cwd, "blocking");
+  assert.deepEqual(bullets, ["scenario S1 is not met", "the deprecation warning is missing its type"]);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

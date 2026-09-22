@@ -44,7 +44,11 @@ import {
 	readArtifactSizes,
 	type ArtifactSizes,
 	type ChangeLane,
+	readOpenDecisions,
+	readAssumptions,
+	readBlockingFindings,
 	readReview,
+	type OpenDecision,
 	readScopeContract,
 	readScopeDeviations,
 	READYSET_ROOT,
@@ -166,7 +170,10 @@ const PROPOSAL_GUIDE_BULLET = `- proposal.md — must have a "## Why" section (1
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
   arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
   the change actually needs — nothing speculative. A file not on this list may not
-  be written during Apply without asking first.`;
+  be written during Apply without asking first.
+  Also add a \`## Open Decisions\` section (one \`### question\` block as specified in the prompt
+  above, or the single line "none") and a \`## Assumptions\` section (one \`- <assumed decision> —
+  <chosen behavior>\` line per brainstorm \`## Assumed\` item, or "none").`;
 
 const FULL_LANE_GUIDE_BULLETS = `- design.md — "## Context", "## Goals / Non-Goals", "## Decisions" (numbered, each with
   Rationale and Alternatives considered), "## Risks / Trade-offs".
@@ -314,7 +321,18 @@ function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets
 		artifactGuide(lane, budgets) +
 		"\n\nCarry over the brainstorm's Decision, Seam, Scope and Acceptance Criteria (keep the criteria as WHEN/THEN " +
 		"scenarios), and use its Spec Impact section to shape the delta specs. Do not reopen options the brainstorm " +
-		"already decided; carry its Open Questions into the proposal rather than answering them silently.\n\n" +
+		"already decided. Instead:\n" +
+		"(1) Answer every Open Question the repo, the brainstorm, or a web lookup can settle — look it up and " +
+		"answer it. (2) Anything still undecided goes into a new `## Open Decisions` section of proposal.md, " +
+		"one item per decision, in exactly this shape:\n" +
+		"    ### <the question>\n" +
+		"    - Options: <option A> | <option B> | ...\n" +
+		"    - Recommended: <the option you recommend, and one line of why>\n" +
+		"    - Changes per option: <what in this plan changes if each option is chosen>\n" +
+		"(3) Nothing may be left \"carried open\" inside design.md, specs/, or tasks.md — an undecided item " +
+		"lives in `## Open Decisions` and nowhere else. (4) The brainstorm's `## Assumed` items are decisions, " +
+		"not open questions: restate each under a `## Assumptions` section of proposal.md with the concrete " +
+		"behavior chosen, so a human can see what was assumed rather than asked.\n\n" +
 		"If EXPLORATION.md surfaced something the brainstorm didn't anticipate (a submodule it didn't mention, a config " +
 		"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it. Do not " +
 		"implement code in this turn — planning artifacts only." +
@@ -341,8 +359,14 @@ function refineTurnPrompt(changeId: string, feedback: string, issues: string[], 
  * review panel can show "N tasks missing verification" as a real signal rather than trusting
  * the same turn's self-report.
  */
-function applyTurnPrompt(changeId: string): string {
+function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): string {
 	const paths = changePaths("", changeId); // relative paths only; cwd prefix stripped for the prompt
+	const openDecisionsBlock = openDecisions.length > 0
+		? "\n\nThis change was approved with " + openDecisions.length + " open decision(s) still unresolved. For each one below, apply the " +
+			"RECOMMENDED option — the user approved on that basis — and record it in a `## Decisions made during Apply` section of tasks.md as " +
+			"`- <decision> → <chosen option> → <why>`. Do not invent a different option.\n" +
+			openDecisions.map((d) => `- ${d.question} — recommended: ${d.recommended ?? "(none stated)"}`).join("\n")
+		: "";
 	return (
 		`Implement the Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, every ` +
 		`specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} before starting. ` +
@@ -363,7 +387,8 @@ function applyTurnPrompt(changeId: string): string {
 		"smallest change that satisfies the scenarios. If a file outside the contract is truly required, you " +
 		"may change it, but in the SAME turn record it under `## Scope deviations` in tasks.md as " +
 		"`- <path> — <one-line reason>`.\n\n" +
-		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks."
+		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks." +
+		openDecisionsBlock
 	);
 }
 
@@ -535,7 +560,25 @@ function codeReviewTurnPrompt(
 		(lane === "fast"
 			? " Keep this review proportional: verify the WHEN/THEN scenarios against behavior and the scope contract, " +
 				"but skip mutation-testing-style probes (removing code to see if tests catch it) — that depth belongs to the full lane."
-			: "")
+			: "") +
+		"\n\nFlag as blocking any doc the request, brainstorm or contract calls for that was not actually written or updated." +
+		"\n\nEnd REVIEW.md with a `## Blocking` section: one bullet per finding that violates (a) a WHEN/THEN " +
+		"scenario, (b) an explicit requirement from the brainstorm or proposal.md — including any doc the " +
+		"request or brainstorm asked for (README/CHANGELOG/docs/migration/deprecation notes) or a doc file the " +
+		"contract lists that was not actually written — or (c) a recorded decision (an `## Assumptions`/`## Open " +
+		"Decisions` entry, or a `## Decisions made during Apply` entry). Write exactly \"none\" when there are none. " +
+		"Every other remark goes in the sections above, never in `## Blocking`."
+	);
+}
+
+/** The single, bounded "Review fix" turn: fixes ONLY the blocking findings REVIEW.md listed, and
+ *  appends a `## Fix turn` section recording each one fixed or not-fixed. No second review runs. */
+function reviewFixTurnPrompt(changeId: string, blocking: string[]): string {
+	const paths = changePaths("", changeId);
+	return (
+		`The code review of Readyset change "${changeId}" found ${blocking.length} blocking finding(s). Fix ONLY these: make the smallest change that addresses each, and nothing else.\n\n` +
+		blocking.map((b, i) => `${i + 1}. ${b}`).join("\n") +
+		"\n\nRules: touch ONLY files in proposal.md's `## Files This Change Will Touch` contract or this run's own changed files; do NOT refactor, rename, reformat or add unrequested code, tests, docs, `scripts, or benchmarks; never modify seed data/fixtures, never add runtime self-checks to production code, and never change an existing test's expectations unless the requested behavior changes them. Never modify seed data, fixtures or sample data in production paths, and never add runtime assertions/self-checks to production code. After fixing, re-run the tests that cover the affected behavior and update the matching `_Verified:` notes in tasks.md. Then append a `## Fix turn` section to " + paths.review + " with one bullet per finding above: `- <finding> — fixed: <what changed> (<command run, result>)` or `- <finding> — not fixed: <why>`. Remove a finding from `## Blocking` only when it is actually fixed; leave the ones you could not fix in `## Blocking` (rewrite the bullet to name why). Do not start new work."
 	);
 }
 
@@ -1680,6 +1723,10 @@ interface ReviewSnapshot {
 	evidenceConflicts: Awaited<ReturnType<typeof findEvidenceConflicts>>;
 	/** Per-artifact character counts, for the gate's budget line. */
 	sizes: ArtifactSizes;
+	/** proposal.md's `## Open Decisions` items still unresolved at the gate. */
+	openDecisions: OpenDecision[];
+	/** proposal.md's `## Assumptions` body, or undefined when absent. */
+	assumptions: string | undefined;
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -1703,6 +1750,8 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const { totalRecords: evidenceTotal } = await checkTaskEvidence(ctx.cwd, chosen.changeId);
 	const evidenceConflicts = await findEvidenceConflicts(ctx.cwd, chosen.changeId);
 	const sizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
+	const openDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
+	const assumptions = await readAssumptions(ctx.cwd, chosen.changeId);
 	return {
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
 		validated,
@@ -1714,6 +1763,8 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		evidenceTotal,
 		evidenceConflicts,
 		sizes,
+		openDecisions,
+		assumptions,
 	};
 }
 
@@ -1758,6 +1809,23 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 			heading: "Proposal",
 			status: "proposal.md",
 			render: () => readOrPlaceholder(paths.proposal, "_(proposal.md not found.)_"),
+		},
+		{
+			id: "open-decisions",
+			heading: "Open decisions",
+			status: snapshot.openDecisions.length > 0 ? `${snapshot.openDecisions.length} unresolved` : "none",
+			render: async () => {
+				const parts: string[] = [];
+				if (snapshot.openDecisions.length === 0) {
+					parts.push("_(none.)_");
+				} else {
+					for (const d of snapshot.openDecisions) {
+						parts.push(`### ${d.question}`, "", d.raw || "_(no detail.)_", "");
+					}
+				}
+				parts.push(`Assumptions: ${snapshot.assumptions ?? "_(none.)_"}`);
+				return parts.join("\n");
+			},
 		},
 		{
 			id: "scope",
@@ -1978,6 +2046,7 @@ async function openSidebarOverlay(
 			overlaySections,
 			taskSummary,
 			done,
+			snapshot.openDecisions.length > 0,
 		),
 	// `width: "90%"` is load-bearing, not decoration: `OverlayOptions.fullscreen` (confirmed
 	// against pi-tui's real source -- see readyset-review-overlay.ts's module doc comment) only
@@ -2067,6 +2136,15 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 				]
 			: []),
 		...artifactBudgetLines(snapshot.sizes, budgets, lane),
+		...((snapshot.openDecisions.length > 0 || snapshot.assumptions !== undefined)
+			? [
+					`open decisions: ${snapshot.openDecisions.length}`,
+					...snapshot.openDecisions.map(
+						(d) => `  - ${d.question}${d.recommended ? ` → ${d.recommended}` : " (no recommendation)"}`,
+					),
+					...(snapshot.assumptions !== undefined ? ["assumptions: see proposal.md `## Assumptions`"] : []),
+				]
+			: []),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -2090,15 +2168,26 @@ async function classicGateSelect(
 	chosen: BrainstormMeta,
 	snapshot: ReviewSnapshot,
 	taskSummary: string,
-): Promise<ReviewOverlayResult> {
+	openDecisions: number,
+): Promise<ReviewOverlayResult | "resolve-decisions"> {
 	for (;;) {
-		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, [
+		const options: ExtensionUISelectOption[] = [
 			{ label: "Discard", description: "leave as proposed, do nothing (the safe default — nothing runs unless you pick an Approve option)" },
 			{ label: "Approve & Execute", description: `compact context first, then implement per tasks.md — ${taskSummary}` },
 			{ label: "Approve & Execute, keep context", description: "implement without compacting (keep the full Explore/Propose discussion in context)" },
 			{ label: "Refine", description: "describe what to change; revises the artifacts and re-validates" },
-			{ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" },
-		]);
+		];
+		if (openDecisions > 0) {
+			options.push({
+				label: "Resolve open decisions",
+				description: `${openDecisions} decision(s) still open — refine with them listed so you can pick the recommended option for each`,
+			});
+		}
+		options.push({ label: "Jump to section", description: "browse one section at a time (exploration/proposal/design/specs/tasks/…)" });
+
+		const choice = await ctx.ui.select(`Review change "${chosen.changeId}" — ${snapshot.validated.summary}`, options, {
+			helpText: "enter to choose · esc to cancel",
+		});
 
 		if (choice === "Jump to section") {
 			await browseReviewSections(ctx, chosen, snapshot);
@@ -2107,6 +2196,7 @@ async function classicGateSelect(
 		if (choice === "Approve & Execute") return "approve";
 		if (choice === "Approve & Execute, keep context") return "keep-context";
 		if (choice === "Refine") return "refine";
+		if (choice === "Resolve open decisions") return "resolve-decisions";
 		if (choice === "Discard") return "discard";
 		return undefined; // cancelled (no choice)
 	}
@@ -2127,6 +2217,7 @@ async function buildReviewTriggerInput(
 	changedPaths: string[],
 	clarity: ReviewTriggerInput["clarity"],
 	thresholds: ParsedReviewThresholds,
+	openDecisions: number,
 ): Promise<ReviewTriggerInput> {
 	const [conflicts, evidence, verification, progress, events] = await Promise.all([
 		findEvidenceConflicts(cwd, changeId),
@@ -2147,6 +2238,7 @@ async function buildReviewTriggerInput(
 		diff: applyEnd?.diff ?? { files: 0, added: 0, deleted: 0 },
 		changedPaths,
 		clarity,
+		openDecisions,
 		thresholds,
 	};
 }
@@ -2212,7 +2304,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"] } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"]; counts?: PhaseEvent["counts"]; openDecisions?: number } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -2253,15 +2345,28 @@ async function reviewAndMaybeExecute(
 				choice = await openSidebarOverlay(ctx, chosen, snapshot, taskSummary);
 			} catch (err) {
 				ctx.ui.notify(`Sidebar view failed to open: ${err instanceof Error ? err.message : String(err)}. Falling back to the classic menu.`, "warning");
-				choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary);
+				choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary, snapshot.openDecisions.length);
 			}
 		} else {
-			choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary);
+			choice = await classicGateSelect(ctx, chosen, snapshot, taskSummary, snapshot.openDecisions.length);
 		}
 
 		if (!choice || choice === "discard") {
 			await recordPhase(chosen.changeId, "gate", "end", { outcome: "discard" });
 			return;
+		}
+
+		// "Resolve open decisions" is a Refine pre-filled with the still-open decision list, so
+		// the user picks (or confirms) the recommended option for each. It routes through the
+		// ordinary Refine branch below — no `ctx.ui.input` prompt, the list IS the feedback.
+		let refineFeedback: string | undefined;
+		if (choice === "resolve-decisions") {
+			refineFeedback =
+				"Resolve these open decisions by picking (or confirming) the recommended option for each, then" +
+				" update proposal.md's `## Open Decisions` (move each resolved one into `## Assumptions` with the" +
+				" chosen behavior) and the affected scenarios:\n" +
+				snapshot.openDecisions.map((d, i) => `${i + 1}. ${d.question} — recommended: ${d.recommended ?? "(none stated)"}`).join("\n");
+			choice = "refine";
 		}
 
 		// "Approve & Execute" compacts first when the context clears the threshold (see
@@ -2285,7 +2390,7 @@ async function reviewAndMaybeExecute(
 				outcome: "skipped-keep-context",
 				boundary: "apply",
 			});
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context" });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context", openDecisions: snapshot.openDecisions.length });
 			choice = "approve"; // fall through to Apply, skipping compaction
 		} else if (choice === "approve" || choice === "compact") {
 			const compactResult = await compactForPhase(
@@ -2309,12 +2414,12 @@ async function reviewAndMaybeExecute(
 			// The recorded outcome names the action the user took. The legacy `"compact"` result
 			// (from older sidebar builds) means "approve, keep context" in 0.12.0's note, but the
 			// gate treats it as a plain approve here, so both record `approve`.
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve" });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve", openDecisions: snapshot.openDecisions.length });
 		}
 
 		if (choice === "refine") {
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine" });
-			const feedback = ctx.ui.input ? await ctx.ui.input("What should change?") : undefined;
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine", openDecisions: snapshot.openDecisions.length });
+			const feedback = refineFeedback ?? (ctx.ui.input ? await ctx.ui.input("What should change?") : undefined);
 			if (!feedback) {
 				ctx.ui.notify("No feedback given — nothing changed.", "info");
 				continue;
@@ -2358,8 +2463,9 @@ async function reviewAndMaybeExecute(
 			await recordPhase(chosen.changeId, "apply", "start", { model: phaseModels.get("apply")?.model });
 			try {
 				try {
+					const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
 					applyFired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
-						spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId)),
+						spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId, applyOpenDecisions)),
 					);
 				} finally {
 					activeVerifyChangeId = undefined;
@@ -2475,7 +2581,7 @@ async function reviewAndMaybeExecute(
 		} else if (reviewMode === "auto") {
 			triggerResult = evaluateReviewTriggers(
 				await buildReviewTriggerInput(
-					ctx.cwd, chosen.changeId, archiveDriftPaths, changedThisRun, chosen.clarity, reviewThresholds,
+					ctx.cwd, chosen.changeId, archiveDriftPaths, changedThisRun, chosen.clarity, reviewThresholds, snapshot.openDecisions.length,
 				),
 			);
 			if (!fullLaneExempt && triggerResult.fired.length === 0) skipReason = "skipped-no-trigger";
@@ -2537,7 +2643,53 @@ async function reviewAndMaybeExecute(
 			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
 		}
 
-		await offerArchive(ctx, chosen, reviewContent, archiveDriftPaths, recordPhase, skipReason, reconcileResult.restored);
+		// Exactly one bounded "Review fix" turn when the review wrote blocking findings, then
+		// straight to the archive offer — no second review, no loop. Only on the review-ran path:
+		// a skipped review never reaches here.
+		let findings: { found: number; fixed: number } | undefined;
+		if (!skipReason) {
+			const blocking = reviewContent ? await readBlockingFindings(ctx.cwd, chosen.changeId) : [];
+			let fixOutcome: "fixed" | "partial" | "skipped-budget" | "not-needed";
+			if (blocking.length === 0) {
+				fixOutcome = "not-needed";
+				await recordPhase(chosen.changeId, "review-fix", "end", { outcome: "not-needed", counts: { outsideBefore: 0, reverted: 0, justified: 0, unjustifiedAfter: 0, blockingBefore: 0, blockingAfter: 0 } });
+			} else if (!turnsAvailableFor(budget, 0)) {
+				// Reserve 0 after review: the turn may spend the very last unit if one is left; the
+				// budget is never exceeded.
+				fixOutcome = "skipped-budget";
+				await recordPhase(chosen.changeId, "review-fix", "end", { outcome: "skipped-budget", counts: { outsideBefore: 0, reverted: 0, justified: 0, unjustifiedAfter: 0, blockingBefore: blocking.length, blockingAfter: blocking.length } });
+				ctx.ui.notify(`"${chosen.changeId}" has ${blocking.length} blocking review finding(s) but no turn budget left to fix them — see ${changePaths(ctx.cwd, chosen.changeId).review}.`, "warning");
+			} else {
+				ctx.ui.notify(`Fixing ${blocking.length} blocking review finding(s) for "${chosen.changeId}"...`, "info");
+				await recordPhase(chosen.changeId, "review-fix", "start", { model: phaseModels.get("apply")?.model });
+				const fired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
+					spendTurn(pi, ctx, budget, "Review fix", reviewFixTurnPrompt(chosen.changeId, blocking)),
+				);
+				const after = await readBlockingFindings(ctx.cwd, chosen.changeId);
+				fixOutcome = !fired ? "skipped-budget" : after.length === 0 ? "fixed" : "partial";
+				// Same post-Apply scope logic the Apply turn gets, minus the second reconciliation
+				// turn: re-run the check and warn on drift only.
+				const fixChanged = await pathsChangedThisRun(ctx.cwd, chosen.changeId);
+				const fixScope = await checkScope(ctx.cwd, chosen.changeId, fixChanged);
+				const fixJustified = new Set((await readScopeDeviations(ctx.cwd, chosen.changeId)).map((d) => d.path));
+				const fixDrift = (fixScope.noContract ? [] : fixScope.outside).filter((p) => !fixJustified.has(p));
+				if (fixDrift.length > 0) {
+					await appendContext(ctx.cwd, chosen.changeId, "Review fix",
+						`Fix turn touched file(s) outside the contract with no deviation entry: ${fixDrift.join(", ")}.`);
+					ctx.ui.notify(`The review-fix turn for "${chosen.changeId}" drifted outside the scope contract: ${fixDrift.join(", ")}. Warning only — no second reconciliation turn.`, "warning");
+				}
+				await appendContext(ctx.cwd, chosen.changeId, "Review fix",
+					`${blocking.length} blocking finding(s); ${after.length} still open after the fix turn.`);
+				await recordPhase(chosen.changeId, "review-fix", "end", {
+					model: phaseModels.get("apply")?.model, outcome: fixOutcome,
+					counts: { outsideBefore: 0, reverted: 0, justified: 0, unjustifiedAfter: 0, blockingBefore: blocking.length, blockingAfter: after.length },
+				});
+				findings = { found: blocking.length, fixed: blocking.length - after.length };
+			}
+			if (!findings) findings = { found: blocking.length, fixed: 0 };
+		}
+
+		await offerArchive(ctx, chosen, reviewContent, archiveDriftPaths, recordPhase, skipReason, reconcileResult.restored, findings);
 		return;
 	}
 }
@@ -2561,10 +2713,12 @@ async function offerArchive(
 	) => Promise<void>,
 	skipReason: "skipped-flag" | "skipped-no-trigger" | undefined,
 	restoredPaths: string[],
+	findings: { found: number; fixed: number } | undefined,
 ): Promise<void> {
 	const restoredLine = restoredPaths.length > 0
 		? `⚠ ${restoredPaths.length} file(s) the reconciliation turn reverted out of list were RESTORED (${restoredPaths.join(", ")}). `
 		: "";
+	const findingsLine = findings ? `blocking: ${findings.found} found, ${findings.fixed} fixed. ` : "";
 	const driftLine = archiveDriftPaths.length > 0
 		? `Apply touched ${archiveDriftPaths.length} file(s) outside the contract (${archiveDriftPaths.join(", ")}). `
 		: "";
@@ -2574,7 +2728,7 @@ async function offerArchive(
 			? `Code review skipped (never): readyset.review.mode = never.`
 			: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
 	const archiveChoice = await ctx.ui.select(
-		`${restoredLine}${driftLine}${reviewLine} Archive now?`,
+		`${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
 		[
 			{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
 			{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
@@ -2692,7 +2846,7 @@ async function runOnDemandReview(
 	const driftPaths = (scope.noContract ? [] : scope.outside).filter((p) => !justified.has(p));
 	const brainstorm = await loadBrainstorms(ctx.cwd).then((all) => all.find((b) => b.changeId === changeId));
 	const triggerResult = evaluateReviewTriggers(
-		await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds),
+		await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds, (await readOpenDecisions(ctx.cwd, changeId)).length),
 	);
 
 	let reviewContent: string | undefined;
@@ -2740,6 +2894,7 @@ async function runOnDemandReview(
 		recordPhase,
 		undefined,
 		[],
+		undefined,
 	);
 }
 

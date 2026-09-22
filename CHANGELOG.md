@@ -46,6 +46,27 @@ by phase events, so the benchmark can tune them from real data.
   trigger evaluated (name, fired, observed value), the fired trigger names, and the outcome
   (`ran` / `skipped-no-trigger` / `skipped-flag` / `on-demand`). The existing string `outcome`
   values are unchanged; this is a separate, nested field.
+- **Open decisions.** `proposal.md` now carries a `## Open Decisions` section (one `### <question>`
+  block per decision, each with `Options` / `Recommended` / `Changes per option` lines) and a
+  `## Assumptions` section (each brainstorm `## Assumed` item restated with the chosen behavior).
+  The Propose prompt answers every question the repo or a lookup can settle, and forbids leaving
+  undecided items "carried open" anywhere else. `readOpenDecisions` / `readAssumptions` parse them;
+  `validateChange` flags (warning-only) any decision without a recommended option. The gate shows
+  the open-decision count and lists each question, the compiled review document gets an **Open
+  decisions** section (with the assumptions), and a **Resolve open decisions** CTA (`[O]`) refines
+  the change with the list so each recommendation can be picked. Approving with open decisions
+  remains possible — warn, never block — and the `gate` `end` phase event records the count.
+- **A single bounded review-fix turn.** `REVIEW.md` now ends with a `## Blocking` section (one
+  bullet per finding that violates a scenario, an explicit requirement, or a recorded decision; the
+  literal `none` when there are none). `readBlockingFindings` reads it; when it is non-empty the
+  run fires **exactly one** review-fix turn (on the apply phase model) to fix only those findings,
+  records a `review-fix` phase event with one of `fixed` / `partial` / `skipped-budget` /
+  `not-needed`, re-runs the post-Apply scope check (warning only, no second reconciliation), and
+  then goes straight to the archive offer. No second review runs.
+- **The Apply prompt applies the recommended option** for any open decision still unresolved at
+  approval, recording each as `- <decision> → <chosen option> → <why>` under a `## Decisions made
+  during Apply` section of `tasks.md`; the `open-decisions` review trigger fires when any remain,
+  and the archive prompt states `blocking: N found, M fixed`.
 
 ### Changed
 

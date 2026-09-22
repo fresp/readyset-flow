@@ -303,7 +303,7 @@ export async function hasDirtyBaseline(cwd: string, changeId: string): Promise<b
 /** The phases a Readyset run records boundaries for. */
 export type PhaseName =
 	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"
-	| "contract-repair" | "scope-reconcile" | "trim" | "compact";
+	| "contract-repair" | "scope-reconcile" | "trim" | "compact" | "review-fix";
 
 /** One boundary event in the machine-parseable phase log. */
 export interface PhaseEvent {
@@ -314,8 +314,9 @@ export interface PhaseEvent {
 	laneSource: "flag" | "config-auto" | "user-pick" | "brainstorm";
 	model?: string;
 	outcome?: string;
-	/** `scope-reconcile` only: drift counts for the bench. */
-	counts?: { outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number };
+	/** `scope-reconcile` only: drift counts for the bench. Also carries the review-fix turn's
+	 *  blocking-finding counts (`blockingBefore`/`blockingAfter`). */
+	counts?: { outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number; blockingBefore?: number; blockingAfter?: number };
 	/** `apply` `end` only: final Apply diff size for the bench. */
 	diff?: { files: number; added: number; deleted: number };
 	/** `compact` only: which boundary this compaction preceded. */
@@ -347,6 +348,8 @@ export interface PhaseEvent {
 		triggersFired: string[];
 		outcome: "ran" | "skipped-no-trigger" | "skipped-flag" | "on-demand";
 	};
+	/** gate `end` only: how many items proposal.md's `## Open Decisions` still carried at approval. */
+	openDecisions?: number;
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */
@@ -639,6 +642,61 @@ export async function readScopeDeviations(cwd: string, changeId: string): Promis
 	return deviations;
 }
 
+/** Body of a `## <heading>` (level-2 only) section, up to the next level-2 heading — unlike
+ *  `sectionBody`, level-3 sub-headings inside stay in the body. Used for `## Open Decisions`,
+ *  whose items are `### <question>` blocks. */
+function level2Body(raw: string, heading: string): string {
+	const re = new RegExp(`^##[ \\t]*${heading}[ \\t]*$`, "im");
+	const match = raw.match(re);
+	if (!match || match.index === undefined) return "";
+	const rest = raw.slice(match.index + match[0].length);
+	const boundary = rest.match(/^##[ \t]/m);
+	return (boundary && boundary.index !== undefined ? rest.slice(0, boundary.index) : rest).trim();
+}
+
+/** One item from proposal.md's `## Open Decisions` section. */
+export interface OpenDecision {
+	/** The `### <question>` heading text. */
+	question: string;
+	/** The recommended option, parsed from a `- Recommended:` line. Undefined when absent. */
+	recommended?: string;
+	/** The raw block body, for display in the gate. */
+	raw: string;
+}
+
+/** Parses proposal.md's `## Open Decisions` section: one `### <question>` block per decision,
+ *  each optionally carrying a `- Recommended: ...` line. Returns [] when the section is absent or
+ *  empty, or when its only content is "none" — an older change (or a proposal that wrote no
+ *  section) reads exactly as it did before. */
+export async function readOpenDecisions(cwd: string, changeId: string): Promise<OpenDecision[]> {
+	const raw = await readFile(changePaths(cwd, changeId).proposal, "utf8").catch(() => undefined);
+	if (raw === undefined) return [];
+	const body = level2Body(raw, "Open Decisions");
+	if (!body || /^none\b/i.test(body.trim())) return [];
+	const decisions: OpenDecision[] = [];
+	// Split on `###` headings; text before the first heading is ignored.
+	const blocks = body.split(/^###[ \t]+/m).slice(1);
+	for (const block of blocks) {
+		const nl = block.indexOf("\n");
+		const question = (nl === -1 ? block : block.slice(0, nl)).trim();
+		const rest = nl === -1 ? "" : block.slice(nl + 1).trim();
+		if (question === "") continue;
+		const recommended = rest.match(/^[-*][ \t]*Recommended[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
+		decisions.push({ question, recommended, raw: rest });
+	}
+	return decisions;
+}
+
+/** The body of proposal.md's `## Assumptions` section, or undefined when absent/empty/"none".
+ *  Level-2 extraction (see `level2Body`) so a nested `###` line stays in the body. */
+export async function readAssumptions(cwd: string, changeId: string): Promise<string | undefined> {
+	const raw = await readFile(changePaths(cwd, changeId).proposal, "utf8").catch(() => undefined);
+	if (raw === undefined) return undefined;
+	const body = level2Body(raw, "Assumptions");
+	if (!body || /^none\b/i.test(body)) return undefined;
+	return body;
+}
+
 export interface ScopeCheck {
 	/** Repo-relative paths outside the contract. Empty when everything is in scope. */
 	outside: string[];
@@ -892,9 +950,9 @@ export async function validateChange(cwd: string, changeId: string, lane?: Chang
 	const paths = changePaths(cwd, changeId);
 	const issues: ValidationIssue[] = [];
 	const effectiveLane = lane ?? (await readChangeLane(cwd, changeId));
+	const proposalRaw = (await readFile(paths.proposal, "utf8").catch(() => undefined)) as string | undefined;
 
 	if (effectiveLane === "fast") {
-		const proposalRaw = (await readFile(paths.proposal, "utf8").catch(() => undefined)) as string | undefined;
 		if (proposalRaw === undefined) {
 			issues.push({ file: "proposal.md", problem: "missing" });
 		} else {
@@ -926,7 +984,6 @@ export async function validateChange(cwd: string, changeId: string, lane?: Chang
 		// specs/ issue. A stray spec file under a fast-lane change is not merged at archive either
 		// (see archiveChange), so it is simply out of scope for this lane.
 	} else {
-		const proposalRaw = (await readFile(paths.proposal, "utf8").catch(() => undefined)) as string | undefined;
 		if (proposalRaw === undefined) {
 			issues.push({ file: "proposal.md", problem: "missing" });
 		} else {
@@ -965,6 +1022,17 @@ export async function validateChange(cwd: string, changeId: string, lane?: Chang
 						});
 					}
 				}
+			}
+		}
+	}
+
+	// Open decisions must not slip through the gate: every decision in proposal.md's
+	// `## Open Decisions` must name a recommended option, or the user is approving a plan whose
+	// behavior is still undecided. Warning-only (a `ValidationIssue`), consistent with the rest.
+	if (proposalRaw !== undefined) {
+		for (const d of await readOpenDecisions(cwd, changeId)) {
+			if (d.recommended === undefined || d.recommended === "") {
+				issues.push({ file: "proposal.md", problem: `open decision "${d.question}" has no recommended option` });
 			}
 		}
 	}
@@ -1064,6 +1132,19 @@ export async function checkTaskVerification(cwd: string, changeId: string): Prom
 export async function readReview(cwd: string, changeId: string): Promise<string | undefined> {
 	const paths = changePaths(cwd, changeId);
 	return readFile(paths.review, "utf8").catch(() => undefined);
+}
+
+/** The findings bullets under REVIEW.md's `## Blocking` section. Empty when the section is
+ *  absent, when its body is "none", or when REVIEW.md does not exist. */
+export async function readBlockingFindings(cwd: string, changeId: string): Promise<string[]> {
+	const raw = await readReview(cwd, changeId);
+	if (raw === undefined) return [];
+	const body = level2Body(raw, "Blocking").trim();
+	if (!body || /^none\b/i.test(body)) return [];
+	return body
+		.split(/\r?\n/)
+		.map((l) => l.replace(/^[-*]\s*/, "").trim())
+		.filter((l) => l.length > 0);
 }
 
 export interface ArchiveResult {
