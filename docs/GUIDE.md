@@ -445,6 +445,17 @@ Picks a brainstorm, then depending on its status:
     the review document shows them alongside the open decisions, while a task that pins one carries
     `(assumed)` in its description and a test that pins one says so in its name or an adjacent
     comment.
+- **Stay-in-repo, with an outside-repo tripwire.** Every phase prompt and `src/skill/SKILL.md`
+  carry one stay-in-repo rule from a single shared constant: work only inside the current
+  repository, never search or read outside it (no `find /`, no absolute paths outside the repo, no
+  home-directory files, logs or notes), and never inspect Readyset's own implementation, package or
+  configuration. Because omp's extension API fires `pi.on("tool_call")` before every tool runs,
+  the rule is also **observed, not just asked for**: `bash`/`read`/`grep`/`glob` calls whose
+  arguments name an absolute path outside the repo (or use `find /`, `~` or `$HOME`) are counted,
+  and the count surfaces in four places — a `⚠ outside-repo access` entry in `CONTEXT.md`, an
+  `outsideRepo` field on the `gate` `end` phase event, a line in the gate panel, and a prefix on
+  the **Archive now?** prompt. **Advisory only** — nothing is blocked and no phase fails; a host
+  without the hook (older omp builds) simply no-ops.
 - Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since

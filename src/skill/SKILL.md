@@ -12,6 +12,8 @@ change directly (reading one to answer a question, hand-editing an artifact, or 
 change that got interrupted mid-phase) rather than only through the command's own triggered
 turns.
 
+Work only inside the current repository (the working directory). Never search or read outside it (no `find /`, no absolute paths outside the repo, no home-directory files, logs or notes), and never inspect Readyset's own implementation, package or configuration. They are not part of the task.
+
 ## The phase order, and why it's in this order
 
 ```

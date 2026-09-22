@@ -57,6 +57,17 @@ by phase events, so the benchmark can tune them from real data.
   when its sentence carries an action verb (and no negation), so a doc merely cited as context is
   never forced into the contract. Migration/release-note/deprecation mentions are advisory only —
   warned, never repaired.
+- **A stay-in-repo rule and an outside-repo tripwire.** The readyset-bench leak check found the
+  `/readyset` agent searching the host filesystem for Readyset itself in 27/36 v0.12 runs (`find /`,
+  the npx cache, `~/.omp` config and session logs, home-dir notes). Every phase prompt and
+  `src/skill/SKILL.md` now carry a one-line **stay-in-repo rule** from a single shared constant
+  (`STAY_IN_REPO_RULE`), so the wording cannot drift between phases, and the wording that invited
+  the model to look up Readyset's own skill files is gone — the workflow is given by the prompt.
+  omp's extension API exposes `pi.on("tool_call")`, so the tripwire is real, not prompt-only:
+  `bash`/`read`/`grep`/`glob` calls whose arguments name an absolute path outside the repo or use
+  `find /`, `~` or `$HOME` append a `⚠ outside-repo access` entry to `CONTEXT.md`, ride the `gate`
+  `end` phase event as `outsideRepo`, and show in the gate panel and at the archive prompt.
+  Advisory only — nothing is blocked, and a host without the hook (older builds) is a no-op.
 - **A `review` field on the `review` `end` phase event** carrying the resolved mode, every
   trigger evaluated (name, fired, observed value), the fired trigger names, and the outcome
   (`ran` / `skipped-no-trigger` / `skipped-flag` / `on-demand`). The existing string `outcome`

@@ -161,6 +161,16 @@ interface OverlayKeybindings {
  * /plan's native Plan Review surface.
  */
 
+/** One line, injected into every phase prompt and mirrored verbatim in src/skill/SKILL.md. Shared
+ *  from this single constant so the wording cannot drift between phases. */
+export const STAY_IN_REPO_RULE =
+	"Work only inside the current repository (the working directory). Never search or read outside it " +
+	"(no `find /`, no absolute paths outside the repo, no home-directory files, logs or notes), and never " +
+	"inspect Readyset's own implementation, package or configuration. They are not part of the task.";
+
+/** Appends the rule as the last paragraph of a phase prompt. */
+const withRepoRule = (prompt: string): string => `${prompt}\n\n${STAY_IN_REPO_RULE}`;
+
 const ARTIFACT_GUIDE_HEADER = `Write proposal.md with a YAML frontmatter block whose first line is \`lane: full\` or \`lane: fast\` matching this run's lane, then the required sections below.
 
 Write exactly these files under readyset/changes/<id>/ (create directories as needed):
@@ -268,7 +278,7 @@ function artifactGuide(lane: ChangeLane, budgets: ArtifactBudgets): string {
  * one. Explore is also its own separate turn — a smaller, single-purpose pass is less likely
  * to shortcut grounding than one more thing competing for attention inside Propose.
  */
-function exploreTurnPrompt(b: BrainstormMeta, submodules: { name: string; path: string }[]): string {
+export function exploreTurnPrompt(b: BrainstormMeta, submodules: { name: string; path: string }[]): string {
 	const paths = changePaths("", b.changeId);
 	const submoduleLine =
 		submodules.length > 0
@@ -277,7 +287,7 @@ function exploreTurnPrompt(b: BrainstormMeta, submodules: { name: string; path: 
 				`don't just omit it):\n` +
 				submodules.map((s) => `  - ${s.name} (path: ${s.path})`).join("\n")
 			: "";
-	return (
+	return withRepoRule(
 		`Explore the ground truth for the Readyset change "${b.changeId}" before any planning artifact is written. ` +
 		`Read the brainstorm at ${b.file} fully first, then write ${paths.exploration}.\n\n` +
 		"Write EXPLORATION.md as a findings log, one entry per thing you actually checked — not a restatement of the " +
@@ -316,9 +326,9 @@ function fastLaneProposeSuffix(): string {
 	);
 }
 
-function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
+export function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
 	const paths = changePaths("", b.changeId);
-	return (
+	return withRepoRule(
 		`Create a Readyset change named "${b.changeId}" from the brainstorm at ${b.file}. ` +
 		`Read the brainstorm fully first, then read ${paths.exploration} — it holds this change's grounding findings, ` +
 		"already checked against real repo state in a prior turn. Do not re-derive or contradict it; every claim in " +
@@ -362,9 +372,9 @@ function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets
 	);
 }
 
-function refineTurnPrompt(changeId: string, feedback: string, issues: string[], lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
+export function refineTurnPrompt(changeId: string, feedback: string, issues: string[], lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
 	const issuesLine = issues.length > 0 ? `\n\nStructural check also flagged: ${issues.join("; ")}.` : "";
-	return (
+	return withRepoRule(
 		`Revise the Readyset change "${changeId}" under readyset/changes/${changeId}/ per this feedback: ${feedback}` +
 		issuesLine +
 		"\n\nRead the existing proposal.md/design.md/specs/tasks.md first. " +
@@ -381,7 +391,7 @@ function refineTurnPrompt(changeId: string, feedback: string, issues: string[], 
  * review panel can show "N tasks missing verification" as a real signal rather than trusting
  * the same turn's self-report.
  */
-function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): string {
+export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): string {
 	const paths = changePaths("", changeId); // relative paths only; cwd prefix stripped for the prompt
 	const openDecisionsBlock = openDecisions.length > 0
 		? "\n\nThis change was approved with " + openDecisions.length + " open decision(s) still unresolved. For each one below, apply the " +
@@ -389,7 +399,7 @@ function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): 
 			"`- <decision> → <chosen option> → <why>`. Do not invent a different option.\n" +
 			openDecisions.map((d) => `- ${d.question} — recommended: ${d.recommended ?? "(none stated)"}`).join("\n")
 		: "";
-	return (
+	return withRepoRule(
 		`Implement the Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, every ` +
 		`specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} before starting. ` +
 		"Loop through pending tasks in tasks.md: make the minimal focused change each task describes, then verify it — run " +
@@ -543,7 +553,7 @@ function compactBeforeProposeGuidance(changeId: string, brainstormFile: string, 
  * mitigation, not a claim of independence. Do not re-add "fresh context" wording here
  * without a mechanism that actually provides it.
  */
-function codeReviewTurnPrompt(
+export function codeReviewTurnPrompt(
 	changeId: string,
 	lane: "full" | "fast" = "full",
 	deviations: ScopeDeviation[] = [],
@@ -554,7 +564,7 @@ function codeReviewTurnPrompt(
 	const triggerLine = triggerResult && triggerResult.fired.length > 0
 		? `This review was triggered by: ${triggerResult.fired.join(", ")}. Focus your findings on these.\n\n`
 		: "";
-	return (
+	return withRepoRule(
 		`Critically review the implementation of Readyset change "${changeId}". This review must start from the diff, not from the repo: ` +
 		(changedPaths.length > 0
 			? `the files this run changed are ${changedPaths.join(", ")}. `
@@ -602,9 +612,9 @@ function codeReviewTurnPrompt(
 
 /** The single, bounded "Review fix" turn: fixes ONLY the blocking findings REVIEW.md listed, and
  *  appends a `## Fix turn` section recording each one fixed or not-fixed. No second review runs. */
-function reviewFixTurnPrompt(changeId: string, blocking: string[]): string {
+export function reviewFixTurnPrompt(changeId: string, blocking: string[]): string {
 	const paths = changePaths("", changeId);
-	return (
+	return withRepoRule(
 		`The code review of Readyset change "${changeId}" found ${blocking.length} blocking finding(s). Fix ONLY these: make the smallest change that addresses each, and nothing else.\n\n` +
 		blocking.map((b, i) => `${i + 1}. ${b}`).join("\n") +
 		"\n\nRules: touch ONLY files in proposal.md's `## Files This Change Will Touch` contract or this run's own changed files; do NOT refactor, rename, reformat or add unrequested code, tests, docs, scripts, or benchmarks; never modify seed data, fixtures or sample data in production paths, and never add runtime assertions/self-checks to production code, and never change an existing test's expectations unless the requested behavior changes them. After fixing, re-run the tests that cover the affected behavior and update the matching `_Verified:` notes in tasks.md. Then append a `## Fix turn` section to " + paths.review + " with one bullet per finding above: `- <finding> — fixed: <what changed> (<command run, result>)` or `- <finding> — not fixed: <why>`. Remove a finding from `## Blocking` only when it is actually fixed; leave the ones you could not fix in `## Blocking` (rewrite the bullet to name why). Do not start new work."
@@ -688,9 +698,74 @@ const GRILL_ROUND_CAP = 4;
  * process without ever calling `readyset_ask`. See the gate's call site (in the command handler)
  * for how this combines with `validateBrainstormContent`. */
 const grillRoundState = { rounds: 0, active: false };
-function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefault, preferredLanguage?: string): string {
-	return (
-		"Grill this raw idea into a decided Readyset brainstorm file, mattpocock/skills style — interrogate it, " +
+
+const OUTSIDE_REPO_TOOLS = new Set(["bash", "read", "grep", "glob"]);
+
+/** True when a tool call's arguments reach outside `cwd`: an absolute path token that is not under
+ *  cwd, a `~`/`$HOME` reference, or the bare `/` root (which is what `find /` reduces to after
+ *  tokenization). Relative paths and paths under cwd are inside — never recorded. Advisory: a
+ *  plain-prose absolute path in a bash command is an accepted false positive. */
+export function isOutsideRepoAccess(toolName: string, input: Record<string, unknown>, cwd: string): boolean {
+	if (!OUTSIDE_REPO_TOOLS.has(toolName)) return false;
+	const repoRoot = cwd.replace(/\/+$/, "");
+	const texts: string[] = [];
+	if (toolName === "bash") {
+		if (typeof input.command === "string") texts.push(input.command);
+		if (typeof input.cwd === "string" && input.cwd !== "") texts.push(input.cwd);
+	} else if (toolName === "read") {
+		if (typeof input.path === "string") texts.push(input.path);
+	} else if (toolName === "grep") {
+		if (typeof input.path === "string") texts.push(input.path);
+		if (typeof input.pattern === "string") texts.push(input.pattern);
+	} else if (typeof input.path === "string") {
+		texts.push(input.path);
+	}
+	for (const text of texts) {
+		if (/\$HOME\b|\$\{HOME\}/.test(text)) return true;
+		for (const token of text.split(/[\s"'`;|&()]+/)) {
+			if (token.startsWith("~")) return true;
+			if (!token.startsWith("/")) continue;
+			if (token === repoRoot || token.startsWith(`${repoRoot}/`)) continue;
+			return true;
+		}
+	}
+	return false;
+}
+
+const outsideRepoState: { cwd: string | undefined; entries: string[]; written: number } = {
+	cwd: undefined, entries: [], written: 0,
+};
+export function outsideRepoCount(): number { return outsideRepoState.entries.length; }
+
+export function resetOutsideRepoWatch(cwd: string): void {
+	outsideRepoState.cwd = cwd;
+	outsideRepoState.entries = [];
+	outsideRepoState.written = 0;
+}
+
+function noteOutsideRepoCall(toolName: string, input: Record<string, unknown>): void {
+	if (outsideRepoState.entries.length >= 200) return; // bound memory; the count below keeps growing
+	const text = toolName === "bash" ? String(input.command ?? "")
+		: [input.path, input.pattern].filter((v) => typeof v === "string").join(" ");
+	outsideRepoState.entries.push(`${toolName}: ${text.slice(0, 140)}`);
+}
+
+/** Advisory CONTEXT.md flush: one entry per gate/archive pass, carrying only the calls observed
+ *  since the previous flush. Never throws — a phase log is diagnostics, not control flow. */
+async function flushOutsideRepoEntries(cwd: string, changeId: string): Promise<void> {
+	const unwritten = outsideRepoState.entries.slice(outsideRepoState.written);
+	if (unwritten.length === 0) return;
+	outsideRepoState.written = outsideRepoState.entries.length;
+	await appendContext(
+		cwd, changeId, "Outside-repo access",
+		`⚠ outside-repo access: ${unwritten.length} tool call(s) reached outside the repository — advisory, never blocking` +
+			(unwritten.length <= 10 ? `: ${unwritten.join("; ")}` : `; first 10: ${unwritten.slice(0, 10).join("; ")}`),
+	).catch(() => {});
+}
+
+export function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefault, preferredLanguage?: string): string {
+	return withRepoRule(
+		"Grill this raw idea into a decided Readyset brainstorm file — interrogate it, " +
 			`don't just accept it. Ask only questions whose answer changes the plan. Raw idea from the user: "${ideaText}"\n\n` +
 			"Use the `readyset_ask` tool for EVERY round of questions — do not write '❓ Q1 ...' as plain chat text. " +
 			"Give it 2 or more real options per question and mark your own recommended one via recommendedIndex, so " +
@@ -751,8 +826,7 @@ function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefau
 					"still be entirely in English regardless, exactly like the structure below.\n\n"
 				: "- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
 					"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
-			"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
-			"rules, so the file reads as though that skill wrote it: which option is decided (or explicitly " +
+			"Before writing the file, explicitly close out: which option is decided (or explicitly " +
 			"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Also write the " +
 			"clarity signal into the frontmatter: `clarity` (`clear` = 0 open decisions after fact-finding, " +
 			"`partial` = 1-2, `ambiguous` = 3+ or an undefined core behavior), `openDecisions` (that count), " +
@@ -1299,8 +1373,8 @@ function scopeRefProblems(refs: Awaited<ReturnType<typeof checkScopeRefs>>): str
 }
 
 /** Prompt for the one-shot contract-repair turn: fix ONLY the scope contract, no code. */
-function contractRepairPrompt(problems: string[]): string {
-	return (
+export function contractRepairPrompt(problems: string[]): string {
+	return withRepoRule(
 		"Your `## Files This Change Will Touch` scope contract in proposal.md is wrong. Fix ONLY that " +
 		"section — do not touch code, do not restructure any other part of proposal.md, design.md, " +
 		"specs/, or tasks.md except to correct a path mention that matches a path you change here.\n\n" +
@@ -1434,8 +1508,8 @@ function trimOverruns(sizes: ArtifactSizes, budgets: ArtifactBudgets, lane: Chan
 /** Prompt for the one-shot Trim turn: rewrite ONLY the over-budget planning artifacts down to
  *  their budget by removing restated content — never drop a scenario, a task, or a contract
  *  file. Reuses the exact "do not touch code" wording from contractRepairPrompt. */
-function trimPrompt(overruns: TrimOverrun[]): string {
-	return (
+export function trimPrompt(overruns: TrimOverrun[]): string {
+	return withRepoRule(
 		"Some planning artifacts for this Readyset change are far over their character budget. " +
 		"Rewrite ONLY the files listed below so each is at or under its budget — do not touch code, " +
 		"and do not restructure any other part of proposal.md, design.md, specs/, or tasks.md.\n\n" +
@@ -1522,8 +1596,8 @@ async function runTrim(
 /** Prompt for the one-shot post-Apply scope reconciliation turn. `paths` is the code-computed
  *  candidate list (see `revertCandidates`) — never the raw out-of-contract set, so the model can
  *  only ever revert or delete a file this run itself made. */
-function scopeReconcilePrompt(changeId: string, paths: string[]): string {
-	return (
+export function scopeReconcilePrompt(changeId: string, paths: string[]): string {
+	return withRepoRule(
 		`After implementing "${changeId}", the working tree changed these file(s) that proposal.md's ` +
 		"`## Files This Change Will Touch` scope contract does NOT name, and that this run itself made " +
 		"(they were not already dirty when the run started):\n\n" +
@@ -1777,6 +1851,9 @@ interface ReviewSnapshot {
 	missingDocs: string[];
 	/** Advisory warnings for migration/release/deprecation docs with no contract or on-disk match. */
 	missingDocWarnings: string[];
+	/** Outside-repo tripwire count: tool calls this run observed reaching outside the repository.
+	 *  Advisory — surfaced in the gate, never blocks. */
+	outsideRepoAccess: number;
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -1821,6 +1898,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		assumedScenarios,
 		missingDocs,
 		missingDocWarnings,
+		outsideRepoAccess: outsideRepoCount(),
 	};
 }
 
@@ -1931,6 +2009,7 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 						? snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`)
 						: []),
 					...snapshot.missingDocWarnings,
+					...(snapshot.outsideRepoAccess > 0 ? [`⚠ outside-repo access: ${snapshot.outsideRepoAccess} tool call(s) outside the repository (advisory)`] : []),
 				].join("\n");
 			},
 		},
@@ -2209,6 +2288,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 			: snapshot.assumedScenarios.length > 0 ? snapshot.assumedScenarios.map((scenario) => `assumed scenario: ${scenario}`) : []),
 		...snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`),
 		...snapshot.missingDocWarnings,
+		...(outsideRepoCount() > 0 ? [`⚠ outside-repo access: ${outsideRepoCount()} tool call(s) outside the repository (advisory)`] : []),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -2375,7 +2455,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"]; counts?: PhaseEvent["counts"]; openDecisions?: number } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"]; counts?: PhaseEvent["counts"]; openDecisions?: number; outsideRepo?: number } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -2398,6 +2478,7 @@ async function reviewAndMaybeExecute(
 		// closes once `choice` is resolved. The gate is UI, not a model turn, so no `model` field.
 		await recordPhase(chosen.changeId, "gate", "start");
 		const snapshot = await takeReviewSnapshot(ctx, chosen);
+		await flushOutsideRepoEntries(ctx.cwd, chosen.changeId);
 		showReviewPanel(ctx, chosen, snapshot, budget, reviewLane, artifactBudgets);
 		ctx.ui.setEditorText(await buildReviewDocument(ctx, chosen, snapshot));
 		const taskSummary = snapshot.counted
@@ -2423,7 +2504,7 @@ async function reviewAndMaybeExecute(
 		}
 
 		if (!choice || choice === "discard") {
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "discard" });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "discard", outsideRepo: outsideRepoState.entries.length });
 			return;
 		}
 
@@ -2461,7 +2542,7 @@ async function reviewAndMaybeExecute(
 				outcome: "skipped-keep-context",
 				boundary: "apply",
 			});
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context", openDecisions: snapshot.openDecisions.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoState.entries.length });
 			choice = "approve"; // fall through to Apply, skipping compaction
 		} else if (choice === "approve" || choice === "compact") {
 			const compactResult = await compactForPhase(
@@ -2485,11 +2566,11 @@ async function reviewAndMaybeExecute(
 			// The recorded outcome names the action the user took. The legacy `"compact"` result
 			// (from older sidebar builds) means "approve, keep context" in 0.12.0's note, but the
 			// gate treats it as a plain approve here, so both record `approve`.
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve", openDecisions: snapshot.openDecisions.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoState.entries.length });
 		}
 
 		if (choice === "refine") {
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine", openDecisions: snapshot.openDecisions.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoState.entries.length });
 			const feedback = refineFeedback ?? (ctx.ui.input ? await ctx.ui.input("What should change?") : undefined);
 			if (!feedback) {
 				ctx.ui.notify("No feedback given — nothing changed.", "info");
@@ -2792,6 +2873,8 @@ async function offerArchive(
 	restoredPaths: string[],
 	findings: { found: number; fixed: number } | undefined,
 ): Promise<void> {
+	await flushOutsideRepoEntries(ctx.cwd, chosen.changeId);
+	const outsideLine = outsideRepoCount() > 0 ? `⚠ outside-repo access: ${outsideRepoCount()} tool call(s) outside the repository (advisory). ` : "";
 	const restoredLine = restoredPaths.length > 0
 		? `⚠ ${restoredPaths.length} file(s) the reconciliation turn reverted out of list were RESTORED (${restoredPaths.join(", ")}). `
 		: "";
@@ -2805,7 +2888,7 @@ async function offerArchive(
 			? `Code review skipped (never): readyset.review.mode = never.`
 			: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
 	const archiveChoice = await ctx.ui.select(
-		`${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
+		`${outsideLine}${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
 		[
 			{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
 			{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
@@ -3442,6 +3525,23 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Outside-repo tripwire (advisory). omp fires `tool_call` before every tool executes; older
+	// builds and the test fakes have no `on`, so registration is feature-detected and no-ops.
+	// The host surface is read through a named const on purpose (see the OverlayKeybindings note
+	// above): this file takes zero type dependency on host internals, so the hook shape is cast
+	// rather than imported.
+	const toolCallHost = pi as unknown as {
+		on?: (event: string, handler: (event: unknown, ctx: { cwd?: string }) => void) => void;
+	};
+	if (typeof toolCallHost.on === "function") {
+		toolCallHost.on("tool_call", (event, ctx) => {
+			if (outsideRepoState.cwd === undefined || ctx?.cwd !== outsideRepoState.cwd) return;
+			const call = event as { toolName?: string; input?: Record<string, unknown> };
+			if (isOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, outsideRepoState.cwd)) {
+				noteOutsideRepoCall(call.toolName ?? "", call.input ?? {});
+			}
+		});
+	}
 	registerAskTool(pi);
 	registerVerifyTool(pi);
 	pi.registerCommand("readyset", {
@@ -3461,6 +3561,7 @@ export default function (pi: ExtensionAPI) {
 			// Standalone: bootstrap readyset/{changes,specs} ourselves if missing — there is no
 			// separate init step or CLI to run first.
 			await ensureReadysetRoot(ctx.cwd);
+			resetOutsideRepoWatch(ctx.cwd);
 
 			// Risk-based code-review policy, resolved once for the run. `--review
 			// auto|always|never` (flag) wins over readyset.review.mode (config); the trigger

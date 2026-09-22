@@ -351,6 +351,9 @@ export interface PhaseEvent {
 	};
 	/** gate `end` only: how many items proposal.md's `## Open Decisions` still carried at approval. */
 	openDecisions?: number;
+	/** gate `end` only: how many tool calls this run observed reaching outside the repository
+	 *  (stay-in-repo tripwire). Advisory — never blocks, never fails a phase. */
+	outsideRepo?: number;
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */

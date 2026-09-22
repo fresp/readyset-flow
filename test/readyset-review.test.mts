@@ -133,6 +133,7 @@ function makeFakePi(cwd: string) {
   const calls: { prompt: string }[] = [];
   const pendingEffects: (() => Promise<void>)[] = [];
   const setModelCalls: unknown[] = [];
+  const outsideHandlers: ((event: unknown, ctx: { cwd?: string }) => void)[] = [];
   return {
     pi: {
       sendUserMessage(prompt: string, _opts: unknown) {
@@ -143,6 +144,11 @@ function makeFakePi(cwd: string) {
       },
       registerTool(_def: unknown) {
         /* readyset_ask registration -- not exercised directly by these tests */
+      },
+      // omp's real extension API fires `tool_call` before each tool runs. Capture the handler so
+      // the tripwire tests can drive it; existing tests never call it, so counts stay 0.
+      on(event: string, handler: (event: unknown, ctx: { cwd?: string }) => void) {
+        if (event === "tool_call") outsideHandlers.push(handler);
       },
       zod: fakeZod,
       async setModel(spec: unknown) {
@@ -155,6 +161,7 @@ function makeFakePi(cwd: string) {
     },
     calls,
     setModelCalls,
+    outsideHandlers,
     queueEffect(fn: () => Promise<void>) {
       pendingEffects.push(fn);
     },
@@ -4646,6 +4653,129 @@ await test("fast lane: archiving notifies info-level 'no spec delta' and CONTEXT
   assert.ok(archivedDirName, "the change was archived");
   const context = await readFile(join(archiveRoot, archivedDirName!, "CONTEXT.md"), "utf8");
   assert.match(context, /no spec delta to merge/);
+});
+
+// --- Stay-in-repo rule + outside-repo tripwire ------------------------------------------------
+
+async function loadMod(): Promise<any> {
+  return (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as any;
+}
+
+await test("stay-in-repo rule: every phase prompt and SKILL.md carry it", async () => {
+  const mod = await loadMod();
+  const prompts: [string, string][] = [
+    ["grill", mod.grillTurnPrompt("idea", "2026-01-01", "ask")],
+    ["explore", mod.exploreTurnPrompt({ changeId: "x", file: ".ai/brainstorms/x.md" } as any, [])],
+    ["propose", mod.proposeTurnPrompt({ changeId: "x", file: ".ai/brainstorms/x.md" } as any)],
+    ["refine", mod.refineTurnPrompt("x", "fb", [])],
+    ["apply", mod.applyTurnPrompt("x")],
+    ["code-review", mod.codeReviewTurnPrompt("x")],
+    ["review-fix", mod.reviewFixTurnPrompt("x", ["f"])],
+    ["contract-repair", mod.contractRepairPrompt(["p"])],
+    ["trim", mod.trimPrompt([{ file: "proposal", chars: 1, budget: 1 }] as any)],
+    ["scope-reconcile", mod.scopeReconcilePrompt("x", ["a.ts"])],
+  ];
+  for (const [name, prompt] of prompts) {
+    assert.match(prompt, /Work only inside the current repository/, `${name} prompt carries the rule`);
+    assert.ok(prompt.trimEnd().endsWith(mod.STAY_IN_REPO_RULE), `${name} prompt ends with the rule as its last paragraph`);
+  }
+  const skill = await readFile("src/skill/SKILL.md", "utf8");
+  assert.ok(skill.includes(mod.STAY_IN_REPO_RULE), "SKILL.md carries the rule byte-identically");
+  const grill = mod.grillTurnPrompt("idea", "2026-01-01", "ask");
+  assert.doesNotMatch(grill, /mattpocock\/skills style/);
+  assert.doesNotMatch(grill, /brainstorm-ai skill's own closing/);
+});
+
+await test("outside-repo tripwire: classifies outside-repo calls and ignores in-repo ones", async () => {
+  const mod = await loadMod();
+  const cwd = await mkdtemp(join(tmpdir(), "outside-cwd-"));
+  const f = (toolName: string, input: Record<string, unknown>) => mod.isOutsideRepoAccess(toolName, input, cwd);
+  assert.ok(f("bash", { command: "cat /etc/passwd" }), "absolute path outside cwd");
+  assert.ok(f("bash", { command: "find / -name 'readyset*'" }), "find / root token");
+  assert.ok(f("bash", { command: "cat ~/.omp/agent/config.yml" }), "tilde reference");
+  assert.ok(f("bash", { command: "cat $HOME/Downloads/notes.md" }), "$HOME reference");
+  assert.ok(f("read", { path: "/etc/passwd" }), "read outside path");
+  assert.ok(f("grep", { pattern: "x", path: "/etc" }), "grep outside path");
+  assert.ok(f("grep", { pattern: "/etc/passwd" }), "grep outside pattern");
+  assert.ok(f("glob", { path: "/tmp" }), "glob outside path");
+  assert.ok(!f("bash", { command: "cat src/a.ts" }), "relative bash path is inside");
+  assert.ok(!f("bash", { command: `cat ${cwd}/src/a.ts` }), "absolute path under cwd is inside");
+  assert.ok(!f("bash", { command: `git -C ${cwd} log` }), "cwd itself is inside");
+  assert.ok(!f("read", { path: join(cwd, "src/a.ts") }), "read under cwd is inside");
+  assert.ok(!f("read", { path: "src/a.ts" }), "relative read is inside");
+  assert.ok(!f("grep", { pattern: "x", path: cwd }), "grep path == cwd is inside");
+  assert.ok(!f("glob", { path: "src" }), "relative glob is inside");
+  assert.ok(!f("edit", { path: "/etc/passwd" }), "unwatched tool is never recorded");
+});
+
+await test("outside-repo tripwire: no-op when the host has no tool_call hook", async () => {
+  const mod = await loadMod();
+  assert.doesNotThrow(() =>
+    mod.default({ sendUserMessage() {}, registerCommand() {}, registerTool() {}, zod: fakeZod } as any),
+  );
+  assert.equal(mod.outsideRepoCount(), 0);
+});
+
+await test("outside-repo tripwire: records an outside bash call and ignores in-repo ones", async () => {
+  const mod = await loadMod();
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  mod.default(fakePiWrap.pi as any);
+  assert.ok(fakePiWrap.outsideHandlers.length > 0, "the tool_call handler was registered");
+  mod.resetOutsideRepoWatch(cwd);
+  const handler = fakePiWrap.outsideHandlers[0];
+  handler({ toolName: "bash", input: { command: "find / -name 'readyset*'" } }, { cwd });
+  assert.equal(mod.outsideRepoCount(), 1, "an outside bash call is recorded");
+  handler({ toolName: "read", input: { path: join(cwd, "src/a.ts") } }, { cwd });
+  assert.equal(mod.outsideRepoCount(), 1, "an in-repo read is ignored");
+  handler({ toolName: "bash", input: { command: "find / -name 'readyset*'" } }, { cwd: `${cwd}-other` });
+  assert.equal(mod.outsideRepoCount(), 1, "a call from a different cwd is ignored");
+});
+
+await test("outside-repo tripwire: an outside bash call during Explore shows at the gate, in CONTEXT.md and on the gate end event", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  await writeBrainstorm(
+    cwd,
+    "2026-07-01-tripwire.md",
+    { title: "Tripwire", status: "open", created: "2026-07-01", change_id: "tripwire" },
+    VALID_BRAINSTORM_BODY,
+  );
+  const dir = join(cwd, "readyset", "changes", "tripwire");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-07-01 · Tripwire"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // gate
+
+  // Fire the outside bash call during the Explore turn's waitForIdle, before the gate.
+  fakePiWrap.queueEffect(async () => {
+    fakePiWrap.outsideHandlers.forEach((h) => h({ toolName: "bash", input: { command: "find / -name 'readyset*'" } }, { cwd }));
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\nchecked things\n", "utf8");
+  });
+  // Propose turn: write a valid proposal so the run reaches the gate.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(
+      join(dir, "proposal.md"),
+      "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n",
+      "utf8",
+    );
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.ok(
+    fakeUiWrap.widgetHistory.flat().some((line) => /⚠ outside-repo access: 1 tool call/.test(line)),
+    "the gate panel shows the outside-repo count",
+  );
+  const context = await readContext(cwd, "tripwire");
+  assert.match(context, /⚠ outside-repo access/, "CONTEXT.md records the outside-repo access");
+  const events = await readPhaseEvents(cwd, "tripwire");
+  const gateEnd = events.find((event) => event.phase === "gate" && event.edge === "end");
+  assert.equal(gateEnd?.outsideRepo, 1, "the gate end event carries the outsideRepo count");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
