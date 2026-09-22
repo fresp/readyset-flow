@@ -161,6 +161,14 @@ by phase events, so the benchmark can tune them from real data.
   **tmp** category (`outsideRepoTmp` on the `gate` `end` event) and excluded from the headline
   `outsideRepo` number.
 
+- **An explicit `--lane` now lists fast-lane brainstorms in the picker.** `--lane` only filled the
+  run's lane override, while the picker filter still keyed off `--fast` alone — so
+  `/readyset --lane fast`, the run that actually wants a fast-lane brainstorm, filtered the list to
+  empty and returned the "No full-lane brainstorms found" warning instead of opening the picker or
+  the gate. An explicit `--lane fast|full` is the operator's lane answer, so it now loads fast-lane
+  brainstorms too (`--lane full` still lets the operator pick one and runs it on the full lane, the
+  same way `--fast` behaves). The empty-picker warning and the flag description name `--lane`.
+
 ## 0.14.0
 
 A scope-and-size pass on top of 0.13.0, still driven by the `v0.12` full-matrix benchmark. It

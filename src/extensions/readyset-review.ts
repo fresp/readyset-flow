@@ -3598,13 +3598,12 @@ export default function (pi: ExtensionAPI) {
 			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --lang <language> to open " +
 			"grilling's discussion in that language from round 1 (must come before --idea), --model <spec> to pin a model " +
 			"for this run's turns, --fallback-model <spec> if the pin fails to apply, " +
-			"--lane <fast|full> to force the lane for the run (note: --fast only filters the picker; it does not force a lane), " +
+			"--lane <fast|full> to force the lane for the run and list fast-lane brainstorms in the picker (--fast only filters the picker; neither flag alone forces a lane), " +
 			"--review auto|always|never|<change-id> to control (or re-run) the code-review turn)",
 		handler: async (args, ctx) => {
 			// `args` is the raw string omp hands a registered command (see parseReadysetArgs).
 			const parsedArgs = parseReadysetArgs(args);
 			const showAll = parsedArgs.all;
-			const includeFast = parsedArgs.fast;
 
 			// Standalone: bootstrap readyset/{changes,specs} ourselves if missing — there is no
 			// separate init step or CLI to run first.
@@ -3667,6 +3666,15 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Ignoring --lane "${parsedArgs.lane}" — expected fast or full. Running on the brainstorm's recorded lane.`, "warning");
 			}
 
+			// The picker filter must agree with the lane the run is about to use. An explicit
+			// --lane (fast or full) IS the operator's lane answer, so a fast-lane brainstorm is
+			// exactly what a `--lane fast` run asked for and `--lane full` must still let it be
+			// listed — the operator picks it and the override decides the lane that actually runs.
+			// Only the bare `/readyset` (no --fast, no --lane) hides fast-lane brainstorms.
+			// Declared here, after laneOverride: reading `laneOverride` before its `const` would be
+			// a temporal-dead-zone ReferenceError.
+			const includeFast = parsedArgs.fast || laneOverride !== undefined;
+
 			// --compact auto|always|never controls when a phase boundary actually compacts.
 			// Anything else (or a bare --compact with no value) warns and uses "auto". The raw
 			// `--compact` text test covers both "no value" and "bad value", since the parser only
@@ -3721,7 +3729,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (items.length === 0) {
 				ctx.ui.notify(
-					`No full-lane brainstorms found in ${BRAINSTORM_DIR}/ (--fast includes fast-lane, --all includes archived)` +
+					`No full-lane brainstorms found in ${BRAINSTORM_DIR}/ (--fast or --lane includes fast-lane, --all includes archived)` +
 						(canGrillFromScratch ? ` -- or run /readyset --idea "<your raw idea>" to grill a new one into existence.` : ""),
 					"warning",
 				);

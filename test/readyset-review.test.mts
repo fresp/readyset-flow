@@ -617,6 +617,103 @@ await test("--fast flag includes fast-lane brainstorms; default excludes them", 
   assert.equal(fakeUiWrap2.notifications.filter((n) => /No full-lane/.test(n.message)).length, 0);
 });
 
+await test("--lane fast lists a fast-lane brainstorm, opens the picker, and runs the fast lane", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-30-fastlane.md", {
+    title: "Fast Street",
+    status: "open",
+    created: "2026-01-30",
+    change_id: "fast-street",
+    lane: "fast",
+  }, VALID_BRAINSTORM_BODY);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-30 · Fast Street");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Archive now");
+
+  const dir = join(cwd, "readyset", "changes", "fast-street");
+  // Fast lane: the first (and only) planning turn is Propose. Mirrors the fast-lane fixture at
+  // test/readyset-review.test.mts:399-413.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "proposal.md"),
+      "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- x (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+  });
+  // Code-review effect (the live fast lane still runs review, just narrowed).
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  // The picker really opened — this is the regression: the bug filtered the list to [] and
+  // warned instead, so select() was never called.
+  assert.equal(fakeUiWrap.selectPrompts.length >= 1, true, "the brainstorm picker opened");
+  assert.equal(
+    fakeUiWrap.notifications.filter((n) => /No full-lane brainstorms found/.test(n.message)).length,
+    0,
+    "an explicit --lane must not warn that no full-lane brainstorms exist",
+  );
+
+  // 3 turns (Propose, Apply, Review) — the fast lane fires no Explore turn (mirrors the
+  // existing fast-lane fixture at test/readyset-review.test.mts:399-413).
+  assert.equal(fakePiWrap.calls.length, 3, "Propose then Apply then Review, no Explore");
+  assert.ok(!fakePiWrap.calls.some((c) => /Explore the ground truth/.test(c.prompt)), "fast lane must not fire Explore");
+  assert.ok(fakePiWrap.calls.some((c) => /Create a Readyset change/.test(c.prompt)), "Propose still fires");
+
+  // The run's lane is the flag's, and the phase log says so.
+  const gateEnd = (await phaseEventsArchivedOrLive(cwd, "fast-street")).find((e) => e.phase === "gate" && e.edge === "end");
+  assert.ok(gateEnd, "a gate end event exists");
+  assert.equal(gateEnd!.lane, "fast");
+  assert.equal(gateEnd!.laneSource, "flag");
+});
+
+await test("--lane full lists a fast-lane brainstorm and runs it on the full lane", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-01-31-fastlane-full.md", {
+    title: "Fast Street Full",
+    status: "proposed",
+    created: "2026-01-31",
+    change_id: "fast-street-full",
+    lane: "fast",
+  });
+
+  const dir = join(cwd, "readyset", "changes", "fast-street-full");
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-01-31 · Fast Street Full"); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // gate: leave immediately, no turns fire
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane full", ctx);
+
+  const gateEnd = (await readPhaseEvents(cwd, "fast-street-full")).find((e) => e.phase === "gate" && e.edge === "end");
+  assert.ok(gateEnd, "a gate end event exists");
+  assert.equal(gateEnd!.lane, "full", "an explicit --lane full overrides the file's fast lane");
+  assert.equal(gateEnd!.laneSource, "flag");
+});
+
 await test("archived brainstorm short-circuits with a warning", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-06-done.md", { title: "Done", status: "archived", created: "2026-01-06", change_id: "done" });
