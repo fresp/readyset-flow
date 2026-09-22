@@ -883,6 +883,37 @@ await test("phase events round-trip in file order", async () => {
   assert.deepEqual(await readPhaseEvents(cwd, "ph"), [first, second]);
 });
 
+await test("phase events round-trip the new laneSource values and the grill payload", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "ph2");
+  const auto: PhaseEvent = {
+    phase: "explore",
+    edge: "end",
+    at: "2026-01-02T00:00:00.000Z",
+    lane: "fast",
+    laneSource: "config-auto",
+  };
+  const userPick: PhaseEvent = {
+    phase: "grill",
+    edge: "end",
+    at: "2026-01-02T00:01:00.000Z",
+    lane: "full",
+    laneSource: "user-pick",
+    outcome: "grilled",
+    grill: {
+      clarity: "partial",
+      openDecisions: 1,
+      questionsAsked: 2,
+      recommendedLane: "full",
+      laneReason: "narrow but migration-bound",
+      riskFlag: "migration",
+    },
+  };
+  await appendPhaseEvent(cwd, "ph2", auto);
+  await appendPhaseEvent(cwd, "ph2", userPick);
+  assert.deepEqual(await readPhaseEvents(cwd, "ph2"), [auto, userPick]);
+});
+
 await test("readPhaseEvents returns [] when there is no CONTEXT.md", async () => {
   const cwd = await freshCwd();
   await scaffoldChange(cwd, "none");

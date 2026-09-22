@@ -3,9 +3,13 @@ import {
 	BRAINSTORM_DIR,
 	type BrainstormMeta,
 	isProposed,
+	type Lane,
 	loadBrainstorms,
 	markApproved,
+	parseFrontmatter,
 	reconcileStatuses,
+	readClaritySignal,
+	recommendLane,
 	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
 import { readFile } from "node:fs/promises";
@@ -42,8 +46,10 @@ import {
 } from "../lib/readyset-spec.ts";
 import {
 	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
+	type LaneDefault,
 	readCompactMinContextPercent,
 	readFallbackChain,
+	readLaneDefault,
 	readPhaseModels,
 	readPinnedModel,
 	readPreferredLanguage,
@@ -520,81 +526,110 @@ const GRILL_ROUND_CAP = 4;
  * process without ever calling `readyset_ask`. See the gate's call site (in the command handler)
  * for how this combines with `validateBrainstormContent`. */
 const grillRoundState = { rounds: 0, active: false };
-function grillTurnPrompt(ideaText: string, today: string, preferredLanguage?: string): string {
+function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefault, preferredLanguage?: string): string {
 	return (
 		"Grill this raw idea into a decided Readyset brainstorm file, mattpocock/skills style — interrogate it, " +
-		`don't just accept it. Raw idea from the user: "${ideaText}"\n\n` +
-		"Use the `readyset_ask` tool for EVERY round of questions — do not write '❓ Q1 ...' as plain chat text. " +
-		"Give it 2 or more real options per question and mark your own recommended one via recommendedIndex, so " +
-		"the user picks or overrides rather than starting from a blank page. You can keep calling `readyset_ask` " +
-		"round after round in this same turn — you don't need to end your turn between rounds. Keep going until " +
-		"the design is genuinely settled, or until the tool tells you the round cap was hit (then check in: " +
-		"summarize what's decided, name what's still open, ask in plain chat whether to keep grilling or write " +
-		"the brainstorm now with the rest under Open Questions — pace check only, not permission to accept a " +
-		"passive answer). If the tool reports the user chose to discuss instead of picking, or that the " +
-		"structured picker isn't available this session, continue that round in plain chat text instead, then go " +
-		"back to `readyset_ask` for the next round once it's resolved. Rules:\n" +
-		"- Map out the decision branches this idea implies before asking anything (what's actually unresolved: " +
-		"approach, scope boundary, the seam/module it touches, how success is observed), then ask only the " +
-		"questions answerable right now, all in one round.\n" +
-		"- Never accept a passive answer ('okay', 'terserah', 'up to you', 'looks good' — whether typed as a " +
-		"custom answer or implied by picking your own recommended option without engaging) as a real decision on " +
-		"anything load-bearing — if the user brushes past a question, restate it as a concrete pick with your " +
-		"recommendation and ask again. Only an explicit 'defer this to the planning harness' counts as a " +
-		"resolved answer for something the user genuinely doesn't want to decide yet.\n" +
-		"- Offer at least two real options/approaches when there's more than one reasonable way in, with a short " +
-		"description of the trade-off on each option — don't just assert a pick.\n" +
-		"- Do ONE focused pass of read-only repo research (Read/Grep/Glob, read-only git/shell commands) " +
-		"BEFORE round 1 — map the idea onto real files/modules/seams first, then carry those findings through " +
-		"every round. Do not re-research the same question in later rounds; research only genuinely new " +
-		"questions that round 1 couldn't have anticipated. The benchmark showed a single grilling session " +
-		"making 17 bash + 16 read calls spread across rounds for what one upfront pass covers — every " +
-		"repeated lookup re-pays the same context cost. Don't ask the user something the repo already " +
-		"answers.\n" +
-		"- Finding facts is your job, never the user's (mattpocock/skills' own rule for this — see " +
-		"src/skill/mattpocock-grilling.md in this package). A question about external platform behavior, API " +
-		"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
-		"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
-		"real thing. Reserve open questions for what only the user can decide or knows.\n" +
-		(preferredLanguage
-			? `- Preferred language for this discussion: ${preferredLanguage}. Write every question and option ` +
-				"text you pass to `readyset_ask`, and any plain-chat fallback text, in that language from the very " +
-				"first round -- don't wait for the user to reply in it first before switching. Keep each " +
-				"`readyset_ask` question's `header` (the short chip label above it, e.g. 'Eligibility gate') in " +
-				"English regardless of preferred language -- it reads like fixed UI chrome, not conversation, and " +
-				"a picker with some tabs translated and some not (e.g. 'Framing' next to a translated tab) is more " +
-				"jarring than just keeping all of them in English. The brainstorm FILE you write at the end must " +
-				"still be entirely in English regardless, exactly like the structure below.\n\n"
-			: "- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
-				"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
-		"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
-		"rules, so the file reads as though that skill wrote it: which option is decided (or explicitly " +
-		"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Then ask the user " +
-		"directly for the lane — propose one with a one-line reason (full for feature/adjust/experimental, " +
-		"fast for bugfix/hotfix/refactor/chore/docs/test/release), and take their pick. The lane decides how " +
-		"heavy the later phases run: fast means a lighter Explore folded into Propose, at most ~8 tasks, and " +
-		"no mutation-testing review — so a wrong lane changes cost, not just a label. Behavior-affecting " +
-		"ambiguities must still be asked either way; the lane trims volume, never the questions that change " +
-		"behavior. Also auto-derive (don't ask) the branch type with a one-line reason, and do ask directly " +
-		"(it's a workflow preference the content can't reveal): commit-only vs. commit + merge request per task.\n\n" +
-		"Once — and only once — every one of those is actually resolved or explicitly deferred, write the file " +
-		`to .ai/brainstorms/${today}-<slug>.md (kebab-case slug derived from the title) with exactly this shape:\n\n` +
-		"---\n" +
-		"title: <short topic title>\n" +
-		"slug: <slug>\n" +
-		"status: open\n" +
-		"lane: full/fast\n" +
-		"change_id:\n" +
-		`created: ${today}\n` +
-		"namespace: <repo/project path this is scoped to, or cross-namespace>\n" +
-		"---\n\n" +
-		"## Problem / Context\n## Options Explored\n### Option A: <name>\n### Option B: <name>\n" +
-		"## Leaning Direction\n## Decision\n## Seam\n## Scope\n## Acceptance Criteria\n## Spec Impact\n" +
-		"## Git Workflow\n- Branch: <type>/<slug>\n- Inference reason: <one line>\n" +
-		"- Lane: <full | fast> — <one line>\n- Per-task flow: <\"commit only\" | \"commit + merge request per task\">\n" +
-		"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +
-		"Once the file is written, tell the user its path and that running /readyset again picks it up " +
-		"from here (Explore, then Propose) — do not fire off Explore or Propose yourself in this turn."
+			`don't just accept it. Ask only questions whose answer changes the plan. Raw idea from the user: "${ideaText}"\n\n` +
+			"Use the `readyset_ask` tool for EVERY round of questions — do not write '❓ Q1 ...' as plain chat text. " +
+			"Give it 2 or more real options per question and mark your own recommended one via recommendedIndex, so " +
+			"the user picks or overrides rather than starting from a blank page. You can keep calling `readyset_ask` " +
+			"round after round in this same turn — you don't need to end your turn between rounds. Keep going until " +
+			"the design is genuinely settled, or until the tool tells you the round cap was hit (then check in: " +
+			"summarize what's decided, name what's still open, ask in plain chat whether to keep grilling or write " +
+			"the brainstorm now with the rest under Open Questions — pace check only, not permission to accept a " +
+			"passive answer). If the tool reports the user chose to discuss instead of picking, or that the " +
+			"structured picker isn't available this session, continue that round in plain chat text instead, then go " +
+			"back to `readyset_ask` for the next round once it's resolved. Rules:\n" +
+			"- Every `readyset_ask` question MUST carry a `decision` field naming the plan decision it changes and how " +
+			"the plan differs per answer, in one short sentence. A question whose answers would all lead to the same " +
+			"plan must NOT be asked — decide it yourself and record it under a `## Assumed` section in the brainstorm " +
+			"(below), so the assumption is reviewable rather than silently held. The tool enforces this: a round with " +
+			"a question missing `decision` is rejected without opening the picker and without consuming a round.\n" +
+			"- Map out the decision branches this idea implies before asking anything (what's actually unresolved: " +
+			"approach, scope boundary, the seam/module it touches, how success is observed), then ask only the " +
+			"questions answerable right now, all in one round.\n" +
+			"- After the fact-finding pass, count *open decisions* — choices facts cannot settle that change scope, " +
+			"behavior, or interfaces. Stop as soon as no open decisions remain, even in round 1; the round cap is a " +
+			"ceiling, not a target.\n" +
+			"- Never accept a passive answer ('okay', 'terserah', 'up to you', 'looks good' — whether typed as a " +
+			"custom answer or implied by picking your own recommended option without engaging) as a real decision on " +
+			"anything load-bearing — if the user brushes past a question, restate it as a concrete pick with your " +
+			"recommendation and ask again. Only an explicit 'defer this to the planning harness' counts as a " +
+			"resolved answer for something the user genuinely doesn't want to decide yet.\n" +
+			"- Offer at least two real options/approaches when there's more than one reasonable way in, with a short " +
+			"description of the trade-off on each option — don't just assert a pick.\n" +
+			"- Do ONE focused pass of read-only repo research (Read/Grep/Glob, read-only git/shell commands) " +
+			"BEFORE round 1 — map the idea onto real files/modules/seams first, then carry those findings through " +
+			"every round. Do not re-research the same question in later rounds; research only genuinely new " +
+			"questions that round 1 couldn't have anticipated. The benchmark showed a single grilling session " +
+			"making 17 bash + 16 read calls spread across rounds for what one upfront pass covers — every " +
+			"repeated lookup re-pays the same context cost. Don't ask the user something the repo already " +
+			"answers.\n" +
+			"- Finding facts is your job, never the user's (mattpocock/skills' own rule for this — see " +
+			"src/skill/mattpocock-grilling.md in this package). A question about external platform behavior, API " +
+			"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
+			"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
+			"real thing. Reserve open questions for what only the user can decide or knows.\n" +
+			(preferredLanguage
+				? `- Preferred language for this discussion: ${preferredLanguage}. Write every question and option ` +
+					"text you pass to `readyset_ask`, and any plain-chat fallback text, in that language from the very " +
+					"first round -- don't wait for the user to reply in it first before switching. Keep each " +
+					"`readyset_ask` question's `header` (the short chip label above it, e.g. 'Eligibility gate') in " +
+					"English regardless of preferred language -- it reads like fixed UI chrome, not conversation, and " +
+					"a picker with some tabs translated and some not (e.g. 'Framing' next to a translated tab) is more " +
+					"jarring than just keeping all of them in English. The brainstorm FILE you write at the end must " +
+					"still be entirely in English regardless, exactly like the structure below.\n\n"
+				: "- Reply in whatever language the user is using for the back-and-forth itself. The brainstorm FILE you " +
+					"write at the end must be entirely in English regardless, exactly like the structure below.\n\n") +
+			"Before writing the file, explicitly close out — per the existing brainstorm-ai skill's own closing " +
+			"rules, so the file reads as though that skill wrote it: which option is decided (or explicitly " +
+			"deferred), the seam, in/out of scope, and acceptance criteria as WHEN/THEN lines. Also write the " +
+			"clarity signal into the frontmatter: `clarity` (`clear` = 0 open decisions after fact-finding, " +
+			"`partial` = 1-2, `ambiguous` = 3+ or an undefined core behavior), `openDecisions` (that count), " +
+			"`questionsAsked` (how many rounds you actually asked), and `riskFlag` — one of " +
+			"`cross-cutting|migration|api-change|security` — but only when it genuinely applies (omit it " +
+			"otherwise). " +
+			(laneDefault === "ask"
+				? "Then ask the user directly for the lane — propose one with a one-line reason (full for " +
+					"feature/adjust/experimental, fast for bugfix/hotfix/refactor/chore/docs/test/release), and take " +
+					"their pick. Write the chosen lane and that one-line reason into `lane` and `laneReason`. "
+				: laneDefault === "auto"
+					? "Do NOT ask the user for the lane. Derive it from the clarity score — `clarity: clear` → " +
+						"`fast`, `clarity: ambiguous` → `full`, `clarity: partial` → `fast` unless a risk flag applies " +
+						"(cross-cutting, migration/data-format, public API/deprecation, security/auth), in which case " +
+						"`full`. Write that into `lane`, and put the one-line justification in `laneReason`. "
+					: `Do NOT ask the user for the lane. Write \`lane: ${laneDefault}\` and a one-line reason in \`laneReason\`. `) +
+			"The lane decides how " +
+			"heavy the later phases run: fast means a lighter Explore folded into Propose, at most ~8 tasks, and " +
+			"no mutation-testing review — so a wrong lane changes cost, not just a label. Behavior-affecting " +
+			"ambiguities must still be asked either way; the lane trims volume, never the questions that change " +
+			"behavior. Also auto-derive (don't ask) the branch type with a one-line reason, and do ask directly " +
+			"(it's a workflow preference the content can't reveal): commit-only vs. commit + merge request per task.\n\n" +
+			"Once — and only once — every one of those is actually resolved or explicitly deferred, write the file " +
+			`to .ai/brainstorms/${today}-<slug>.md (kebab-case slug derived from the title) with exactly this shape:\n\n` +
+			"---\n" +
+			"title: <short topic title>\n" +
+			"slug: <slug>\n" +
+			"status: open\n" +
+			"lane: full/fast\n" +
+			"change_id:\n" +
+			`created: ${today}\n` +
+			"namespace: <repo/project path this is scoped to, or cross-namespace>\n" +
+			`clarity: clear|partial|ambiguous\n` +
+			`openDecisions: <n>\n` +
+			`questionsAsked: <n>\n` +
+			`laneReason: "<one line>"\n` +
+			`# riskFlag: cross-cutting|migration|api-change|security  (only when it applies; omit otherwise)\n` +
+			"---\n\n" +
+			"## Problem / Context\n## Options Explored\n### Option A: <name>\n### Option B: <name>\n" +
+			"## Leaning Direction\n## Decision\n## Assumed\n- none\n## Seam\n## Scope\n## Acceptance Criteria\n## Spec Impact\n" +
+			"## Git Workflow\n- Branch: <type>/<slug>\n- Inference reason: <one line>\n" +
+			"- Lane: <full | fast> — <one line>\n- Per-task flow: <\"commit only\" | \"commit + merge request per task\">\n" +
+			"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +
+			"Under `## Assumed`, list each decision you made yourself without asking — one per line as " +
+			"`- <the decision> — because all answers led to the same plan` — or `- none` if there were none. " +
+			"Once the file is written, tell the user its path and that running /readyset again picks it up " +
+			"from here (Explore, then Propose) — do not fire off Explore or Propose yourself in this turn."
 	);
 }
 
@@ -910,7 +945,7 @@ async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string)
  * turns that follow are ordinary chat turns the user answers directly (see `grillTurnPrompt`'s
  * doc comment). Handler call sites `return` right after this.
  */
-function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, preferredLanguage?: string): void {
+function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, laneDefault: LaneDefault, preferredLanguage?: string): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
 	grillRoundState.rounds = 0;
@@ -922,7 +957,7 @@ function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, prefe
 			"from there.",
 		"info",
 	);
-	pi.sendUserMessage(grillTurnPrompt(ideaText, today, preferredLanguage));
+	pi.sendUserMessage(grillTurnPrompt(ideaText, today, laneDefault, preferredLanguage));
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -1731,7 +1766,7 @@ async function reviewAndMaybeExecute(
 	budget: TurnBudget,
 	phaseModels: Map<string, { model: string; source: string }> = new Map(),
 	reviewLane: "full" | "fast" = "full",
-	reviewLaneSource: "flag" | "brainstorm" = "brainstorm",
+	reviewLaneSource: PhaseEvent["laneSource"] = "brainstorm",
 	compactMode: "auto" | "always" | "never" = "auto",
 	minContextPercent: number = DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
 ): Promise<void> {
@@ -2088,6 +2123,7 @@ interface ReadysetAskParams {
 		options: { label: string; description?: string }[];
 		recommendedIndex?: number;
 		multi?: boolean;
+		decision: string;
 	}[];
 }
 
@@ -2132,6 +2168,12 @@ function registerAskTool(pi: ExtensionAPI): void {
 							.describe("2 or more real options"),
 						recommendedIndex: pi.zod.number().int().min(0).optional().describe("index of your recommended option, if any"),
 						multi: pi.zod.boolean().optional().describe("true if more than one option can be selected"),
+						decision: pi.zod
+							.string()
+							.describe(
+								"the plan decision this question changes, and how the plan differs per answer — one short " +
+									"sentence; a question whose answers all lead to the same plan must not be asked",
+							),
 					}),
 				)
 				.min(1)
@@ -2151,6 +2193,27 @@ function registerAskTool(pi: ExtensionAPI): void {
 								"Check in with the user in plain chat text instead: summarize what's decided, name what's still " +
 								"open, and ask whether to keep grilling or write the brainstorm now with the rest under Open " +
 								"Questions.",
+						},
+					],
+				};
+			}
+			// Value-of-information gate: every question must name the plan decision it changes.
+			// A question whose answers all lead to the same plan must not be asked at all — the
+			// model decides it and records it under the brainstorm's "Assumed" list instead. This
+			// is checked BEFORE rounds++ so a rejected round neither opens the dialog nor consumes
+			// the round budget (a malformed round can be corrected without burning the ceiling).
+			const missingDecision = askedQuestions.filter((q) => !q.decision || q.decision.trim() === "");
+			if (missingDecision.length > 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Rejected: ${missingDecision.length} question(s) had no \`decision\` field (${missingDecision.map((q) => q.id).join(", ")}). ` +
+								"Every question must name the plan decision it changes and how the plan differs per answer, in the " +
+								"question's `decision` field. If a question's answers would all lead to the same plan, do not ask it — " +
+								"decide it yourself and record it under an \"Assumed\" list in the brainstorm instead. Re-send this round " +
+								"with a `decision` on every question.",
 						},
 					],
 				};
@@ -2528,6 +2591,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Ignoring --compact with no valid mode — expected auto, always, or never. Using "auto".`, "warning");
 			}
 
+			// readyset.lane.default decides whether the lane is asked by hand during grilling
+			// (ask, today's behavior), auto-accepted from code's clarity→lane recommendation, or
+			// forced. Resolved once here and threaded into both grilling and the effective lane.
+			const resolvedLaneDefault = await readLaneDefault();
+			if (resolvedLaneDefault.warning) ctx.ui.notify(resolvedLaneDefault.warning, "warning");
+			const laneDefault = resolvedLaneDefault.laneDefault;
+
 			// --lang <language> (or, if no flag, readyset.language in ~/.omp/agent/config.yml) sets
 			// the language grilling's discussion (questions and replies) opens in from round 1,
 			// rather than grillTurnPrompt's reactive default of matching whatever language the
@@ -2546,7 +2616,7 @@ export default function (pi: ExtensionAPI) {
 			// come last among flags on the command line.
 			const ideaFromFlag = parsedArgs.idea ?? "";
 			if (ideaFromFlag) {
-				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, preferredLanguage);
+				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, laneDefault, preferredLanguage);
 				return;
 			}
 
@@ -2583,8 +2653,11 @@ export default function (pi: ExtensionAPI) {
 						? "full lane (assumed)"
 						: `${b.lane} lane`;
 				const next = b.status === "archived" ? "done" : isProposed(b.status) ? "→ review" : "→ propose + review";
+				const clarityTag = b.clarity
+					? `clarity ${b.clarity}${b.recommendedLane && b.recommendedLane !== b.lane ? ` → ${b.recommendedLane}` : ""}`
+					: undefined;
 				byLabel.set(label, b);
-				return { label, description: [next, lane, b.namespace].filter(Boolean).join(" · ") };
+				return { label, description: [next, lane, b.namespace, clarityTag].filter(Boolean).join(" · ") };
 			});
 			if (canGrillFromScratch) {
 				options.unshift({
@@ -2605,7 +2678,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("No idea given -- nothing started.", "info");
 					return;
 				}
-				startGrilling(pi, reviewCtxForInput, idea, preferredLanguage);
+				startGrilling(pi, reviewCtxForInput, idea, laneDefault, preferredLanguage);
 				return;
 			}
 
@@ -2613,10 +2686,20 @@ export default function (pi: ExtensionAPI) {
 			if (!chosen) return;
 
 			// resolveLane() in readyset-brainstorm.ts answers "what did the file say"; the run's
-			// lane additionally honors --lane (set above). From here on, effectiveLane is the
-			// only lane value this run may act on — read b.lane directly and you silently drop
-			// the operator's override.
-			const effectiveLane = laneOverride ?? chosen.lane;
+			// lane additionally honors --lane (set above) and readyset.lane.default (a configured
+			// `fast`/`full` forces it; `auto` accepts code's clarity→lane recommendation recomputed
+			// fresh from the file's frontmatter). From here on, effectiveLane is the only lane
+			// value this run may act on — read b.lane directly and you silently drop the operator's
+			// override or the config default.
+			const claritySignal = readClaritySignal(parseFrontmatter(chosen.raw).meta);
+			const recommendation = recommendLane(claritySignal);
+			const configLane: Lane | undefined =
+				laneDefault === "fast" || laneDefault === "full"
+					? laneDefault
+					: laneDefault === "auto"
+						? recommendation.lane
+						: undefined;
+			const effectiveLane = laneOverride ?? configLane ?? chosen.lane;
 			if (laneOverride && laneOverride !== chosen.lane) {
 				ctx.ui.notify(
 					`Running "${chosen.changeId}" on the ${effectiveLane} lane (--lane override; the brainstorm records ${chosen.lane}). ` +
@@ -2625,16 +2708,29 @@ export default function (pi: ExtensionAPI) {
 							: "Full lane: the complete Grill → Explore → Propose → Review → Execute pipeline."),
 					"info",
 				);
+			} else if (laneDefault === "auto" && recommendation.lane !== chosen.lane) {
+				ctx.ui.notify(
+					`Auto lane: clarity ${recommendation.clarity}` +
+						`${recommendation.escalatedBy ? ` (risk flag: ${recommendation.escalatedBy})` : ""} recommends the ` +
+						`${recommendation.lane} lane; the brainstorm records ${chosen.lane}. Running ${effectiveLane}.`,
+					"warning",
+				);
 			}
 
 			// Lane context every `recordPhase` below reads. `--lane` is the operator's explicit,
-			// per-run answer to the lane question, so its source is "flag"; a lane the brainstorm
-			// itself recorded (default, frontmatter, branch, or a resolved default) arrives the
-			// same way, so its source is "brainstorm". These two values are the ONLY lane/source
-			// pair the run may act on -- see the effectiveLane comment above for why reading
-			// b.lane directly silently drops the override.
+			// per-run answer to the lane question, so its source is "flag"; a configured
+			// readyset.lane.default decides the lane, so its source is "config-auto"; under `ask`,
+			// a brainstorm that carries the new clarity signal came from grilling just asking the
+			// user, so its source is "user-pick"; an older/pre-existing file with no clarity signal
+			// falls back to "brainstorm" (today's meaning, unchanged).
 			const phaseLane: "fast" | "full" = effectiveLane;
-			const phaseLaneSource: "flag" | "brainstorm" = laneOverride ? "flag" : "brainstorm";
+			const phaseLaneSource: PhaseEvent["laneSource"] = laneOverride
+				? "flag"
+				: laneDefault === "auto" || laneDefault === "fast" || laneDefault === "full"
+					? "config-auto"
+					: chosen.clarity !== undefined
+						? "user-pick"
+						: "brainstorm";
 
 			if (chosen.status === "archived") {
 				ctx.ui.notify(`Change "${chosen.changeId}" is already archived. Start a new brainstorm for follow-up work.`, "warning");
@@ -2699,8 +2795,8 @@ export default function (pi: ExtensionAPI) {
 				phase: PhaseName,
 				edge: "start" | "end",
 				lane: "fast" | "full",
-				laneSource: "flag" | "brainstorm",
-				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"] } = {},
+				laneSource: PhaseEvent["laneSource"],
+				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"] } = {},
 			): Promise<void> => {
 				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
 			};
@@ -2779,6 +2875,14 @@ export default function (pi: ExtensionAPI) {
 				await recordPhase(chosen.changeId, "grill", "end", phaseLane, phaseLaneSource, {
 					model: phaseModelFor("grill"),
 					outcome: "grilled",
+					grill: {
+						clarity: recommendation.clarity,
+						openDecisions: claritySignal.openDecisions,
+						questionsAsked: chosen.questionsAsked,
+						recommendedLane: recommendation.lane,
+						laneReason: chosen.laneReason,
+						riskFlag: claritySignal.riskFlag,
+					},
 				});
 
 				// Fast lane folds Explore into Propose: no separate turn, no EXPLORATION.md turn.

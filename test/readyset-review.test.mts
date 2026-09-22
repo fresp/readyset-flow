@@ -6,15 +6,26 @@ import assert from "node:assert/strict";
 import { readPhaseEvents, changePaths, readContext } from "../src/lib/readyset-spec.ts";
 
 // This whole file exercises readyset-review.ts's handler, which reads omp config
-// (language/model/fallback chain) via readPreferredLanguage()/readPinnedModel()/
-// readFallbackChain() called with NO argument -- by design, that always resolves to the real
-// ~/.omp/agent/config.yml (see readyset-omp-config.ts's OMP_CONFIG_PATH comment), never a scratch
-// path. Point it at a path that's guaranteed not to exist instead, so every "no --lang/--model
-// flag" test here gets the same clean "nothing configured" starting point regardless of what's
+// (language/model/fallback chain/lane default) via readers called with NO argument -- by design,
+// that always resolves to the real ~/.omp/agent/config.yml (see readyset-omp-config.ts's
+// OMP_CONFIG_PATH comment), never a scratch path. Point it at a scratch path instead, so every
+// "no flag" test here gets the same clean "nothing configured" starting point regardless of what's
 // actually sitting in the real config.yml on whatever machine runs this suite. Must be set before
 // the first `import(".../readyset-review.ts?t=...")` below, since OMP_CONFIG_PATH is a top-level
-// const evaluated at module load.
-process.env.READYSET_TEST_CONFIG_PATH = join(tmpdir(), `readyset-test-omp-config-${Date.now()}-${Math.random()}`, "config.yml");
+// const evaluated at module load -- which also means the *path* is fixed once the config module
+// loads. Tests that need a real config value therefore write/remove this exact file (writeConfig/
+// clearConfig) rather than re-pointing the env var; when it's absent, every reader sees "unset".
+const TEST_CONFIG_PATH = join(
+  await mkdtemp(join(tmpdir(), "readyset-test-omp-config-")),
+  "config.yml",
+);
+process.env.READYSET_TEST_CONFIG_PATH = TEST_CONFIG_PATH;
+async function writeConfig(content: string) {
+  await writeFile(TEST_CONFIG_PATH, content, "utf8");
+}
+async function clearConfig() {
+  await rm(TEST_CONFIG_PATH, { force: true });
+}
 
 let pass = 0;
 let fail = 0;
@@ -1474,7 +1485,7 @@ await test("zero-rounds gate: does not fire once readyset_ask has actually been 
   await handler("--idea Some risky feature", ctx);
 
   // The model actually asked at least one real round this time.
-  await askExecute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, {
+  await askExecute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "A or B -- the plan differs in the call path" }] }, undefined, undefined, {
     ui: {}, // no askDialog -- falls back to plain text, but still counts as a round asked
   });
 
@@ -1511,7 +1522,7 @@ await test("readyset_ask: presents askDialog and returns the user's picks back t
 
   const result = await tool.execute(
     "call1",
-    { questions: [{ id: "q1", question: "Which approach?", options: [{ label: "A" }, { label: "B" }], recommendedIndex: 0 }] },
+    { questions: [{ id: "q1", question: "Which approach?", options: [{ label: "A" }, { label: "B" }], recommendedIndex: 0, decision: "A is sync, B is async -- the plan differs" }] },
     undefined,
     undefined,
     ctx,
@@ -1532,7 +1543,7 @@ await test("readyset_ask: a custom typed answer is reported back verbatim", asyn
     },
   };
 
-  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Name it?", options: [{ label: "X" }] }] }, undefined, undefined, ctx);
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Name it?", options: [{ label: "X" }], decision: "the name changes the public API surface" }] }, undefined, undefined, ctx);
   assert.match(result.content[0]?.text ?? "", /their own answer: "my own answer"/);
 });
 
@@ -1540,7 +1551,7 @@ await test("readyset_ask: kind 'chat' tells the model to continue the round in p
   const tool = await loadAskTool();
   const ctx = { ui: { askDialog: async () => ({ kind: "chat" }) } };
 
-  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, ctx);
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "A or B -- the plan differs" }] }, undefined, undefined, ctx);
   assert.match(result.content[0]?.text ?? "", /chose to discuss this round in plain chat/);
 });
 
@@ -1548,7 +1559,7 @@ await test("readyset_ask: dialog cancelled (undefined result) -> tells the model
   const tool = await loadAskTool();
   const ctx = { ui: { askDialog: async () => undefined } };
 
-  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, ctx);
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "A or B -- the plan differs" }] }, undefined, undefined, ctx);
   assert.match(result.content[0]?.text ?? "", /closed the picker without answering/);
 });
 
@@ -1556,7 +1567,7 @@ await test("readyset_ask: askDialog unavailable (non-interactive mode) -> falls 
   const tool = await loadAskTool();
   const ctx = { ui: {} }; // no askDialog on this ctx shape -- RPC/print/ACP modes
 
-  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] }, undefined, undefined, ctx);
+  const result = await tool.execute("call1", { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "A or B -- the plan differs" }] }, undefined, undefined, ctx);
   assert.match(result.content[0]?.text ?? "", /structured picker isn't available/);
 });
 
@@ -1571,7 +1582,7 @@ await test("readyset_ask: round cap is enforced in code -- stops opening the dia
       },
     },
   };
-  const oneQuestion = { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] };
+  const oneQuestion = { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "A or B -- the plan differs" }] };
 
   let cappedText: string | undefined;
   for (let i = 0; i < 20 && !cappedText; i++) {
@@ -1586,6 +1597,299 @@ await test("readyset_ask: round cap is enforced in code -- stops opening the dia
   // one more call past the cap must not open the dialog again
   await tool.execute("call", oneQuestion, undefined, undefined, ctx);
   assert.equal(askDialogCallCount, callsAtCap, "askDialog should not be called again once the cap is hit");
+});
+
+await test("readyset_ask: a question without `decision` is rejected and opens no dialog", async () => {
+  const tool = await loadAskTool();
+  let dialogCalls = 0;
+  const ctx = { ui: { askDialog: async () => { dialogCalls++; return { kind: "submit", results: [] }; } } };
+
+  const rejected = await tool.execute(
+    "c",
+    { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const text = rejected.content[0]?.text ?? "";
+  assert.match(text, /Rejected/);
+  assert.match(text, /`decision`/);
+  assert.match(text, /q1/, "the offending question id is named");
+  assert.equal(dialogCalls, 0, "a rejected round must not open the picker");
+});
+
+await test("readyset_ask: a blank `decision` is rejected too", async () => {
+  const tool = await loadAskTool();
+  let dialogCalls = 0;
+  const ctx = { ui: { askDialog: async () => { dialogCalls++; return { kind: "submit", results: [] }; } } };
+
+  const rejected = await tool.execute(
+    "c",
+    { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "   " }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(rejected.content[0]?.text ?? "", /Rejected/);
+  assert.equal(dialogCalls, 0);
+});
+
+await test("readyset_ask: a rejected round does not consume the round budget", async () => {
+  const tool = await loadAskTool();
+  let dialogCalls = 0;
+  const ctx = { ui: { askDialog: async () => { dialogCalls++; return { kind: "submit", results: [{ id: "q1", question: "Q?", options: ["A"], multi: false, selectedOptions: ["A"] }] }; } } };
+  const noDecision = { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }] }] };
+
+  // Reject many rounds with no decision -- none of these should count against the cap.
+  for (let i = 0; i < 10; i++) await tool.execute("c", noDecision, undefined, undefined, ctx);
+  assert.equal(dialogCalls, 0);
+
+  // A well-formed round still opens the dialog (the cap was not drained by the rejections).
+  const good = await tool.execute(
+    "c",
+    { questions: [{ id: "q1", question: "Q?", options: [{ label: "A" }, { label: "B" }], decision: "pick A or B -- A is synchronous" }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(dialogCalls, 1, "a well-formed round after rejections still opens the dialog");
+  assert.match(good.content[0]?.text ?? "", /Q\? -> A/);
+});
+
+await test("readyset_ask: a clean round with `decision` set still returns the user's picks", async () => {
+  const tool = await loadAskTool();
+  const askDialogCalls: unknown[] = [];
+  const ctx = {
+    ui: {
+      askDialog: async (questions: unknown) => {
+        askDialogCalls.push(questions);
+        return {
+          kind: "submit",
+          results: [{ id: "q1", question: "Which approach?", options: ["A", "B"], multi: false, selectedOptions: ["B"] }],
+        };
+      },
+    },
+  };
+
+  const result = await tool.execute(
+    "call1",
+    { questions: [{ id: "q1", question: "Which approach?", options: [{ label: "A" }, { label: "B" }], decision: "A is sync, B is async -- the plan differs in the call path" }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(askDialogCalls.length, 1);
+  assert.match(result.content[0]?.text ?? "", /Which approach\? -> B/);
+});
+
+// --- lane policy: prompt text (grilling) and handler precedence ------------------------------
+
+async function runProposedThroughGate(cwd: string, changeId: string, title: string, extraBrainstorm?: Record<string, string>, args = "") {
+  await writeBrainstorm(cwd, `2026-02-02-${changeId}.md`, {
+    title,
+    status: "proposed",
+    created: "2026-02-02",
+    change_id: changeId,
+    ...extraBrainstorm,
+  });
+  const dir = join(cwd, "readyset", "changes", changeId);
+  await mkdir(join(dir, "specs", "cap"), { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+  await writeFile(
+    join(dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push(`2026-02-02 · ${title}`); // pick
+  fakeUiWrap.selectQueue.push("Discard"); // gate: discard immediately, no turns fire
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler(args, ctx);
+  const events = await readPhaseEvents(cwd, changeId);
+  const gateEnd = events.find((e) => e.phase === "gate" && e.edge === "end");
+  assert.ok(gateEnd, "a gate end event exists");
+  return { gateEnd, fakeUiWrap };
+}
+
+await test("lane policy: default (ask) grilling prompt carries the VoI rule and the ask-the-user lane wording", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+  await clearConfig();
+  await handler("--idea Some idea", ctx);
+
+  const prompt = fakePiWrap.calls[0]?.prompt ?? "";
+  assert.match(prompt, /Ask only questions whose answer changes the plan/);
+  assert.match(prompt, /Then ask the user directly for the lane/);
+  assert.match(prompt, /clarity: clear\|partial\|ambiguous/);
+  assert.match(prompt, /## Assumed/);
+});
+
+await test("lane policy: readyset.lane.default auto tells grilling not to ask and to derive the lane", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+  await writeConfig("readyset:\n  lane:\n    default: auto\n");
+  try {
+    await handler("--idea Some idea", ctx);
+    const prompt = fakePiWrap.calls[0]?.prompt ?? "";
+    assert.match(prompt, /Do NOT ask the user for the lane/);
+    assert.match(prompt, /`clarity: clear` → `fast`/);
+    assert.doesNotMatch(prompt, /Then ask the user directly for the lane/);
+  } finally {
+    await clearConfig();
+  }
+});
+
+await test("handler lane precedence: readyset.lane.default auto uses code's recommendation + warns", async () => {
+  const cwd = await freshRepo();
+  await writeConfig("readyset:\n  lane:\n    default: auto\n");
+  try {
+    // openDecisions: 0 -> clear -> fast, but the file records full: auto accepts fast.
+    const { gateEnd, fakeUiWrap } = await runProposedThroughGate(cwd, "auto1", "Auto One", { lane: "full", openDecisions: "0" });
+    assert.equal(gateEnd.lane, "fast");
+    assert.equal(gateEnd.laneSource, "config-auto");
+    assert.ok(
+      fakeUiWrap.notifications.some((n) => /Auto lane: clarity clear/.test(n.message) && /recommends the fast lane/.test(n.message)),
+      "a warning names the recommendation",
+    );
+  } finally {
+    await clearConfig();
+  }
+});
+
+await test("handler lane precedence: readyset.lane.default full forces the lane over the file", async () => {
+  const cwd = await freshRepo();
+  await writeConfig("readyset:\n  lane:\n    default: full\n");
+  try {
+    // The file records fast, which the default picker filter would hide; --fast includes
+    // fast-lane brainstorms so the run can proceed and prove the configured `full` overrides it.
+    const { gateEnd } = await runProposedThroughGate(cwd, "force1", "Force One", { lane: "fast" }, "--fast");
+    assert.equal(gateEnd.lane, "full");
+    assert.equal(gateEnd.laneSource, "config-auto");
+  } finally {
+    await clearConfig();
+  }
+});
+
+await test("handler lane precedence: --lane beats readyset.lane.default (laneSource flag)", async () => {
+  const cwd = await freshRepo();
+  await writeConfig("readyset:\n  lane:\n    default: full\n");
+  try {
+    await writeBrainstorm(cwd, "2026-02-02-flag1.md", { title: "Flag One", status: "proposed", created: "2026-02-02", change_id: "flag1" });
+    const dir = join(cwd, "readyset", "changes", "flag1");
+    await mkdir(join(dir, "specs", "cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+    const fakePiWrap = makeFakePi(cwd);
+    const handler = await loadHandler(fakePiWrap.pi);
+    const fakeUiWrap = makeFakeUi();
+    fakeUiWrap.selectQueue.push("2026-02-02 · Flag One");
+    fakeUiWrap.selectQueue.push("Discard");
+    const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+    await handler("--lane fast", ctx);
+    const gateEnd = (await readPhaseEvents(cwd, "flag1")).find((e) => e.phase === "gate" && e.edge === "end");
+    assert.ok(gateEnd, "a gate end event exists");
+    assert.equal(gateEnd.lane, "fast");
+    assert.equal(gateEnd.laneSource, "flag");
+  } finally {
+    await clearConfig();
+  }
+});
+
+await test("handler lane source: ask + clarity signal -> user-pick; old file with none -> brainstorm", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+
+  const withClarity = await runProposedThroughGate(cwd, "pick1", "Pick One", { lane: "full", clarity: "partial" });
+  assert.equal(withClarity.gateEnd.laneSource, "user-pick");
+
+  const old = await runProposedThroughGate(cwd, "old1", "Old One", { lane: "full" });
+  assert.equal(old.gateEnd.laneSource, "brainstorm");
+});
+
+await test("old brainstorms with no new frontmatter keys still load and run", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  const { gateEnd } = await runProposedThroughGate(cwd, "legacy1", "Legacy One", { lane: "full" });
+  assert.equal(gateEnd.lane, "full");
+  assert.equal(gateEnd.laneSource, "brainstorm", "no clarity signal -> today's meaning, unchanged");
+});
+
+await test("the grill end phase event carries the clarity signal from the brainstorm", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  await writeBrainstorm(
+    cwd,
+    "2026-04-01-signal.md",
+    {
+      title: "Signal",
+      status: "open",
+      created: "2026-04-01",
+      change_id: "signal",
+      lane: "full",
+      clarity: "partial",
+      openDecisions: "1",
+      questionsAsked: "2",
+      laneReason: "narrow but migration-bound",
+      riskFlag: "migration",
+    },
+    VALID_BRAINSTORM_BODY,
+  );
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-01 · Signal"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Archive now");
+
+  const dir = join(cwd, "readyset", "changes", "signal");
+  // --lane fast skips Explore, so the first effect is the Propose turn.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(dir, "specs", "cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await writeFile(
+      join(dir, "specs", "cap", "spec.md"),
+      "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  const grillEnd = (await phaseEventsArchivedOrLive(cwd, "signal")).find((e) => e.phase === "grill" && e.edge === "end");
+  assert.ok(grillEnd, "a grill end event is written");
+  assert.ok(grillEnd!.grill, "the grill event carries the clarity signal payload");
+  assert.equal(grillEnd!.grill!.clarity, "partial");
+  assert.equal(grillEnd!.grill!.openDecisions, 1);
+  assert.equal(grillEnd!.grill!.questionsAsked, 2);
+  assert.equal(grillEnd!.grill!.recommendedLane, "full", "partial + migration risk flag escalates to full");
+  assert.equal(grillEnd!.grill!.riskFlag, "migration");
+  assert.equal(grillEnd!.grill!.laneReason, "narrow but migration-bound");
 });
 
 await test("Approve & Execute compacts first: ctx.compact() with internalGuidance + suppressContinuation before Apply", async () => {

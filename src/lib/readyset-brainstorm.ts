@@ -43,6 +43,14 @@ export interface BrainstormMeta {
 	laneSource: "frontmatter" | "branch" | "default";
 	changeId: string;
 	branch?: string;
+	/** Clarity signal + lane recommendation grilling wrote, all optional so an older brainstorm
+	 *  (written before these fields existed) loads exactly as it did before. */
+	clarity?: Clarity;
+	openDecisions?: number;
+	questionsAsked?: number;
+	laneReason?: string;
+	recommendedLane?: Lane;
+	riskFlag?: RiskFlag;
 }
 
 /** Minimal flat-YAML frontmatter parser — good enough for our known,
@@ -125,6 +133,71 @@ export function resolveLane(
 	return { lane: "full", laneSource: "default" };
 }
 
+/** The clarity score grilling writes to a brainstorm's frontmatter: how many plan decisions were
+ *  still genuinely open when the file was written. `clear` = 0, `partial` = 1-2, `ambiguous` =
+ *  3+. Defined here, next to `Lane`, because the recommendation rule below maps clarity → lane
+ *  and the rest of this package (readyset-spec.ts's phase events) needs the same three names. */
+export type Clarity = "clear" | "partial" | "ambiguous";
+
+/** Why a `partial` change is escalated to the full lane. Vocabulary is closed: code accepts only
+ *  these, anything else reads as absent (a model typo must not silently change the lane). */
+export const RISK_FLAGS = ["cross-cutting", "migration", "api-change", "security"] as const;
+export type RiskFlag = (typeof RISK_FLAGS)[number];
+
+export interface ClaritySignal {
+	/** Model-written `clarity` frontmatter, if it is one of the three known values. */
+	clarity?: Clarity;
+	/** Model-written `openDecisions` count, if a non-negative integer. */
+	openDecisions?: number;
+	/** Model-written `riskFlag`, if one of RISK_FLAGS. */
+	riskFlag?: RiskFlag;
+}
+
+/** Reads the clarity signal out of a brainstorm's frontmatter. Missing/None if unset or malformed
+ *  — an older brainstorm has none of these keys and must load exactly as before. */
+export function readClaritySignal(meta: Record<string, string>): ClaritySignal {
+	const clarity =
+		meta.clarity === "clear" || meta.clarity === "partial" || meta.clarity === "ambiguous" ? meta.clarity : undefined;
+	const n = Number(meta.openDecisions);
+	const openDecisions = meta.openDecisions !== undefined && Number.isInteger(n) && n >= 0 ? n : undefined;
+	const riskFlag = (RISK_FLAGS as readonly string[]).includes(meta.riskFlag ?? "") ? (meta.riskFlag as RiskFlag) : undefined;
+	return { clarity, openDecisions, riskFlag };
+}
+
+/** The clarity score derived from the open-decision count, per the benchmark's rule:
+ *  `clear` = 0, `partial` = 1-2, `ambiguous` = 3+. An undefined count is `ambiguous` (we cannot
+ *  claim clarity we did not measure). */
+export function deriveClarity(openDecisions: number | undefined): Clarity {
+	if (openDecisions === undefined) return "ambiguous";
+	if (openDecisions === 0) return "clear";
+	if (openDecisions <= 2) return "partial";
+	return "ambiguous";
+}
+
+export interface LaneRecommendation {
+	clarity: Clarity;
+	lane: Lane;
+	/** Set iff a risk flag escalated a `partial` decision to `fast`'s opposite (full). */
+	escalatedBy: RiskFlag | undefined;
+}
+
+/**
+ * The clarity → lane rule, in code so it is testable without an LLM (the model writes the
+ * *inputs*; this owns the mapping). `clear` → fast, `ambiguous` → full, `partial` → fast **unless
+ * a risk flag applies** (cross-cutting, migration/data-format, public API/deprecation,
+ * security/auth), in which case full — the benchmark's T11 case: a rename with a deprecation path
+ * lost 11 pt and looks narrow but is cross-cutting. `clarity` is derived from `openDecisions` when
+ * present, else taken from the model's `clarity` field, else `ambiguous`.
+ */
+export function recommendLane(signal: ClaritySignal): LaneRecommendation {
+	const clarity = signal.openDecisions !== undefined ? deriveClarity(signal.openDecisions) : (signal.clarity ?? "ambiguous");
+	if (clarity === "clear") return { clarity, lane: "fast", escalatedBy: undefined };
+	if (clarity === "ambiguous") return { clarity, lane: "full", escalatedBy: undefined };
+	// partial
+	if (signal.riskFlag) return { clarity, lane: "full", escalatedBy: signal.riskFlag };
+	return { clarity, lane: "fast", escalatedBy: undefined };
+}
+
 /** True once a brainstorm has a Readyset change, whichever spelling wrote it — this
  *  includes "approved" on purpose: reconcileStatuses uses !isProposed(...) to decide
  *  whether to bump status to "proposed", and an approved change must never be bumped
@@ -191,6 +264,12 @@ export async function loadBrainstorms(cwd: string): Promise<BrainstormMeta[]> {
 			created: meta.created,
 			namespace: meta.namespace,
 			...resolveLane(meta, branch?.type),
+			...readClaritySignal(meta),
+			...(meta.questionsAsked !== undefined && Number.isInteger(Number(meta.questionsAsked))
+				? { questionsAsked: Number(meta.questionsAsked) }
+				: {}),
+			...(meta.laneReason ? { laneReason: meta.laneReason } : {}),
+			recommendedLane: recommendLane(readClaritySignal(meta)).lane,
 			changeId: toChangeId(meta.change_id || meta.slug || file.replace(/\.md$/, "")),
 			branch: branch?.name,
 		});

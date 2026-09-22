@@ -19,6 +19,7 @@
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
+import type { Clarity, Lane, RiskFlag } from "./readyset-brainstorm.ts";
 
 export const READYSET_ROOT = "readyset";
 
@@ -299,7 +300,7 @@ export interface PhaseEvent {
 	edge: "start" | "end";
 	at: string;
 	lane: "fast" | "full";
-	laneSource: "flag" | "brainstorm";
+	laneSource: "flag" | "config-auto" | "user-pick" | "brainstorm";
 	model?: string;
 	outcome?: string;
 	/** `scope-reconcile` only: drift counts for the bench. */
@@ -310,6 +311,15 @@ export interface PhaseEvent {
 	boundary?: "explore" | "propose" | "apply";
 	/** `compact` only: context usage before/after when the host reported it. */
 	context?: { beforePercent?: number; afterPercent?: number };
+	/** `grill` `end` only: the grilling signal behind this run's lane. */
+	grill?: {
+		clarity: Clarity;
+		openDecisions?: number;
+		questionsAsked?: number;
+		recommendedLane: Lane;
+		laneReason?: string;
+		riskFlag?: RiskFlag;
+	};
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */

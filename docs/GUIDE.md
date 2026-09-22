@@ -160,6 +160,15 @@ mattpocock/skills-style interrogation — map the open decision branches, ask a 
 questions with a recommended answer each, never accept a passive "okay" on anything load-bearing,
 repeat until the design tree resolves.
 
+Grilling asks only questions whose answer changes the plan. Every `readyset_ask` question carries
+a `decision` field naming the plan decision it changes and how the plan differs per answer; a
+round with any question missing it is refused before the picker opens, and does not consume a
+round. A question whose answers would all lead to the same plan is not asked at all — the model
+decides it and records it under a **`## Assumed`** section of the brainstorm, so the assumption is
+reviewable rather than silently held. Grilling counts the *open decisions* (choices facts cannot
+settle that change scope, behavior, or interfaces) after one fact-finding pass and stops as soon
+as none remain, even in round 1 — the round cap is a ceiling, not a target.
+
 The driving prompt is adapted from mattpocock/skills' actual `grilling` skill, vendored verbatim
 (MIT-licensed) at `src/skill/mattpocock-grilling.md`. One of its rules — "finding facts is your
 job, never the user's" (see [Design philosophy](#design-philosophy)) — carries over close to
@@ -172,6 +181,13 @@ opening the dialog and the model checks in via plain text. Interactive-mode only
 modes, or an omp build without it, grilling falls back to a plain-chat back-and-forth, same rules.
 Either way it ends once the model writes the brainstorm file and tells you to run `/readyset`
 again to pick it up.
+
+Alongside `lane`, grilling writes the clarity signal into the frontmatter: `clarity`
+(`clear` = 0 open decisions after fact-finding, `partial` = 1–2, `ambiguous` = 3+ or an undefined
+core behavior), `openDecisions`, `questionsAsked`, a one-line `laneReason`, and — only when it
+genuinely applies — `riskFlag` (`cross-cutting`, `migration`, `api-change`, `security`). Code
+validates these and recomputes a recommended lane from them (see [The lane](#the-lane)); an older
+brainstorm without them loads and runs exactly as before.
 
 ### Grilling from outside omp
 
@@ -281,11 +297,35 @@ real run input — not just a label on the brainstorm picker.
   a few targeted reads, noted inline in `CONTEXT.md`), Propose carries a tight-planning suffix
   (roughly 8 tasks, no padding), and the code-review turn skips mutation-testing-style probes.
 
-Grilling proposes a lane with a one-line reason and you confirm or override it; that decision is
-recorded on the brainstorm. `--lane fast|full` forces the lane for the run — the flag wins over the
-recorded lane, and the picker shows the effective lane so an override is visible before anything
-runs. `--fast` is only a picker filter (it decides which brainstorms are *listed*) — it never forces
-a lane; only `--lane` does.
+The lane follows the grilling signal. Grilling writes a clarity score onto the brainstorm
+(`clear` = 0 open decisions after fact-finding, `partial` = 1–2, `ambiguous` = 3+ or an undefined
+core behavior), and code maps it to a recommended lane: `clear` → fast, `ambiguous` → full,
+`partial` → **fast unless a risk flag applies**, in which case full. The risk flags are
+`cross-cutting`, `migration` (data/format), `api-change` (public API/deprecation), and `security`
+(auth). A narrow-looking rename with a deprecation path is exactly the case the risk flag exists
+for: it reads small but is cross-cutting, so `partial` escalates to full.
+
+By default (`readyset.lane.default: ask`) grilling proposes a lane with a one-line reason and you
+confirm or override it; that pick is recorded on the brainstorm. `readyset.lane.default` decides
+otherwise:
+
+```yaml
+readyset:
+  lane:
+    default: auto   # ask | auto | fast | full
+```
+
+- `ask` (default) — ask the user during grilling, as above.
+- `auto` — accept code's clarity → lane recommendation without prompting; if it differs from the
+  lane the file records, the run warns and uses the recommendation.
+- `fast` / `full` — force that lane.
+
+Precedence is `--lane` > `readyset.lane.default` > the brainstorm's recorded lane, so `--lane
+fast|full` still forces the lane for one run (`--fast` is only a picker filter — it decides which
+brainstorms are *listed*, and never forces a lane). The picker shows the clarity score and the
+recommendation when they disagree, and the effective lane so an override is visible before
+anything runs. `readyset.lane.default` is hand-edited YAML — the `configure` wizard covers only
+language, model, and fallback chain.
 
 The lane trims **volume**, never the questions that change behavior: grilling still asks everything
 whose answer would change what gets built on either lane.

@@ -374,3 +374,40 @@ export async function readPreferredLanguage(configPath: string = OMP_CONFIG_PATH
 
 	return { language: undefined, source: undefined };
 }
+
+/** How `readyset.lane.default` decides the lane question grilling otherwise asks by hand:
+ *  `ask` = ask the user (today's behavior), `auto` = accept code's clarity→lane recommendation
+ *  without prompting, `fast`/`full` = force that lane. */
+export type LaneDefault = "ask" | "auto" | "fast" | "full";
+export const DEFAULT_LANE_DEFAULT: LaneDefault = "ask";
+
+/** Parses `readyset.lane.default` — one of `ask|auto|fast|full` (case-insensitive). Any other
+ *  value is ignored (returns undefined) so the caller can warn and fall back to `ask`, the same
+ *  way an unknown `--lane` is ignored rather than silently defaulted. */
+export function parseLaneDefault(raw: string): LaneDefault | undefined {
+	const value = getPath(parseYamlSubset(raw), "readyset.lane.default");
+	if (typeof value !== "string") return undefined;
+	const v = value.trim().toLowerCase();
+	return v === "ask" || v === "auto" || v === "fast" || v === "full" ? v : undefined;
+}
+
+export interface ResolvedLaneDefault { laneDefault: LaneDefault; warning: string | undefined }
+
+/** Reads `readyset.lane.default` (or `configPath`, for tests). Never throws — a missing/unreadable
+ *  file means `ask` (today's behavior: the user picks the lane during grilling). A present but
+ *  invalid value means `ask` plus a warning the caller surfaces once. */
+export async function readLaneDefault(configPath: string = OMP_CONFIG_PATH): Promise<ResolvedLaneDefault> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { laneDefault: DEFAULT_LANE_DEFAULT, warning: undefined };
+	const parsed = parseLaneDefault(raw);
+	if (parsed === undefined) {
+		const present = getPath(parseYamlSubset(raw), "readyset.lane.default");
+		if (present === undefined) return { laneDefault: DEFAULT_LANE_DEFAULT, warning: undefined };
+		const text = typeof present === "string" ? present.trim() : String(present);
+		return {
+			laneDefault: DEFAULT_LANE_DEFAULT,
+			warning: `readyset.lane.default ("${text}") isn't one of ask, auto, fast, full — using the default (ask).`,
+		};
+	}
+	return { laneDefault: parsed, warning: undefined };
+}

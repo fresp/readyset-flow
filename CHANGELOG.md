@@ -6,6 +6,44 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## Unreleased
+
+Makes grilling ask only questions whose answer changes the plan, and makes the lane follow the
+signal grilling produces instead of always being asked by hand. Each change states a mechanism;
+the only measured figures cited are the existing v0.12 motivation numbers.
+
+### Added
+
+- **Value-of-information questioning in grilling.** Every `readyset_ask` question now carries a
+  required `decision` field naming the plan decision it changes and how the plan differs per
+  answer. A round containing any question without a non-blank `decision` is refused before the
+  picker opens — and does not consume the round cap — with a result telling the model to decide
+  that question itself and record it under a new `## Assumed` section of the brainstorm instead.
+  The grilling prompt adds the same rule, plus "stop as soon as no open decisions remain, even in
+  round 1" and a count of open decisions after the fact-finding pass. A question whose answers all
+  lead to the same plan is an assumption, not a question: it is written to `## Assumed` so it is
+  reviewable rather than silently held.
+- **A clarity score on the brainstorm, and a clarity → lane rule.** Grilling now writes `clarity`
+  (`clear` = 0 open decisions after fact-finding, `partial` = 1–2, `ambiguous` = 3+ or an undefined
+  core behavior), `openDecisions`, `questionsAsked`, and — only when it applies — `riskFlag`
+  (`cross-cutting|migration|api-change|security`), plus a one-line `laneReason`, into the
+  brainstorm frontmatter. Code validates those fields (an unknown value reads as absent, so a
+  typo cannot silently change the lane) and recomputes a recommended lane: `clear` → fast,
+  `ambiguous` → full, `partial` → fast unless a risk flag escalates it to full. The picker shows
+  the clarity score and the recommendation when the two disagree.
+- **`readyset.lane.default: ask | auto | fast | full`** (default `ask`) in
+  `~/.omp/agent/config.yml`. `ask` keeps today's behavior (grilling asks the user for the lane
+  and the pick is recorded); `auto` accepts code's clarity → lane recommendation without
+  prompting and warns when it overrides the file's recorded lane; `fast`/`full` force that lane.
+  Precedence is `--lane` > `readyset.lane.default` > the brainstorm's recorded lane. The value is
+  hand-edited YAML (the `configure` wizard does not cover it).
+- **The `grill` phase event carries the signal.** The `grill` `end` event in `CONTEXT.md` now
+  includes a `grill` payload (`clarity`, `openDecisions`, `questionsAsked`, `recommendedLane`,
+  `laneReason`, `riskFlag`), and `PhaseEvent.laneSource` widens to
+  `flag | config-auto | user-pick | brainstorm` so the offline bench can tell an operator-forced
+  lane, a config-decided lane, a lane the user picked during grilling, and a pre-existing
+  brainstorm's own recorded lane apart.
+
 ## 0.13.0
 
 A quality-and-cost pass driven by the `v0.12` full-matrix benchmark (12 tasks × 3 reps × 2 arms).

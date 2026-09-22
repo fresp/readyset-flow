@@ -8,6 +8,11 @@ import {
 	loadBrainstorms,
 	reconcileStatuses,
 	validateBrainstormContent,
+	readClaritySignal,
+	deriveClarity,
+	recommendLane,
+	parseFrontmatter,
+	setFrontmatterFields,
 } from "../src/lib/readyset-brainstorm.ts";
 
 let pass = 0;
@@ -163,6 +168,89 @@ await test("a full-lane brainstorm is still reconciled (unchanged behavior)", as
 	await reconcileStatuses(cwd, items);
 	assert.equal(items.find((b) => b.changeId === "full-thing")?.status, "proposed");
 });
+
+// --- clarity signal + lane recommendation --------------------------------------------
+
+await test("deriveClarity: 0 -> clear, 1-2 -> partial, 3+ -> ambiguous, undefined -> ambiguous", () => {
+	assert.equal(deriveClarity(0), "clear");
+	assert.equal(deriveClarity(1), "partial");
+	assert.equal(deriveClarity(2), "partial");
+	assert.equal(deriveClarity(3), "ambiguous");
+	assert.equal(deriveClarity(undefined), "ambiguous");
+});
+
+await test("recommendLane: the clarity -> lane rule with risk-flag escalation", () => {
+	assert.equal(recommendLane({ openDecisions: 0 }).lane, "fast");
+	assert.equal(recommendLane({ openDecisions: 3 }).lane, "full");
+	assert.equal(recommendLane({ openDecisions: 1 }).lane, "fast");
+	const escalated = recommendLane({ openDecisions: 1, riskFlag: "cross-cutting" });
+	assert.equal(escalated.lane, "full");
+	assert.equal(escalated.escalatedBy, "cross-cutting");
+	assert.equal(recommendLane({ clarity: "partial" }).lane, "fast");
+	assert.equal(recommendLane({ clarity: "ambiguous" }).lane, "full");
+	assert.equal(recommendLane({}).lane, "full", "unknown clarity reads as ambiguous -> full");
+});
+
+await test("recommendLane: openDecisions wins over the model's clarity field when both are present", () => {
+	// model claimed clear but counted 3 open decisions -> the count is what code trusts.
+	const rec = recommendLane({ clarity: "clear", openDecisions: 3 });
+	assert.equal(rec.clarity, "ambiguous");
+	assert.equal(rec.lane, "full");
+});
+
+await test("readClaritySignal: reads valid keys, rejects unknown/malformed values", () => {
+	const good = readClaritySignal({ clarity: "partial", openDecisions: "1", riskFlag: "migration" });
+	assert.deepEqual(good, { clarity: "partial", openDecisions: 1, riskFlag: "migration" });
+
+	const bad = readClaritySignal({ clarity: "sorta", openDecisions: "abc", riskFlag: "nonsense" });
+	assert.deepEqual(bad, { clarity: undefined, openDecisions: undefined, riskFlag: undefined });
+
+	const negative = readClaritySignal({ openDecisions: "-1" });
+	assert.equal(negative.openDecisions, undefined);
+
+	assert.deepEqual(readClaritySignal({}), { clarity: undefined, openDecisions: undefined, riskFlag: undefined });
+});
+
+await test("setFrontmatterFields -> parseFrontmatter round-trips the new fields", () => {
+	const raw = "---\ntitle: T\nstatus: open\n---\n\nbody\n";
+	const next = setFrontmatterFields(raw, { clarity: "partial", openDecisions: "1" });
+	const { meta } = parseFrontmatter(next);
+	assert.equal(meta.clarity, "partial");
+	assert.equal(meta.openDecisions, "1");
+});
+
+await test("loadBrainstorms: new clarity fields populate; a file without them leaves them undefined", async () => {
+	const cwd = await scratchRepo();
+	const dir = join(cwd, BRAINSTORM_DIR);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(
+		join(dir, "2026-10-01-with-clarity.md"),
+		"---\ntitle: T\nslug: with-clarity\nstatus: open\nlane: full\nchange_id:\ncreated: 2026-10-01\n" +
+			"clarity: partial\nopenDecisions: 1\nquestionsAsked: 2\nlaneReason: \"narrow but risky\"\nriskFlag: migration\n---\n\nbody\n",
+		"utf8",
+	);
+	writeFileSync(
+		join(dir, "2026-10-02-old.md"),
+		"---\ntitle: O\nslug: old\nstatus: open\nlane: full\nchange_id:\ncreated: 2026-10-02\n---\n\nbody\n",
+		"utf8",
+	);
+
+	const items = await loadBrainstorms(cwd);
+	const withClarity = items.find((b) => b.changeId === "with-clarity");
+	assert.equal(withClarity?.clarity, "partial");
+	assert.equal(withClarity?.openDecisions, 1);
+	assert.equal(withClarity?.questionsAsked, 2);
+	assert.equal(withClarity?.laneReason, "narrow but risky");
+	assert.equal(withClarity?.riskFlag, "migration");
+	// partial + migration risk flag escalates to full.
+	assert.equal(withClarity?.recommendedLane, "full");
+
+	const old = items.find((b) => b.changeId === "old");
+	assert.equal(old?.clarity, undefined, "an old brainstorm has no clarity signal");
+	assert.equal(old?.openDecisions, undefined);
+	assert.equal(old?.recommendedLane, "full", "no signal -> ambiguous -> full");
+});
+
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

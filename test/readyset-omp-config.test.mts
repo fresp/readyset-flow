@@ -12,9 +12,11 @@ import {
 	parseOmpDefaultModel,
 	parsePhaseModels,
 	parseYamlSubset,
+	parseLaneDefault,
 	readCompactMinContextPercent,
 	readFallbackChain,
 	readFallbackModel,
+	readLaneDefault,
 	readPhaseModels,
 	readPinnedModel,
 	readPreferredLanguage,
@@ -383,6 +385,42 @@ await test("readCompactMinContextPercent: an invalid stored value yields the def
   await writeFile(configPath, "readyset:\n  compact:\n    minContextPercent: nope\n", "utf8");
   const parsed = await readCompactMinContextPercent(configPath);
   assert.equal(parsed.percent, DEFAULT_COMPACT_MIN_CONTEXT_PERCENT);
+  assert.ok(parsed.warning && parsed.warning.length > 0);
+});
+
+await test("parseLaneDefault: absent key -> undefined", () => {
+  assert.equal(parseLaneDefault("readyset:\n  language: Indonesian\n"), undefined);
+});
+
+await test("parseLaneDefault: each of ask|auto|fast|full (and uppercase) parses", () => {
+  for (const value of ["ask", "auto", "fast", "full"]) {
+    assert.equal(parseLaneDefault(`readyset:\n  lane:\n    default: ${value}\n`), value);
+  }
+  assert.equal(parseLaneDefault("readyset:\n  lane:\n    default: AUTO\n"), "auto");
+});
+
+await test("parseLaneDefault: an unknown value -> undefined (caller warns and falls back)", () => {
+  assert.equal(parseLaneDefault("readyset:\n  lane:\n    default: sometimes\n"), undefined);
+});
+
+await test("readLaneDefault: missing file -> ask, no warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  assert.deepEqual(await readLaneDefault(join(dir, "does-not-exist.yml")), { laneDefault: "ask", warning: undefined });
+});
+
+await test("readLaneDefault: a valid value is read", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  lane:\n    default: auto\n", "utf8");
+  assert.deepEqual(await readLaneDefault(configPath), { laneDefault: "auto", warning: undefined });
+});
+
+await test("readLaneDefault: a present but invalid value -> ask plus a warning", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
+  const configPath = join(dir, "config.yml");
+  await writeFile(configPath, "readyset:\n  lane:\n    default: sometimes\n", "utf8");
+  const parsed = await readLaneDefault(configPath);
+  assert.equal(parsed.laneDefault, "ask");
   assert.ok(parsed.warning && parsed.warning.length > 0);
 });
 
