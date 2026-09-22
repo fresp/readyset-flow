@@ -26,6 +26,10 @@ import {
   readBlockingFindings,
   docMentions,
   findMissingRequestedDocs,
+  findDocFileWarnings,
+  brainstormRequestText,
+  brainstormDecisionText,
+  docRequests,
   parseContractLine,
   checkScope,
   checkScopeRefs,
@@ -1348,6 +1352,158 @@ await test("docMentions/findMissingRequestedDocs: a CHANGELOG mention absent fro
   assert.deepEqual(
     await findMissingRequestedDocs(cwd, "requested-docs", "Please update CHANGELOG.", "No request text."),
     [],
+  );
+});
+
+await test("docRequests: action-verb gating with negation veto", async () => {
+  assert.deepEqual(docRequests("Please add a CHANGELOG entry under Unreleased."), ["changelog"]);
+  assert.deepEqual(docRequests("Update the README and docs/getting-started.md."), ["docs/", "readme"]);
+  assert.deepEqual(docRequests("don't touch the README"), []);
+  assert.deepEqual(docRequests("Do not update the CHANGELOG."), []);
+  assert.deepEqual(docRequests("README says rounding is half-up"), []);
+  assert.deepEqual(docRequests("We never document in docs/"), []);
+});
+
+await test("brainstormRequestText/brainstormDecisionText: only the request and decision sections", async () => {
+  const raw = [
+    "---",
+    "lane: full",
+    "---",
+    "## Problem / Context",
+    "",
+    "The rounding mode is wrong.",
+    "",
+    "## Scope",
+    "",
+    "- in scope: the formatter",
+    "",
+    "## Acceptance Criteria",
+    "",
+    "- WHEN x THEN y",
+    "",
+    "## Decision",
+    "",
+    "- Chosen option: A",
+    "",
+    "## Technical Constraints & Notes from Repo",
+    "",
+    "- README says rounding is half-up",
+    "",
+  ].join("\n");
+  assert.equal(brainstormRequestText(raw), "The rounding mode is wrong.");
+  const decision = brainstormDecisionText(raw);
+  assert.ok(decision.includes("the formatter"));
+  assert.ok(decision.includes("WHEN x THEN y"));
+  assert.ok(decision.includes("Chosen option: A"));
+  assert.ok(!decision.includes("half-up"), "a Notes section is never decision-bearing");
+});
+
+await test("findMissingRequestedDocs: a cited-but-unrequested doc in a Notes section yields no repair item", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "scoped-docs");
+  await writeFile(
+    paths.proposal,
+    ["## Why", "", "x", "", "## Files This Change Will Touch", "", "- src/thing.ts"].join("\n"),
+    "utf8",
+  );
+  const brainstorm = [
+    "---",
+    "lane: full",
+    "---",
+    "## Problem / Context",
+    "",
+    "Fix the rounding.",
+    "",
+    "## Technical Constraints & Notes from Repo",
+    "",
+    "- README says rounding is half-up",
+    "",
+  ].join("\n");
+  assert.deepEqual(
+    await findMissingRequestedDocs(cwd, "scoped-docs", brainstormRequestText(brainstorm), brainstorm),
+    [],
+    "a Notes citation never forces a doc into the contract",
+  );
+
+  // A decision-bearing request DOES produce a repair item.
+  const requested = `${brainstorm}\n\n## Scope\n\n- Add a CHANGELOG entry under Unreleased.\n`;
+  assert.deepEqual(
+    await findMissingRequestedDocs(cwd, "scoped-docs", brainstormRequestText(requested), requested),
+    ["changelog"],
+  );
+});
+
+await test("findDocFileWarnings: deprecation advisory only, never a repair item", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "doc-warnings");
+  await writeFile(
+    paths.proposal,
+    ["## Why", "", "x", "", "## Files This Change Will Touch", "", "- src/thing.ts"].join("\n"),
+    "utf8",
+  );
+  const brainstorm = "## Problem / Context\n\nFix the rounding.\n\n## Scope\n\n- Follow the deprecation path in the code.\n";
+  assert.deepEqual(
+    await findMissingRequestedDocs(cwd, "doc-warnings", brainstormRequestText(brainstorm), brainstorm),
+    [],
+    "a deprecation mention is never a repair item",
+  );
+  assert.deepEqual(await findDocFileWarnings(cwd, "doc-warnings", brainstormRequestText(brainstorm), brainstorm), [
+    "requested deprecation has no matching contract entry or existing file — warning only, not a repair item",
+  ]);
+
+  // A matching on-disk file silences the advisory.
+  await writeFile(join(cwd, "DEPRECATIONS.md"), "# Deprecations\n", "utf8");
+  assert.deepEqual(await findDocFileWarnings(cwd, "doc-warnings", brainstormRequestText(brainstorm), brainstorm), []);
+
+  // No contract section at all -> [].
+  await writeFile(paths.proposal, "## Why\n\nx\n", "utf8");
+  assert.deepEqual(await findDocFileWarnings(cwd, "doc-warnings", "Follow the deprecation path.", "No request text."), []);
+});
+
+await test("readOpenDecisions: bullet decisions parse with inline and indented Recommended", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "bullet-dec");
+  await writeFile(
+    paths.proposal,
+    [
+      "## Why",
+      "",
+      "x",
+      "",
+      "## Open Decisions",
+      "",
+      "- Which store? Recommended: sqlite, simpler for one process",
+      "- Which port?",
+      "  - Recommended: 8080, matches the existing default",
+      "- none",
+      "",
+      "## Assumptions",
+      "",
+      "- default timeout — 30s",
+    ].join("\n"),
+    "utf8",
+  );
+  const decisions = await readOpenDecisions(cwd, "bullet-dec");
+  assert.equal(decisions.length, 2, "the 'none' bullet is skipped");
+  assert.equal(decisions[0].question, "Which store?");
+  assert.equal(decisions[0].recommended, "sqlite, simpler for one process");
+  assert.equal(decisions[1].question, "Which port?");
+  assert.equal(decisions[1].recommended, "8080, matches the existing default");
+});
+
+await test("validateChange: prose-only non-none Open Decisions yields the no-parsable-decisions warning", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "od-prose");
+  await writeFile(
+    paths.proposal,
+    "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n\n## Open Decisions\n\nWe still have not decided which store to use.\n",
+    "utf8",
+  );
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  const result = await validateChange(cwd, "od-prose");
+  assert.ok(
+    result.issues.some((i) => i.file === "proposal.md" && i.problem === "open decisions section has content but no parsable decisions"),
+    "prose-only Open Decisions is warned about verbatim",
   );
 });
 

@@ -3571,6 +3571,10 @@ await test("F2: blocking findings fire exactly one fix turn", async () => {
 
   const fixCalls = fakePiWrap.calls.filter((c) => /Fix ONLY these|smallest change that addresses/.test(c.prompt));
   assert.equal(fixCalls.length, 1, "exactly one fix turn fired");
+  const fixPrompt = fixCalls[0].prompt;
+  assert.match(fixPrompt, /scripts, or benchmarks/, "the fix prompt keeps the doc/scripts/benchmarks rule");
+  assert.equal((fixPrompt.match(/never modify seed data/gi) ?? []).length, 1, "the seed-data rule appears exactly once");
+  assert.ok(!/`scripts/.test(fixPrompt), "no stray backtick before scripts");
   const events = await readPhaseEvents(cwd, "f2a");
   assert.ok(events.some((e) => e.phase === "review-fix" && e.edge === "start"), "a review-fix start event exists");
   const fixEnd = events.find((e) => e.phase === "review-fix" && e.edge === "end");
@@ -3736,7 +3740,10 @@ await test("F5: a doc mention missing from the contract is shown in the gate and
     cwd,
     "2026-06-02-f5docs.md",
     { title: "F5 Docs", status: "proposed", created: "2026-06-02", change_id: "f5docs" },
-    `${VALID_BRAINSTORM_BODY}\n\nPlease update CHANGELOG.md to document this behavior change.\n`,
+    `${VALID_BRAINSTORM_BODY.replace(
+      "## Scope\n- In scope: the thing itself\n- Out of scope: unrelated things\n",
+      "## Scope\n- In scope: the thing itself\n- Out of scope: unrelated things\n- Please update CHANGELOG.md to document this behavior change.\n- Follow the deprecation path in the code.\n",
+    )}`,
   );
   const dir = await writeProposedChange(cwd, "f5docs", ["- src/keep.ts"]);
   await mkdir(join(cwd, "src"), { recursive: true });
@@ -3769,10 +3776,15 @@ await test("F5: a doc mention missing from the contract is shown in the gate and
     fakeUiWrap.editorTextHistory.join("\n\n").includes("requested doc missing from contract: changelog"),
     "the review document Scope section names the requested doc",
   );
+  assert.ok(
+    panel.some((line) => /requested deprecation has no matching contract entry or existing file — warning only, not a repair item/.test(line)),
+    "the gate panel shows the deprecation advisory",
+  );
   const repair = fakePiWrap.calls.find((call) => /scope contract in proposal\.md is wrong/.test(call.prompt));
   assert.ok(repair, "a contract-repair turn fired");
   assert.match(repair.prompt, /requested doc missing from contract: changelog/);
   assert.match(repair.prompt, /marked \(new\) if the file does not exist yet/);
+  assert.ok(!/deprecation/i.test(repair.prompt), "the repair prompt never mentions the advisory-only deprecation");
 
   const proposal = await readFile(join(dir, "proposal.md"), "utf8");
   assert.match(proposal, /- CHANGELOG\.md \(new\)/, "the repaired contract lists the requested doc as (new)");

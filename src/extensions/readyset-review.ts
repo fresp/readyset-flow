@@ -29,6 +29,8 @@ import {
 	checkTaskVerification,
 	ensureDirtyBaseline,
 	ensureReadysetRoot,
+	brainstormRequestText,
+	findDocFileWarnings,
 	findMissingRequestedDocs,
 	findSpecFiles,
 	getProgress,
@@ -176,8 +178,8 @@ const PROPOSAL_GUIDE_BULLET = `- proposal.md — must have a "## Why" section (1
   arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
   the change actually needs — nothing speculative. A file not on this list may not
   be written during Apply without asking first. Every doc the request or brainstorm asks for
-  (README, CHANGELOG, docs/…, migration notes, deprecation notes) must be in this contract —
-  list it, marking a new file "(new)".
+  (README, CHANGELOG, docs/…) must be in this contract — list it, marking a new file "(new)".
+  Migration/release-note/deprecation mentions join the contract only when they match an existing file.
   Also add a \`## Open Decisions\` section (one \`### question\` block as specified in the prompt
   above, or the single line "none") and a \`## Assumptions\` section (one \`- <assumed decision> —
   <chosen behavior>\` line per brainstorm \`## Assumed\` item, or "none").`;
@@ -591,7 +593,7 @@ function codeReviewTurnPrompt(
 		"\n\nFlag as blocking any doc the request, brainstorm or contract calls for that was not actually written or updated." +
 		"\n\nEnd REVIEW.md with a `## Blocking` section: one bullet per finding that violates (a) a WHEN/THEN " +
 		"scenario, (b) an explicit requirement from the brainstorm or proposal.md — including any doc the " +
-		"request or brainstorm asked for (README/CHANGELOG/docs/migration/deprecation notes) or a doc file the " +
+		"request or brainstorm asked for (README/CHANGELOG/docs) or a doc file the " +
 		"contract lists that was not actually written — or (c) a recorded decision (an `## Assumptions`/`## Open " +
 		"Decisions` entry, or a `## Decisions made during Apply` entry). Write exactly \"none\" when there are none. " +
 		"Every other remark goes in the sections above, never in `## Blocking`."
@@ -605,7 +607,7 @@ function reviewFixTurnPrompt(changeId: string, blocking: string[]): string {
 	return (
 		`The code review of Readyset change "${changeId}" found ${blocking.length} blocking finding(s). Fix ONLY these: make the smallest change that addresses each, and nothing else.\n\n` +
 		blocking.map((b, i) => `${i + 1}. ${b}`).join("\n") +
-		"\n\nRules: touch ONLY files in proposal.md's `## Files This Change Will Touch` contract or this run's own changed files; do NOT refactor, rename, reformat or add unrequested code, tests, docs, `scripts, or benchmarks; never modify seed data/fixtures, never add runtime self-checks to production code, and never change an existing test's expectations unless the requested behavior changes them. Never modify seed data, fixtures or sample data in production paths, and never add runtime assertions/self-checks to production code. After fixing, re-run the tests that cover the affected behavior and update the matching `_Verified:` notes in tasks.md. Then append a `## Fix turn` section to " + paths.review + " with one bullet per finding above: `- <finding> — fixed: <what changed> (<command run, result>)` or `- <finding> — not fixed: <why>`. Remove a finding from `## Blocking` only when it is actually fixed; leave the ones you could not fix in `## Blocking` (rewrite the bullet to name why). Do not start new work."
+		"\n\nRules: touch ONLY files in proposal.md's `## Files This Change Will Touch` contract or this run's own changed files; do NOT refactor, rename, reformat or add unrequested code, tests, docs, scripts, or benchmarks; never modify seed data, fixtures or sample data in production paths, and never add runtime assertions/self-checks to production code, and never change an existing test's expectations unless the requested behavior changes them. After fixing, re-run the tests that cover the affected behavior and update the matching `_Verified:` notes in tasks.md. Then append a `## Fix turn` section to " + paths.review + " with one bullet per finding above: `- <finding> — fixed: <what changed> (<command run, result>)` or `- <finding> — not fixed: <why>`. Remove a finding from `## Blocking` only when it is actually fixed; leave the ones you could not fix in `## Blocking` (rewrite the bullet to name why). Do not start new work."
 	);
 }
 
@@ -1337,7 +1339,7 @@ async function runContractRepair(
 	changeId: string,
 	phaseModels: Map<string, { model: string; source: string }>,
 	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string }) => Promise<void>,
-	brainstormText = "",
+	brainstormRaw = "",
 ): Promise<Awaited<ReturnType<typeof checkScopeRefs>>> {
 	const applied = await hasBeenApplied(ctx.cwd, changeId);
 	const appliedRefs = applied ? { afterApply: true as const } : {};
@@ -1345,7 +1347,7 @@ async function runContractRepair(
 	const before = applied ? { ...beforeRaw, newButExists: [] } : beforeRaw;
 	// Doc mentions that the request/brainstorm asked for but the contract omits are folded into the
 	// same one-shot repair turn, so a requested doc can never be silently dropped at planning time.
-	const missingDocs = await findMissingRequestedDocs(ctx.cwd, changeId, brainstormText, brainstormText);
+	const missingDocs = await findMissingRequestedDocs(ctx.cwd, changeId, brainstormRequestText(brainstormRaw), brainstormRaw);
 	const problems = [
 		...scopeRefProblems(before),
 		...missingDocs.map((d) => `requested doc missing from contract: ${d} (add it to \`## Files This Change Will Touch\`, marked (new) if the file does not exist yet)`),
@@ -1773,6 +1775,8 @@ interface ReviewSnapshot {
 	assumedScenarios: string[];
 	/** Doc mentions (from `chosen.raw`) that the contract does not name. */
 	missingDocs: string[];
+	/** Advisory warnings for migration/release/deprecation docs with no contract or on-disk match. */
+	missingDocWarnings: string[];
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -1799,7 +1803,8 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 	const openDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
 	const assumptions = await readAssumptions(ctx.cwd, chosen.changeId);
 	const assumedScenarios = await readAssumedScenarios(ctx.cwd, chosen.changeId);
-	const missingDocs = await findMissingRequestedDocs(ctx.cwd, chosen.changeId, chosen.raw, chosen.raw);
+	const missingDocs = await findMissingRequestedDocs(ctx.cwd, chosen.changeId, brainstormRequestText(chosen.raw), chosen.raw);
+	const missingDocWarnings = await findDocFileWarnings(ctx.cwd, chosen.changeId, brainstormRequestText(chosen.raw), chosen.raw);
 	return {
 		counted: progress ? { done: progress.done, total: progress.total } : undefined,
 		validated,
@@ -1815,6 +1820,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		assumptions,
 		assumedScenarios,
 		missingDocs,
+		missingDocWarnings,
 	};
 }
 
@@ -1924,6 +1930,7 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 					...(snapshot.missingDocs.length > 0
 						? snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`)
 						: []),
+					...snapshot.missingDocWarnings,
 				].join("\n");
 			},
 		},
@@ -2201,6 +2208,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 				]
 			: snapshot.assumedScenarios.length > 0 ? snapshot.assumedScenarios.map((scenario) => `assumed scenario: ${scenario}`) : []),
 		...snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`),
+		...snapshot.missingDocWarnings,
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,

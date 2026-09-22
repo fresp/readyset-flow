@@ -50,10 +50,13 @@ by phase events, so the benchmark can tune them from real data.
 - **`readyset.review.testPaths`** (default `test/**`, `tests/**`, `**/*.test.*`, `**/*.spec.*`,
   `__tests__/**`) and test-aware **`diff-size`** evaluation. Matched test-only paths are excluded
   from the trigger’s non-test file count; a large test suite alone is not a reason to review.
-- **Requested-doc contract repair.** The request/brainstorm text is scanned for README, CHANGELOG,
-  docs, release-note, migration-guide, and deprecation mentions, and any mentioned doc missing
-  from `## Files This Change Will Touch` is shown in the gate and added to the same one-shot
-  contract-repair turn, marked `(new)` when the file does not yet exist.
+- **Requested-doc contract repair.** The request and the brainstorm's decision-bearing sections
+  are scanned for README, CHANGELOG, and docs mentions, and any requested doc missing from
+  `## Files This Change Will Touch` is shown in the gate and added to the same one-shot
+  contract-repair turn, marked `(new)` when the file does not yet exist. A mention counts only
+  when its sentence carries an action verb (and no negation), so a doc merely cited as context is
+  never forced into the contract. Migration/release-note/deprecation mentions are advisory only —
+  warned, never repaired.
 - **A `review` field on the `review` `end` phase event** carrying the resolved mode, every
   trigger evaluated (name, fired, observed value), the fired trigger names, and the outcome
   (`ran` / `skipped-no-trigger` / `skipped-flag` / `on-demand`). The existing string `outcome`
@@ -126,6 +129,18 @@ by phase events, so the benchmark can tune them from real data.
   trigger is now satisfied by a command-bearing `_Verified:` note as well as by a runtime
   evidence record, and the glob matcher treats `**/` as zero-or-more directories at any position
   and matches case-insensitively (which also affects `sensitivePaths`).
+
+### Fixed
+
+- **Doc-repair false positives, bullet open decisions, and the fix-turn prompt.** Requested-doc
+  repair now scans only the request text (`## Problem / Context`) and the brainstorm's
+  decision-bearing sections (`Scope`, `Acceptance Criteria`, `Decision`), and a doc counts only
+  when its sentence carries an action verb without a negation — so a README merely cited as
+  context is no longer forced into the scope contract, and migration/release-note/deprecation
+  mentions are advisory only. `readOpenDecisions` now parses top-level `- <question>` bullets
+  (inline or indented `Recommended:`), and `validateChange` warns when an `## Open Decisions`
+  section has content but no parsable decision. The review-fix prompt's duplicated seed/self-check
+  sentence and stray backtick are gone.
 
 ## 0.14.0
 

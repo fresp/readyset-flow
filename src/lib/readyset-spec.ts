@@ -16,6 +16,7 @@
  * reason documented there).
  */
 
+import type { Dirent } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
@@ -664,10 +665,12 @@ export interface OpenDecision {
 	raw: string;
 }
 
-/** Parses proposal.md's `## Open Decisions` section: one `### <question>` block per decision,
- *  each optionally carrying a `- Recommended: ...` line. Returns [] when the section is absent or
- *  empty, or when its only content is "none" — an older change (or a proposal that wrote no
- *  section) reads exactly as it did before. */
+/** Parses proposal.md's `## Open Decisions` section. Two formats are accepted: one
+ *  `### <question>` block per decision, each optionally carrying a `- Recommended: ...` line, or
+ *  top-level `- <question>` bullets (inline `Recommended: <option>` on the same line, or on the
+ *  lines that follow). Returns [] when the section is absent or empty, or when its only content
+ *  is "none" — an older change (or a proposal that wrote no section) reads exactly as it did
+ *  before. */
 export async function readOpenDecisions(cwd: string, changeId: string): Promise<OpenDecision[]> {
 	const raw = await readFile(changePaths(cwd, changeId).proposal, "utf8").catch(() => undefined);
 	if (raw === undefined) return [];
@@ -683,6 +686,31 @@ export async function readOpenDecisions(cwd: string, changeId: string): Promise<
 		if (question === "") continue;
 		const recommended = rest.match(/^[-*][ \t]*Recommended[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
 		decisions.push({ question, recommended, raw: rest });
+	}
+	// Bullet format: blank the headed spans, then read top-level bullets from the remainder.
+	const remainder = body.replace(/^###[ \t]+.*(?:\r?\n(?!(?:###|##)[ \t]).*)*/gm, "");
+	const lines = remainder.split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		const bullet = lines[i].match(/^[-*][ \t]+(.+)$/);
+		if (!bullet) continue;
+		const text = bullet[1].trim();
+		if (text === "" || /^none\b/i.test(text) || /\*\*WHEN\*\*/i.test(text)) continue;
+		const inline = text.match(/\bRecommended\s*:\s*(.+)$/i);
+		if (inline) {
+			const question = text.slice(0, inline.index ?? text.length).replace(/[—–-]\s*$/, "").trim();
+			if (question === "") continue;
+			decisions.push({ question, recommended: inline[1].trim(), raw: text });
+			continue;
+		}
+		const restLines: string[] = [];
+		for (let j = i + 1; j < lines.length; j++) {
+			const next = lines[j];
+			if (/^[-*][ \t]/.test(next) || /^#{1,6}[ \t]/.test(next)) break;
+			restLines.push(next);
+		}
+		const rest = restLines.join("\n").trim();
+		const recommended = rest.match(/^[ \t]*[-*][ \t]*Recommended[ \t]*:[ \t]*(.+)$/im)?.[1]?.trim();
+		decisions.push({ question: text, recommended, raw: rest });
 	}
 	return decisions;
 }
@@ -746,11 +774,57 @@ export function docMentions(text: string): string[] {
 	return [...found].sort();
 }
 
-/** Doc mentions (docMentions) that are NOT named anywhere in proposal.md's
+/** The original request text a brainstorm carries: the body of its `## Problem / Context`
+ *  section. No raw request is persisted anywhere, so this is the closest on-disk stand-in —
+ *  a brainstorm without that section contributes nothing. */
+export function brainstormRequestText(raw: string): string {
+	return level2Body(parseFrontmatter(raw).body, "Problem / Context");
+}
+
+/** The decision-bearing sections of a brainstorm — `Scope`, `Acceptance Criteria`, and
+ *  `Decision` bodies joined with blank lines. Notes/constraints/context sections are
+ *  deliberately excluded: a doc cited there is context, not a request. */
+export function brainstormDecisionText(raw: string): string {
+	const body = parseFrontmatter(raw).body;
+	return ["Scope", "Acceptance Criteria", "Decision"]
+		.map((heading) => level2Body(body, heading))
+		.filter((text) => text !== "")
+		.join("\n\n");
+}
+
+/** Doc paths a request/decision text actually *asks for*, as opposed to merely mentions. A
+ *  concrete doc token (README/CHANGELOG/docs//documentation) counts only when its own sentence
+ *  window carries an action verb and no negation — so "README says rounding is half-up" and
+ *  "don't touch the README" both yield nothing. Returns only the repair set: "readme",
+ *  "changelog", "docs/". Migration/release/deprecation mentions are advisory only (see
+ *  `findDocFileWarnings`), never repair items. */
+export function docRequests(text: string): string[] {
+	const found = new Set<string>();
+	const re = /\b(README(?:\.md)?|CHANGELOG(?:\.md)?|docs?\/|documentation)\b/gi;
+	for (const match of text.matchAll(re)) {
+		const raw = match[0].toLowerCase();
+		const name = raw.startsWith("readme")
+			? "readme"
+			: raw.startsWith("changelog")
+				? "changelog"
+				: "docs/";
+		const before = text.slice(0, match.index ?? 0);
+		const sentenceStart = Math.max(before.lastIndexOf("."), before.lastIndexOf("!"), before.lastIndexOf("?"), before.lastIndexOf("\n"));
+		const window = before.slice(sentenceStart + 1).slice(-160);
+		if (/\b(?:add|update|document|write|mention|record|include|revise|change|modify|create|reflect|capture|describe)\b/i.test(window) &&
+			!/\b(?:don't|do not|doesn't|does not|never|no need|without|not|n't|skip|avoid|leave|untouched)\b/i.test(window)) {
+			found.add(name);
+		}
+	}
+	return [...found].sort();
+}
+
+/** Doc requests (docRequests) that are NOT named anywhere in proposal.md's
  *  `## Files This Change Will Touch` contract. Each is reported as
- *  `requested doc missing from contract: <name>`. */
-export async function findMissingRequestedDocs(cwd: string, changeId: string, requestText: string, brainstormText: string): Promise<string[]> {
-	const mentions = [...new Set([...docMentions(requestText), ...docMentions(brainstormText)])];
+ *  `requested doc missing from contract: <name>`. Only README/CHANGELOG/docs/ can be repair
+ *  items — migration/release/deprecation mentions are advisory (`findDocFileWarnings`). */
+export async function findMissingRequestedDocs(cwd: string, changeId: string, requestText: string, brainstormRaw: string): Promise<string[]> {
+	const mentions = [...new Set([...docRequests(requestText), ...docRequests(brainstormDecisionText(brainstormRaw))])];
 	if (mentions.length === 0) return [];
 	const contract = await readScopeContract(cwd, changeId);
 	if (contract.files === undefined) return [];
@@ -763,6 +837,54 @@ export async function findMissingRequestedDocs(cwd: string, changeId: string, re
 		});
 	};
 	return mentions.filter((m) => !named(m)).map((m) => m);
+}
+
+/** Advisory warnings for migration/release/deprecation docs a request or decision text mentions
+ *  with no matching contract entry or on-disk file. One string per kind; never a repair item.
+ *  Returns [] when the contract section is absent. */
+export async function findDocFileWarnings(cwd: string, changeId: string, requestText: string, brainstormRaw: string): Promise<string[]> {
+	const text = `${requestText}\n\n${brainstormDecisionText(brainstormRaw)}`;
+	const contract = await readScopeContract(cwd, changeId);
+	if (contract.files === undefined) return [];
+	const entries = [...contract.files, ...contract.newFiles, ...contract.deleteFiles].map((p) => p.toLowerCase());
+	const kinds = [
+		{ kind: "migration guide", mention: /migrat\w*/i, file: /migrat/i },
+		{ kind: "release notes", mention: /release notes?/i, file: /release[-_ ]?notes?/i },
+		{ kind: "deprecation", mention: /deprecat\w*/i, file: /deprecat/i },
+	];
+	const warnings: string[] = [];
+	for (const { kind, mention, file } of kinds) {
+		if (!mention.test(text)) continue;
+		const inContract = entries.some((e) => file.test(e));
+		const onDisk = inContract ? true : await hasMatchingFile(cwd, file);
+		if (inContract || onDisk) continue;
+		warnings.push(`requested ${kind} has no matching contract entry or existing file — warning only, not a repair item`);
+	}
+	return warnings;
+}
+
+/** Recursively checks whether any file's basename under `cwd` matches `pattern`. Skips the
+ *  directories that are never doc homes (node_modules, .git, readyset, .ai). */
+async function hasMatchingFile(cwd: string, pattern: RegExp): Promise<boolean> {
+	const skip = new Set(["node_modules", ".git", "readyset", ".ai"]);
+	async function walk(dir: string): Promise<boolean> {
+		let entries: Dirent[];
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return false;
+		}
+		for (const entry of entries) {
+			if (entry.isDirectory()) {
+				if (skip.has(entry.name)) continue;
+				if (await walk(join(dir, entry.name))) return true;
+			} else if (pattern.test(entry.name)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	return walk(cwd);
 }
 
 export interface ScopeCheck {
@@ -1131,9 +1253,16 @@ export async function validateChange(cwd: string, changeId: string, lane?: Chang
 	// `## Open Decisions` must name a recommended option, or the user is approving a plan whose
 	// behavior is still undecided. Warning-only (a `ValidationIssue`), consistent with the rest.
 	if (proposalRaw !== undefined) {
-		for (const d of await readOpenDecisions(cwd, changeId)) {
+		const decisions = await readOpenDecisions(cwd, changeId);
+		for (const d of decisions) {
 			if (d.recommended === undefined || d.recommended === "") {
 				issues.push({ file: "proposal.md", problem: `open decision "${d.question}" has no recommended option` });
+			}
+		}
+		if (decisions.length === 0) {
+			const openBody = level2Body(proposalRaw, "Open Decisions").trim();
+			if (openBody !== "" && !/^none\b/i.test(openBody)) {
+				issues.push({ file: "proposal.md", problem: "open decisions section has content but no parsable decisions" });
 			}
 		}
 		issues.push(...internalTermIssues("proposal.md", proposalRaw));
