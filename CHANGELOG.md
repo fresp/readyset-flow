@@ -6,11 +6,14 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
-## Unreleased
+## 0.14.0
 
-Makes grilling ask only questions whose answer changes the plan, and makes the lane follow the
-signal grilling produces instead of always being asked by hand. Each change states a mechanism;
-the only measured figures cited are the existing v0.12 motivation numbers.
+A scope-and-size pass on top of 0.13.0, still driven by the `v0.12` full-matrix benchmark. It
+tightens the one dimension Readyset was still losing — scope discipline — at the before-Apply and
+after-Apply ends, keeps grilling to the questions that actually change the plan, makes the lane
+follow grilling's own signal, compacts prep phases conditionally, and makes the fast lane write a
+genuinely smaller artifact set with per-artifact budgets. Each change states a mechanism; the only
+measured figures cited are the existing v0.12 motivation numbers.
 
 ### Added
 
@@ -43,6 +46,81 @@ the only measured figures cited are the existing v0.12 motivation numbers.
   `flag | config-auto | user-pick | brainstorm` so the offline bench can tell an operator-forced
   lane, a config-decided lane, a lane the user picked during grilling, and a pre-existing
   brainstorm's own recorded lane apart.
+- **Every run records its effective lane and phase boundaries in `CONTEXT.md`.** `--fast` only
+  filters the picker; `--lane fast|full` is what forces the lane, and nothing recorded which lane a
+  run used. Each phase boundary (grill, explore, propose, refine, gate, apply, review, archive) is
+  now written as its own `<!-- readyset-phase -->` marker plus a one-line `json` fence, recording
+  the phase, a `start`/`end` edge, an ISO timestamp, the effective lane and its source
+  (`flag`/`config-auto`/`user-pick`/`brainstorm`), and where relevant the phase model and an
+  outcome. Phases that exit early still write their `end` via `try/finally`, and the fence is
+  scoped per entry so later braces (e.g. raw Refine feedback) can't corrupt earlier events.
+- **A wrong scope contract is repaired once, automatically, before the gate.** A
+  `## Files This Change Will Touch` path that doesn't exist and isn't marked `(new)` is flagged
+  (`scope refs: DANGLING …`), and after Propose (and after every Refine) Readyset fires at most one
+  repair turn that rewrites only that section, re-checks the planning boundary, then re-checks the
+  contract. The check also gained two cases it was missing — `(new)` on a file that already exists,
+  and `(delete)` on a file that doesn't (`(delete)` is a new marker). Remaining problems still only
+  warn; it never blocks.
+- **Per-artifact character budgets, with a bounded Trim turn.**
+  `readyset.artifacts.budget.<proposal|design|specs|tasks>` in `~/.omp/agent/config.yml` overrides a
+  lane's default (full: proposal 4,000 / design 5,000 / specs 6,000 total / tasks 4,000; fast:
+  proposal 4,000 / tasks 3,000). The Propose prompt states the budgets and the no-restating rules,
+  the gate panel shows an `artifacts: N chars (budget M)` line per artifact, and an overrun only
+  warns — except a file past **1.5×** its budget, which fires at most one planning-only Trim turn
+  (skipped when the turn budget is too tight) recorded as a `trim` phase event with before/after
+  sizes.
+- **`readyset.compact.minContextPercent` and `--compact auto|always|never`.** A phase-boundary
+  compaction now runs only when the host reports context usage at or above this share of the window
+  (default 25), so a fresh session skips it; `--compact always` restores the unconditional behavior
+  and `--compact never` suppresses every boundary. The summarization also runs under the phase's own
+  configured model where one is set.
+
+### Changed
+
+- **Apply is accountable to the scope contract.** Readyset's diffs ran **246 vs 107** lines, **5.6
+  vs 4.4** code files, and **0.72 vs 0.39** files outside expected scope against `/plan` on the
+  v0.12 matrix, and the post-Apply check only warned. Apply now gets explicit minimal-diff rules; a
+  file changed outside the contract with no justification is reconciled **once** after Execute
+  (revert it, or record it under `## Scope deviations` in `tasks.md`); the code-review turn judges
+  each deviation. Whatever remains still only warns, and phase events carry the drift counts and the
+  final diff size for the bench.
+- **The fast lane writes a genuinely smaller artifact set: `proposal.md` + `tasks.md` only.** The
+  v0.12 benchmark showed Readyset's planning output at 44,700 chars vs 10,031 for native `/plan`
+  (longer on all 12 tasks), much of it proposal/design/specs/tasks restating each other. The fast
+  lane now skips `design.md` and the spec delta; its acceptance scenarios move to a `## Acceptance`
+  section in `proposal.md` (each `- **WHEN** … **THEN** …` bullet with a `[S1]`, `[S2]`, … id that
+  `tasks.md` references). The lane is recorded on disk as a `lane:` line in `proposal.md`'s
+  frontmatter, so `validateChange`, `archiveChange`, the review overlay, and the standalone
+  `readyset-flow validate` CLI all agree with no run context.
+- **Prep phases compact at their own boundaries, conditionally.** Compaction also fires after
+  grilling, before **Explore**, and after Explore, before **Propose**, not just before Execute.
+  Everything each phase relies on is already on disk, so this is **expected** to cut prep-phase
+  token cost — pending the next benchmark. It only fires when context usage is at or above the
+  threshold (or when `--compact always` forces it), and each boundary records a `compact` phase
+  event so the effect is measurable next time.
+
+### Fixed
+
+- **Turns are reserved for Apply and Review.** Contract repair now fires only while 2 turns remain
+  and scope reconciliation only while 1 does, so a nearly-spent run no longer burns its last turn
+  and ends with no `REVIEW.md`.
+- **Post-Apply contract semantics.** Once Apply has run, `checkScopeRefs` reads with post-Apply
+  semantics and the repair turn never fires (it would strip correct `(new)`/`(delete)` markers),
+  fixing false `NEW-BUT-EXISTS` / `DELETE-BUT-MISSING` when the gate reopens after "Address
+  findings first" or a Refine after Apply.
+- **Every gate start has a matching end.** A keep-context approval records a skipped compact
+  boundary plus the gate end, and both the approve and legacy compact paths record outcome
+  `approve`.
+- **Diff stats see staged changes** (`git diff HEAD --numstat`, falling back to plain `git diff`
+  when there is no HEAD), so a fully staged Apply counts.
+- **Directory contract entries resolve.** `exists()` now stats a path (a directory isn't "missing"),
+  and a contract entry ending in `/` or naming an existing directory matches anything under it.
+- **Scope contracts no longer drop non-JS paths.** The parser only accepted a hard-coded directory
+  or JS/MD/YAML extension whitelist and only stripped commentary after ` -- `, so `app/handler.go`,
+  `packages/core/index.ts`, `.github/workflows/ci.yml`, and `Makefile` never entered the contract.
+  The path is now the first token and the rest is commentary, whatever the separator.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.13.0...0.14.0
 
 ## 0.13.0
 
