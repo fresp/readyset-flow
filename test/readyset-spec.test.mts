@@ -1397,5 +1397,58 @@ await test("validateChange still passes on an older change with no (assumed) mar
   assert.equal((await validateChange(cwd, "assumed-legacy")).ok, true);
 });
 
+await test("validateChange: a body mention of an internal term is flagged; the same text under `## Grounding` is not", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "internal-terms");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  await mkdir(join(paths.dir, "specs", "cap"), { recursive: true });
+  await writeFile(
+    join(paths.dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: ordinary behavior\n\n- **WHEN** something happens\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(
+    paths.proposal,
+    "## Why\n\nSee readyset/changes/foo for background.\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n",
+    "utf8",
+  );
+  const flagged = await validateChange(cwd, "internal-terms");
+  assert.ok(
+    flagged.issues.some((issue) => issue.file === "proposal.md" && /Readyset-internal term "readyset\/changes"/.test(issue.problem)),
+    "a workflow path in the proposal body is flagged",
+  );
+
+  await writeFile(
+    paths.proposal,
+    "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n\n## Grounding\n\nSee readyset/changes/foo for background.\n",
+    "utf8",
+  );
+  assert.ok(
+    !(await validateChange(cwd, "internal-terms")).issues.some((issue) => /Readyset-internal term/.test(issue.problem)),
+    "the same anchor under `## Grounding` is not flagged",
+  );
+});
+
+await test("validateChange: 'lane' matches as a word, not a substring", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "internal-lane");
+  await writeFile(paths.tasks, "- [ ] 1.1 x\n", "utf8");
+  await mkdir(join(paths.dir, "specs", "cap"), { recursive: true });
+  await writeFile(
+    join(paths.dir, "specs", "cap", "spec.md"),
+    "## Purpose\n\nx\n\n## ADDED Requirements\n\n### Requirement: Foo\n\n#### Scenario: ordinary behavior\n\n- **WHEN** something happens\n- **THEN** the command exits 0\n",
+    "utf8",
+  );
+  await writeFile(
+    paths.proposal,
+    "## Why\n\nWe considered airplanes and planed wood, but the plain route won.\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/a.ts (new)\n",
+    "utf8",
+  );
+  assert.ok(
+    !(await validateChange(cwd, "internal-lane")).issues.some((issue) => /Readyset-internal term/.test(issue.problem)),
+    "`planes` does not trip the `lane` word check",
+  );
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

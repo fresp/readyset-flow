@@ -68,6 +68,10 @@ Prose is a request; a gate is a requirement.
   — exit code, stdout/stderr, timeout — nothing more. `exitCode: 0` means the command ran clean,
   never that the requirement is satisfied; that judgment stays the code-review turn's. It never
   marks a task done or touches `_Verified:`.
+- **Implementer-facing artifacts describe the user's change, not Readyset.** Planning bodies stay
+  about the repo and request; exploration-entry or `verified during planning` anchors go in a
+  trailing `## Grounding` section. Workflow vocabulary outside that section is flagged
+  warning-only, never blocking.
 - **Smallest useful primitive, not the cleanest architecture.** Evidence Capture could have
   shipped with structured findings, a state machine, a `ReadysetChange` domain object — all
   deferred. What shipped is one tool, observable, with tests, so the next iteration is informed by

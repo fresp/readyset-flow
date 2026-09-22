@@ -86,6 +86,10 @@ scenarios under a `## Acceptance` section in `proposal.md` instead (each bullet
 `- **WHEN** … **THEN** …`, with a `[S1]`, `[S2]`, … id in document order that `tasks.md` references
 rather than restating).
 
+Each implementer-facing artifact ends with a trailing `## Grounding` section for exploration-entry
+or `verified during planning` anchors. Artifact bodies never mention Readyset's own workflow;
+workflow terms outside `## Grounding` are flagged warning-only.
+
 **`EXPLORATION.md`** — a findings log. One entry per thing checked: what was checked (exact
 file path / command / commit), what was found (the actual value/output). No fixed section
 headers required, but every entry needs a checked-vs-found pair — a claim with no "here's what

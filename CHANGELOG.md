@@ -85,9 +85,16 @@ by phase events, so the benchmark can tune them from real data.
   `readAssumedScenarios` parses them, and the gate lists each before approval. A task that pins one
   carries `(assumed)` in its description, and a test that pins one says so in its name or an
   adjacent comment.
+- **Implementer-facing artifact checks.** `validateChange` now flags (warning-only, never blocking)
+  Readyset-internal workflow terms in proposal/design/tasks/spec bodies, while a trailing
+  `## Grounding` section may carry exploration-entry or `verified during planning` anchors without
+  tripping that check.
 
 ### Changed
 
+- **Removed the grill prompt's package-path pointer.** `grillTurnPrompt` no longer names
+  `src/skill/mattpocock-grilling.md`; it states the fact-finding rule directly. That prompt was the
+  one model-facing place naming a Readyset package path; neither tool description names one.
 - **The code-review prompt is diff-first.** It now names the run's changed paths up front and
   instructs the turn to start from their diff, reading `proposal.md`, `design.md`,
   `specs/**/spec.md`, and `tasks.md` for the scenarios and any *other* file only when the diff

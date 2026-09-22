@@ -241,7 +241,12 @@ function artifactGuide(lane: ChangeLane, budgets: ArtifactBudgets): string {
 		"  `## Acceptance` section) instead of restating their WHEN/THEN text.\n" +
 		"- No prose summary of proposal.md" +
 		(lane === "fast" ? "" : ", design.md, or specs/") +
-		" inside any other artifact."
+		" inside any other artifact.\n\n" +
+		"Write about the user's repo and request only. Never mention Readyset's own workflow (lanes, the " +
+		"review gate, phase names, `readyset/changes/…` paths, spec deltas, this extension or its source), " +
+		"and never a benchmark or task-definition file. Grounding anchors — exploration entry numbers or a " +
+		`"verified during planning" note — go in a trailing \`## Grounding\` section at the end of each ` +
+		"artifact, so the body stays about the change; the compiled review document still shows them."
 	);
 }
 
@@ -326,6 +331,7 @@ function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets
 		"checked format Explore used), so the next person reading EXPLORATION.md sees the complete grounding trail, not " +
 		"just what the Explore turn happened to cover; (3) anchor every repo claim in proposal.md/design.md to a " +
 		"numbered exploration entry or a 'verified during planning' note — file:line, helper name, test name — " +
+		"under a trailing `## Grounding` section in that artifact rather than inline, " +
 		"so a reviewer can check each claim without re-reading the repo. An unanchored claim about the repo is " +
 		"indistinguishable from a guess, and the benchmark measured such plans as no better grounded than a " +
 		"single read-only pass.\n\n" +
@@ -728,8 +734,7 @@ function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefau
 			"making 17 bash + 16 read calls spread across rounds for what one upfront pass covers — every " +
 			"repeated lookup re-pays the same context cost. Don't ask the user something the repo already " +
 			"answers.\n" +
-			"- Finding facts is your job, never the user's (mattpocock/skills' own rule for this — see " +
-			"src/skill/mattpocock-grilling.md in this package). A question about external platform behavior, API " +
+			"- Finding facts is your job, never the user's. A question about external platform behavior, API " +
 			"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
 			"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
 			"real thing. Reserve open questions for what only the user can decide or knows.\n" +

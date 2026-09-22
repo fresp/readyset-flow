@@ -988,6 +988,38 @@ function sectionBody(raw: string, heading: string): string {
 	return (boundary && boundary.index !== undefined ? rest.slice(0, boundary.index) : rest).trim();
 }
 
+/** Readyset-internal vocabulary that must not appear in an artifact's body — the implementer-facing
+ *  plan is about the user's repo, not about Readyset's own workflow. Small, closed list. */
+const INTERNAL_TERMS = ["readyset/changes", "EXPLORATION.md", "CONTEXT.md", "lane", "review gate", "spec delta", "readyset-review", "expectedTouch"];
+
+/** Body text of `raw` with its trailing `## Grounding` section removed, so a legitimate grounding
+ *  anchor does not trip the check. A leading YAML frontmatter block is also removed: proposal.md's
+ *  required `lane:` line is metadata, not artifact prose, and must not itself trip the `lane` term. */
+function bodyWithoutGrounding(raw: string): string {
+	const withoutFrontmatter = raw.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "");
+	const idx = withoutFrontmatter.search(/^##[ \t]*Grounding[ \t]*$/im);
+	return idx === -1 ? withoutFrontmatter : withoutFrontmatter.slice(0, idx);
+}
+
+/** A case-insensitive matcher for one internal term. `lane` needs word boundaries so ordinary
+ *  prose like `planes` does not trip it; the other terms are matched as literal substrings. */
+function internalTermPattern(term: string): RegExp {
+	if (term === "lane") return /\blane\b/i;
+	return new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+}
+
+/** Advisory: one issue per internal term found in a body outside `## Grounding`. */
+function internalTermIssues(file: string, raw: string): ValidationIssue[] {
+	const body = bodyWithoutGrounding(raw);
+	const issues: ValidationIssue[] = [];
+	for (const term of INTERNAL_TERMS) {
+		if (internalTermPattern(term).test(body)) {
+			issues.push({ file, problem: `body mentions Readyset-internal term "${term}" outside a ## Grounding section` });
+		}
+	}
+	return issues;
+}
+
 /**
  * Structural validation — not a real schema check (see file header), but scoped per
  * requirement rather than per file (see `splitRequirementBlocks`). The required set depends on
@@ -1066,6 +1098,7 @@ export async function validateChange(cwd: string, changeId: string, lane?: Chang
 		} else {
 			for (const specFile of specFiles) {
 				const raw = await readFile(specFile, "utf8").catch(() => "");
+				issues.push(...internalTermIssues(specFile, raw));
 
 				if (!/^##[ \t]*(ADDED|MODIFIED|REMOVED)[ \t]+Requirements\b/im.test(raw)) {
 					issues.push({ file: specFile, problem: "no '## ADDED/MODIFIED/REMOVED Requirements' section found" });
@@ -1103,13 +1136,19 @@ export async function validateChange(cwd: string, changeId: string, lane?: Chang
 				issues.push({ file: "proposal.md", problem: `open decision "${d.question}" has no recommended option` });
 			}
 		}
+		issues.push(...internalTermIssues("proposal.md", proposalRaw));
 	}
 
 	const tasksRaw = (await readFile(paths.tasks, "utf8").catch(() => undefined)) as string | undefined;
+	const designRaw = await readFile(paths.design, "utf8").catch(() => undefined);
+	if (designRaw !== undefined) issues.push(...internalTermIssues("design.md", designRaw));
 	if (tasksRaw === undefined) {
 		issues.push({ file: "tasks.md", problem: "missing" });
-	} else if (!/^\s*-\s*\[[ xX]\]/m.test(tasksRaw)) {
-		issues.push({ file: "tasks.md", problem: "no checkbox items found" });
+	} else {
+		if (!/^\s*-\s*\[[ xX]\]/m.test(tasksRaw)) {
+			issues.push({ file: "tasks.md", problem: "no checkbox items found" });
+		}
+		issues.push(...internalTermIssues("tasks.md", tasksRaw));
 	}
 
 	const ok = issues.length === 0;

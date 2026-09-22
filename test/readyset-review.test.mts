@@ -1292,6 +1292,7 @@ await test("--idea skips the picker entirely and fires a grill turn as the first
   // looking it up. See src/skill/mattpocock-grilling.md for the vendored source rule.
   assert.match(fakePiWrap.calls[0].prompt, /[Ff]inding facts is your job, never the user's/);
   assert.match(fakePiWrap.calls[0].prompt, /web search tool/);
+  assert.doesNotMatch(fakePiWrap.calls[0].prompt, /src\/skill\/mattpocock-grilling\.md/);
 });
 
 await test("F6: the grill prompt contains the edge-case checklist and the ask-only-if-it-changes-the-plan rule", async () => {
@@ -4391,6 +4392,41 @@ async function writeFastLaneChange(cwd: string, changeId: string, title: string,
   await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
   return dir;
 }
+
+await test("F7: ARTIFACT_GUIDE contains the workflow-internals rule", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  await writeBrainstorm(
+    cwd,
+    "2026-06-20-f7guide.md",
+    { title: "F7 Guide", status: "open", created: "2026-06-20", change_id: "f7guide", lane: "full" },
+    VALID_BRAINSTORM_BODY,
+  );
+  const dir = join(cwd, "readyset", "changes", "f7guide");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-06-20 · F7 Guide");
+  fakeUiWrap.selectQueue.push("Discard");
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "proposal.md"),
+      FAST_LANE_PROPOSAL("## Acceptance\n\n- **WHEN** a sorted list is requested **THEN** the command exits 0\n"),
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast", ctx);
+
+  const propose = fakePiWrap.calls.find((call) => /Create a Readyset change named "f7guide"/.test(call.prompt));
+  assert.ok(propose, "a Propose turn fired");
+  assert.match(propose.prompt, /Never mention Readyset's own workflow/);
+  assert.match(propose.prompt, /## Grounding/);
+});
 
 await test("fast lane: the review document shows the Artifact set section, not design/specs placeholders", async () => {
   const cwd = await freshRepo();
