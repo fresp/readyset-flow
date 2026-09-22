@@ -153,6 +153,14 @@ by phase events, so the benchmark can tune them from real data.
   section has content but no parsable decision. The review-fix prompt's duplicated seed/self-check
   sentence and stray backtick are gone.
 
+- **Outside-repo tripwire false positives.** The tripwire no longer counts `grep`'s `pattern` (a
+  regex, never a path), `/dev/*`, or a redirection target like `> /dev/null`, and for bash it
+  counts an absolute token only when its first segment is a real top-level directory on the host
+  (checked once with `existsSync` and cached) — so an API repo's route strings (`/orders/:id`,
+  `/products`) no longer inflate the count. Paths under `/tmp` are reported under a separate
+  **tmp** category (`outsideRepoTmp` on the `gate` `end` event) and excluded from the headline
+  `outsideRepo` number.
+
 ## 0.14.0
 
 A scope-and-size pass on top of 0.13.0, still driven by the `v0.12` full-matrix benchmark. It

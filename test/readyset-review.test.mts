@@ -4689,23 +4689,28 @@ await test("stay-in-repo rule: every phase prompt and SKILL.md carry it", async 
 await test("outside-repo tripwire: classifies outside-repo calls and ignores in-repo ones", async () => {
   const mod = await loadMod();
   const cwd = await mkdtemp(join(tmpdir(), "outside-cwd-"));
-  const f = (toolName: string, input: Record<string, unknown>) => mod.isOutsideRepoAccess(toolName, input, cwd);
-  assert.ok(f("bash", { command: "cat /etc/passwd" }), "absolute path outside cwd");
-  assert.ok(f("bash", { command: "find / -name 'readyset*'" }), "find / root token");
-  assert.ok(f("bash", { command: "cat ~/.omp/agent/config.yml" }), "tilde reference");
-  assert.ok(f("bash", { command: "cat $HOME/Downloads/notes.md" }), "$HOME reference");
-  assert.ok(f("read", { path: "/etc/passwd" }), "read outside path");
-  assert.ok(f("grep", { pattern: "x", path: "/etc" }), "grep outside path");
-  assert.ok(f("grep", { pattern: "/etc/passwd" }), "grep outside pattern");
-  assert.ok(f("glob", { path: "/tmp" }), "glob outside path");
-  assert.ok(!f("bash", { command: "cat src/a.ts" }), "relative bash path is inside");
-  assert.ok(!f("bash", { command: `cat ${cwd}/src/a.ts` }), "absolute path under cwd is inside");
-  assert.ok(!f("bash", { command: `git -C ${cwd} log` }), "cwd itself is inside");
-  assert.ok(!f("read", { path: join(cwd, "src/a.ts") }), "read under cwd is inside");
-  assert.ok(!f("read", { path: "src/a.ts" }), "relative read is inside");
-  assert.ok(!f("grep", { pattern: "x", path: cwd }), "grep path == cwd is inside");
-  assert.ok(!f("glob", { path: "src" }), "relative glob is inside");
-  assert.ok(!f("edit", { path: "/etc/passwd" }), "unwatched tool is never recorded");
+  const kind = (toolName: string, input: Record<string, unknown>) => mod.classifyOutsideRepoAccess(toolName, input, cwd);
+  assert.equal(kind("bash", { command: "cat /etc/passwd" }), "outside", "absolute path outside cwd");
+  assert.equal(kind("bash", { command: "find / -name 'readyset*'" }), "outside", "find / root token");
+  assert.equal(kind("bash", { command: "cat ~/.omp/agent/config.yml" }), "outside", "tilde reference");
+  assert.equal(kind("bash", { command: "cat $HOME/Downloads/notes.md" }), "outside", "$HOME reference");
+  assert.equal(kind("bash", { command: "ls /home/someone" }), "outside", "real top-level dir");
+  assert.equal(kind("bash", { command: "cat 2>/home/x" }), "outside", "redirection target still caught");
+  assert.equal(kind("read", { path: "/etc/passwd" }), "outside", "read outside path");
+  assert.equal(kind("grep", { pattern: "x", path: "/etc" }), "outside", "grep path counts");
+  assert.equal(kind("bash", { command: "mktemp -d /tmp/x" }), "tmp", "scratch dir is its own category");
+  assert.equal(kind("glob", { path: "/tmp" }), "tmp", "glob /tmp is the tmp category");
+  assert.equal(kind("bash", { command: "npm test > /dev/null 2>&1" }), undefined, "/dev/null is ignored");
+  assert.equal(kind("grep", { pattern: "/orders/:id" }), undefined, "grep pattern is never a path");
+  assert.equal(kind("bash", { command: "grep -rn \"'/products'\" src" }), undefined, "route string is not a host dir");
+  assert.equal(kind("bash", { command: "curl localhost:3000/orders/1" }), undefined, "URL path is not absolute");
+  assert.equal(kind("bash", { command: "node -e \"console.log(1)\"" }), undefined, "inline script");
+  assert.equal(kind("bash", { command: "cat src/a.ts" }), undefined, "relative bash path is inside");
+  assert.equal(kind("bash", { command: `cat ${cwd}/src/a.ts` }), undefined, "absolute path under cwd is inside");
+  assert.equal(kind("read", { path: join(cwd, "src/a.ts") }), undefined, "read under cwd is inside");
+  assert.equal(kind("read", { path: "src/a.ts" }), undefined, "relative read is inside");
+  assert.equal(kind("grep", { pattern: "x", path: cwd }), undefined, "grep path == cwd is inside");
+  assert.equal(kind("edit", { path: "/etc/passwd" }), undefined, "unwatched tool is never recorded");
 });
 
 await test("outside-repo tripwire: no-op when the host has no tool_call hook", async () => {
@@ -4730,6 +4735,9 @@ await test("outside-repo tripwire: records an outside bash call and ignores in-r
   assert.equal(mod.outsideRepoCount(), 1, "an in-repo read is ignored");
   handler({ toolName: "bash", input: { command: "find / -name 'readyset*'" } }, { cwd: `${cwd}-other` });
   assert.equal(mod.outsideRepoCount(), 1, "a call from a different cwd is ignored");
+  handler({ toolName: "bash", input: { command: "mktemp -d /tmp/x" } }, { cwd });
+  assert.equal(mod.outsideRepoCount(), 1, "a /tmp call is not counted in the headline");
+  assert.equal(mod.outsideRepoTmpCount(), 1, "a /tmp call is counted in the tmp category");
 });
 
 await test("outside-repo tripwire: an outside bash call during Explore shows at the gate, in CONTEXT.md and on the gate end event", async () => {
@@ -4752,6 +4760,7 @@ await test("outside-repo tripwire: an outside bash call during Explore shows at 
   // Fire the outside bash call during the Explore turn's waitForIdle, before the gate.
   fakePiWrap.queueEffect(async () => {
     fakePiWrap.outsideHandlers.forEach((h) => h({ toolName: "bash", input: { command: "find / -name 'readyset*'" } }, { cwd }));
+    fakePiWrap.outsideHandlers.forEach((h) => h({ toolName: "bash", input: { command: "mktemp -d /tmp/x" } }, { cwd }));
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\nchecked things\n", "utf8");
   });
@@ -4771,11 +4780,17 @@ await test("outside-repo tripwire: an outside bash call during Explore shows at 
     fakeUiWrap.widgetHistory.flat().some((line) => /⚠ outside-repo access: 1 tool call/.test(line)),
     "the gate panel shows the outside-repo count",
   );
+  assert.ok(
+    fakeUiWrap.widgetHistory.flat().some((line) => /\/tmp access: 1 tool call/.test(line)),
+    "the gate panel shows the /tmp category",
+  );
   const context = await readContext(cwd, "tripwire");
   assert.match(context, /⚠ outside-repo access/, "CONTEXT.md records the outside-repo access");
+  assert.match(context, /tmp-directory access/, "CONTEXT.md records the /tmp category");
   const events = await readPhaseEvents(cwd, "tripwire");
   const gateEnd = events.find((event) => event.phase === "gate" && event.edge === "end");
   assert.equal(gateEnd?.outsideRepo, 1, "the gate end event carries the outsideRepo count");
+  assert.equal(gateEnd?.outsideRepoTmp, 1, "the gate end event carries the outsideRepoTmp count");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

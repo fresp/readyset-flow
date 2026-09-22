@@ -354,6 +354,9 @@ export interface PhaseEvent {
 	/** gate `end` only: how many tool calls this run observed reaching outside the repository
 	 *  (stay-in-repo tripwire). Advisory — never blocks, never fails a phase. */
 	outsideRepo?: number;
+	/** gate `end` only: tool calls using a scratch directory under /tmp — reported, never part of
+	 *  the headline `outsideRepo` count (stay-in-repo tripwire). Advisory. */
+	outsideRepoTmp?: number;
 }
 
 /** Marker line that opens one phase-event entry inside CONTEXT.md. */

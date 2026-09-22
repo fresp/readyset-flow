@@ -14,6 +14,7 @@ import {
 	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -701,41 +702,71 @@ const grillRoundState = { rounds: 0, active: false };
 
 const OUTSIDE_REPO_TOOLS = new Set(["bash", "read", "grep", "glob"]);
 
-/** True when a tool call's arguments reach outside `cwd`: an absolute path token that is not under
- *  cwd, a `~`/`$HOME` reference, or the bare `/` root (which is what `find /` reduces to after
- *  tokenization). Relative paths and paths under cwd are inside — never recorded. Advisory: a
- *  plain-prose absolute path in a bash command is an accepted false positive. */
-export function isOutsideRepoAccess(toolName: string, input: Record<string, unknown>, cwd: string): boolean {
-	if (!OUTSIDE_REPO_TOOLS.has(toolName)) return false;
+/** `outside` counts toward the headline number; `tmp` is reported separately (scratch dirs are
+ *  common and legitimate). */
+export type OutsideRepoKind = "outside" | "tmp";
+
+/** Memoized `existsSync('/<segment>')` — a top-level directory listing never changes mid-run. */
+const topLevelDirCache = new Map<string, boolean>();
+function isRealTopLevelDir(segment: string): boolean {
+	const cached = topLevelDirCache.get(segment);
+	if (cached !== undefined) return cached;
+	let exists = false;
+	try { exists = segment !== "" && existsSync(`/${segment}`); } catch { exists = false; }
+	topLevelDirCache.set(segment, exists);
+	return exists;
+}
+
+/** Classifies a tool call's arguments as reaching outside `cwd`; `undefined` when nothing does.
+ *  - `~`/`$HOME` and a bare `/` (what `find /` reduces to) are always outside;
+ *  - a leading redirection prefix (`>/x`, `2>/x`, `<`) is stripped before the test;
+ *  - an absolute token counts only when its first segment is a real top-level directory on this
+ *    host, so route strings like `/orders/:id` or `/products` drop out;
+ *  - `/dev/*` is always ignored;
+ *  - `/tmp/*` returns `"tmp"` (reported, not headline-counted). */
+export function classifyOutsideRepoAccess(toolName: string, input: Record<string, unknown>, cwd: string): OutsideRepoKind | undefined {
+	if (!OUTSIDE_REPO_TOOLS.has(toolName)) return undefined;
 	const repoRoot = cwd.replace(/\/+$/, "");
 	const texts: string[] = [];
 	if (toolName === "bash") {
 		if (typeof input.command === "string") texts.push(input.command);
 		if (typeof input.cwd === "string" && input.cwd !== "") texts.push(input.cwd);
-	} else if (toolName === "read") {
+	} else if (toolName === "read" || toolName === "glob") {
 		if (typeof input.path === "string") texts.push(input.path);
 	} else if (toolName === "grep") {
+		// Only `path` — `pattern` is a regex, never a path (`/orders/:id` is a route, not a dir).
 		if (typeof input.path === "string") texts.push(input.path);
-		if (typeof input.pattern === "string") texts.push(input.pattern);
-	} else if (typeof input.path === "string") {
-		texts.push(input.path);
 	}
+	let sawTmp = false;
 	for (const text of texts) {
-		if (/\$HOME\b|\$\{HOME\}/.test(text)) return true;
-		for (const token of text.split(/[\s"'`;|&()]+/)) {
-			if (token.startsWith("~")) return true;
+		if (/\$HOME\b|\$\{HOME\}/.test(text)) return "outside";
+		for (const raw of text.split(/[\s"'`;|&()]+/)) {
+			const token = raw.replace(/^[0-9]*&?[<>]{1,2}/, ""); // strip a redirection prefix
+			if (token === "") continue;
+			if (token.startsWith("~")) return "outside";
 			if (!token.startsWith("/")) continue;
+			if (token === "/") return "outside";
 			if (token === repoRoot || token.startsWith(`${repoRoot}/`)) continue;
-			return true;
+			if (token === "/dev" || token.startsWith("/dev/")) continue;
+			const segment = token.slice(1).split("/")[0];
+			if (!isRealTopLevelDir(segment)) continue;
+			if (segment === "tmp") { sawTmp = true; continue; }
+			return "outside";
 		}
 	}
-	return false;
+	return sawTmp ? "tmp" : undefined;
 }
 
-const outsideRepoState: { cwd: string | undefined; entries: string[]; written: number } = {
+interface OutsideRepoEntry { kind: OutsideRepoKind; text: string; }
+const outsideRepoState: { cwd: string | undefined; entries: OutsideRepoEntry[]; written: number } = {
 	cwd: undefined, entries: [], written: 0,
 };
-export function outsideRepoCount(): number { return outsideRepoState.entries.length; }
+export function outsideRepoCount(): number {
+	return outsideRepoState.entries.filter((e) => e.kind === "outside").length;
+}
+export function outsideRepoTmpCount(): number {
+	return outsideRepoState.entries.filter((e) => e.kind === "tmp").length;
+}
 
 export function resetOutsideRepoWatch(cwd: string): void {
 	outsideRepoState.cwd = cwd;
@@ -743,11 +774,11 @@ export function resetOutsideRepoWatch(cwd: string): void {
 	outsideRepoState.written = 0;
 }
 
-function noteOutsideRepoCall(toolName: string, input: Record<string, unknown>): void {
-	if (outsideRepoState.entries.length >= 200) return; // bound memory; the count below keeps growing
+function noteOutsideRepoCall(toolName: string, input: Record<string, unknown>, kind: OutsideRepoKind): void {
+	if (outsideRepoState.entries.length >= 200) return; // bound memory; the counts below keep growing
 	const text = toolName === "bash" ? String(input.command ?? "")
-		: [input.path, input.pattern].filter((v) => typeof v === "string").join(" ");
-	outsideRepoState.entries.push(`${toolName}: ${text.slice(0, 140)}`);
+		: (typeof input.path === "string" ? input.path : ""); // grep: never the pattern
+	outsideRepoState.entries.push({ kind, text: `${toolName}: ${text.slice(0, 140)}` });
 }
 
 /** Advisory CONTEXT.md flush: one entry per gate/archive pass, carrying only the calls observed
@@ -756,11 +787,22 @@ async function flushOutsideRepoEntries(cwd: string, changeId: string): Promise<v
 	const unwritten = outsideRepoState.entries.slice(outsideRepoState.written);
 	if (unwritten.length === 0) return;
 	outsideRepoState.written = outsideRepoState.entries.length;
-	await appendContext(
-		cwd, changeId, "Outside-repo access",
-		`⚠ outside-repo access: ${unwritten.length} tool call(s) reached outside the repository — advisory, never blocking` +
-			(unwritten.length <= 10 ? `: ${unwritten.join("; ")}` : `; first 10: ${unwritten.slice(0, 10).join("; ")}`),
-	).catch(() => {});
+	const outside = unwritten.filter((e) => e.kind === "outside").map((e) => e.text);
+	const tmp = unwritten.filter((e) => e.kind === "tmp").map((e) => e.text);
+	if (outside.length > 0) {
+		await appendContext(
+			cwd, changeId, "Outside-repo access",
+			`⚠ outside-repo access: ${outside.length} tool call(s) reached outside the repository — advisory, never blocking` +
+				(outside.length <= 10 ? `: ${outside.join("; ")}` : `; first 10: ${outside.slice(0, 10).join("; ")}`),
+		).catch(() => {});
+	}
+	if (tmp.length > 0) {
+		await appendContext(
+			cwd, changeId, "Outside-repo access",
+			`tmp-directory access: ${tmp.length} tool call(s) used a scratch directory under /tmp — reported separately, not counted in the outside-repo headline` +
+				(tmp.length <= 10 ? `: ${tmp.join("; ")}` : `; first 10: ${tmp.slice(0, 10).join("; ")}`),
+		).catch(() => {});
+	}
 }
 
 export function grillTurnPrompt(ideaText: string, today: string, laneDefault: LaneDefault, preferredLanguage?: string): string {
@@ -1854,6 +1896,9 @@ interface ReviewSnapshot {
 	/** Outside-repo tripwire count: tool calls this run observed reaching outside the repository.
 	 *  Advisory — surfaced in the gate, never blocks. */
 	outsideRepoAccess: number;
+	/** Tool calls using a scratch directory under /tmp — reported alongside the headline, never
+	 *  counted in `outsideRepoAccess` (stay-in-repo tripwire). Advisory. */
+	outsideRepoTmpAccess: number;
 }
 
 /** One validate + progress + verification pass, shared by the widget and the gate prompt so
@@ -1899,6 +1944,7 @@ async function takeReviewSnapshot(ctx: ReviewCtx, chosen: BrainstormMeta): Promi
 		missingDocs,
 		missingDocWarnings,
 		outsideRepoAccess: outsideRepoCount(),
+		outsideRepoTmpAccess: outsideRepoTmpCount(),
 	};
 }
 
@@ -2010,6 +2056,7 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 						: []),
 					...snapshot.missingDocWarnings,
 					...(snapshot.outsideRepoAccess > 0 ? [`⚠ outside-repo access: ${snapshot.outsideRepoAccess} tool call(s) outside the repository (advisory)`] : []),
+					...(snapshot.outsideRepoTmpAccess > 0 ? [`/tmp access: ${snapshot.outsideRepoTmpAccess} tool call(s) used a scratch directory (advisory, not counted in the outside-repo headline)`] : []),
 				].join("\n");
 			},
 		},
@@ -2289,6 +2336,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 		...snapshot.missingDocs.map((d) => `requested doc missing from contract: ${d}`),
 		...snapshot.missingDocWarnings,
 		...(outsideRepoCount() > 0 ? [`⚠ outside-repo access: ${outsideRepoCount()} tool call(s) outside the repository (advisory)`] : []),
+		...(outsideRepoTmpCount() > 0 ? [`/tmp access: ${outsideRepoTmpCount()} tool call(s) used a scratch directory (advisory, not counted in the outside-repo headline)`] : []),
 		`agent turns this run: ${budget.spent}/${budget.max}`,
 		...(usage ? [`context: ${usage.percent}% (${usage.tokens.toLocaleString()}/${usage.contextWindow.toLocaleString()} tokens)`] : []),
 		`proposal: readyset/changes/${chosen.changeId}/proposal.md`,
@@ -2455,7 +2503,7 @@ async function reviewAndMaybeExecute(
 		changeId: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"]; counts?: PhaseEvent["counts"]; openDecisions?: number; outsideRepo?: number } = {},
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"]; counts?: PhaseEvent["counts"]; openDecisions?: number; outsideRepo?: number; outsideRepoTmp?: number } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, changeId, {
 			phase,
@@ -2504,7 +2552,7 @@ async function reviewAndMaybeExecute(
 		}
 
 		if (!choice || choice === "discard") {
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "discard", outsideRepo: outsideRepoState.entries.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "discard", outsideRepo: outsideRepoCount(), outsideRepoTmp: outsideRepoTmpCount() });
 			return;
 		}
 
@@ -2542,7 +2590,7 @@ async function reviewAndMaybeExecute(
 				outcome: "skipped-keep-context",
 				boundary: "apply",
 			});
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoState.entries.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve-keep-context", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoCount(), outsideRepoTmp: outsideRepoTmpCount() });
 			choice = "approve"; // fall through to Apply, skipping compaction
 		} else if (choice === "approve" || choice === "compact") {
 			const compactResult = await compactForPhase(
@@ -2566,11 +2614,11 @@ async function reviewAndMaybeExecute(
 			// The recorded outcome names the action the user took. The legacy `"compact"` result
 			// (from older sidebar builds) means "approve, keep context" in 0.12.0's note, but the
 			// gate treats it as a plain approve here, so both record `approve`.
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoState.entries.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "approve", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoCount(), outsideRepoTmp: outsideRepoTmpCount() });
 		}
 
 		if (choice === "refine") {
-			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoState.entries.length });
+			await recordPhase(chosen.changeId, "gate", "end", { outcome: "refine", openDecisions: snapshot.openDecisions.length, outsideRepo: outsideRepoCount(), outsideRepoTmp: outsideRepoTmpCount() });
 			const feedback = refineFeedback ?? (ctx.ui.input ? await ctx.ui.input("What should change?") : undefined);
 			if (!feedback) {
 				ctx.ui.notify("No feedback given — nothing changed.", "info");
@@ -2875,6 +2923,7 @@ async function offerArchive(
 ): Promise<void> {
 	await flushOutsideRepoEntries(ctx.cwd, chosen.changeId);
 	const outsideLine = outsideRepoCount() > 0 ? `⚠ outside-repo access: ${outsideRepoCount()} tool call(s) outside the repository (advisory). ` : "";
+	const tmpLine = outsideRepoTmpCount() > 0 ? `/tmp access: ${outsideRepoTmpCount()} tool call(s) (advisory, not counted). ` : "";
 	const restoredLine = restoredPaths.length > 0
 		? `⚠ ${restoredPaths.length} file(s) the reconciliation turn reverted out of list were RESTORED (${restoredPaths.join(", ")}). `
 		: "";
@@ -2888,7 +2937,7 @@ async function offerArchive(
 			? `Code review skipped (never): readyset.review.mode = never.`
 			: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
 	const archiveChoice = await ctx.ui.select(
-		`${outsideLine}${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
+		`${outsideLine}${tmpLine}${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
 		[
 			{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
 			{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
@@ -3537,9 +3586,8 @@ export default function (pi: ExtensionAPI) {
 		toolCallHost.on("tool_call", (event, ctx) => {
 			if (outsideRepoState.cwd === undefined || ctx?.cwd !== outsideRepoState.cwd) return;
 			const call = event as { toolName?: string; input?: Record<string, unknown> };
-			if (isOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, outsideRepoState.cwd)) {
-				noteOutsideRepoCall(call.toolName ?? "", call.input ?? {});
-			}
+			const kind = classifyOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, outsideRepoState.cwd);
+			if (kind) noteOutsideRepoCall(call.toolName ?? "", call.input ?? {}, kind);
 		});
 	}
 	registerAskTool(pi);

@@ -451,8 +451,16 @@ Picks a brainstorm, then depending on its status:
   home-directory files, logs or notes), and never inspect Readyset's own implementation, package or
   configuration. Because omp's extension API fires `pi.on("tool_call")` before every tool runs,
   the rule is also **observed, not just asked for**: `bash`/`read`/`grep`/`glob` calls whose
-  arguments name an absolute path outside the repo (or use `find /`, `~` or `$HOME`) are counted,
-  and the count surfaces in four places — a `⚠ outside-repo access` entry in `CONTEXT.md`, an
+  arguments name an absolute path outside the repo (or use `find /`, `~` or `$HOME`) are counted.
+  To keep the signal meaningful on an API repo — where nearly every run would otherwise warn — the
+  check is deliberately narrow: an absolute token counts only when its first segment is a real
+  top-level directory on the host (checked once with `existsSync` and cached), so `grep`'s
+  `pattern` (a regex, never a path), `/dev/*`, a redirection target like `> /dev/null`, and
+  route-like strings whose first segment is not a real host directory (`/orders/:id`, `/products`)
+  are all excluded. A path under `/tmp` is a separate **tmp** category (scratch directories are
+  legitimate): reported alongside the headline but never counted in it, riding the same sinks as
+  `outsideRepoTmp` on the `gate` `end` event. The count surfaces in four places — a
+  `⚠ outside-repo access` entry in `CONTEXT.md`, an
   `outsideRepo` field on the `gate` `end` phase event, a line in the gate panel, and a prefix on
   the **Archive now?** prompt. **Advisory only** — nothing is blocked and no phase fails; a host
   without the hook (older omp builds) simply no-ops.
