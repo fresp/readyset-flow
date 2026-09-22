@@ -436,12 +436,20 @@ Picks a brainstorm, then depending on its status:
     **reconciled once**: one bounded turn reverts it (`git checkout -- <path>`, or deletes it if
     this run created it — never `git checkout .`/`git stash`/`git reset`/`git clean`) or keeps it
     and writes a `## Scope deviations` entry. It re-runs the affected tests and updates their
-    `_Verified:` notes after any revert. The turn **runs at most once per Execute**, and is skipped
-    when the run has no turn budget left. Anything still unjustified is named at the **Archive
-    now?** prompt and in `CONTEXT.md` — a **warning, never a block**. If the reconciliation turn
-    itself touches a new out-of-contract file, that is surfaced too. The code-review turn also gets
-    the deviation list and writes a `## Scope` section of `REVIEW.md` judging each deviation
-    necessary-or-gold-plating.
+    `_Verified:` notes after any revert. **Only a path that is (a) outside the contract, (b) changed
+    by this run (baseline-subtracted), and (c) *not* in the change's dirty baseline — i.e. not dirty
+    before the run started — is ever offered for revert or deletion**, and that candidate list is
+    computed in code and handed to the turn; with **no dirty baseline at all** (an older change, or
+    a failed capture) no revert is offered and the turn may only justify. Before the turn, every
+    candidate is copied to `readyset/changes/<id>/reverted/<path>` and the backup is recorded in
+    `CONTEXT.md`; after it, a hash of every baseline-dirty and contract file is compared against a
+    pre-turn snapshot, and **anything the turn changed or deleted outside its candidate list is
+    restored byte-for-byte**, logged loudly, and surfaced at the archive prompt. The turn **runs at
+    most once per Execute**, and is skipped when the run has no turn budget left. Anything still
+    unjustified is named at the **Archive now?** prompt and in `CONTEXT.md` — a **warning, never a
+    block**. If the reconciliation turn itself touches a new out-of-contract file, that is surfaced
+    too. The code-review turn also gets the deviation list and writes a `## Scope` section of
+    `REVIEW.md` judging each deviation necessary-or-gold-plating.
 - **Approve & Execute** implements the tasks. Each completed task needs an indented `_Verified:`
   note, or the gate sends it back. It can optionally call `readyset_verify({taskId, command})` to
   back that note with more than a self-report — the command runs for real, and an immutable record

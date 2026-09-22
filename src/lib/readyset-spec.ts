@@ -290,6 +290,16 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
 	return new Set(parsed?.paths ?? []);
 }
 
+/** True when this change actually has a captured dirty baseline. Distinguishes "the baseline was
+ *  empty" from "there is no baseline at all" (an older change, or a failed capture) — the latter
+ *  must not be read as "nothing was dirty before the run", or every pre-existing dirty file
+ *  becomes a revert candidate. */
+export async function hasDirtyBaseline(cwd: string, changeId: string): Promise<boolean> {
+	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
+	if (raw === undefined) return false;
+	return parseBaselineEntry(raw) !== undefined;
+}
+
 /** The phases a Readyset run records boundaries for. */
 export type PhaseName =
 	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"

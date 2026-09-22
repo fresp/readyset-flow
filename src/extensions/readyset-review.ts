@@ -13,10 +13,11 @@ import {
 	recommendLane,
 	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	appendContext,
 	appendPhaseEvent,
@@ -31,6 +32,7 @@ import {
 	findSpecFiles,
 	getProgress,
 	hasBeenApplied,
+	hasDirtyBaseline,
 	hasExploration,
 	listSubmodules,
 	type PhaseEvent,
@@ -1430,22 +1432,72 @@ async function runTrim(
 	});
 }
 
-/** Prompt for the one-shot post-Apply scope reconciliation turn. */
+/** Prompt for the one-shot post-Apply scope reconciliation turn. `paths` is the code-computed
+ *  candidate list (see `revertCandidates`) — never the raw out-of-contract set, so the model can
+ *  only ever revert or delete a file this run itself made. */
 function scopeReconcilePrompt(changeId: string, paths: string[]): string {
 	return (
 		`After implementing "${changeId}", the working tree changed these file(s) that proposal.md's ` +
-		"`## Files This Change Will Touch` scope contract does NOT name:\n\n" +
+		"`## Files This Change Will Touch` scope contract does NOT name, and that this run itself made " +
+		"(they were not already dirty when the run started):\n\n" +
 		paths.map((p) => `- ${p}`).join("\n") +
 		`\n\nFor EACH path above, choose one:\n` +
 		`1. REVERT it: run \`git checkout -- <path>\` for a tracked file, or delete it if this run created ` +
 		`it and it is untracked. Do this ONE PATH AT A TIME. NEVER run \`git checkout .\`, \`git stash\`, ` +
-		`\`git reset\`, or \`git clean\`.\n` +
+		`\`git reset\`, or \`git clean\`. Only the paths listed above may be reverted or deleted; every ` +
+		`other file in the repo — including anything that was already dirty before this run started — ` +
+		`must be left exactly as it is.\n` +
 		`2. KEEP it: leave the file and add a line to the \`## Scope deviations\` section of tasks.md: ` +
 		`\`- <path> — <why this change genuinely requires it>\`.\n\n` +
 		`After any revert, re-run the tests that cover the affected behavior and fix the corresponding ` +
 		`\`_Verified:\` notes in tasks.md. If a revert breaks required behavior, keep the file and justify ` +
 		`it instead. Leave correctly-in-contract files alone; do not start new work.`
 	);
+}
+
+/** The only paths a reconciliation turn may ever revert or delete: (a) outside the scope
+ *  contract, (b) changed by THIS run (baseline-subtracted), and (c) not in the dirty baseline
+ *  (c) is implied by (b) but restated because it is the safety property: a path dirty before
+ *  the run is never a candidate, however it got there. */
+function revertCandidates(outside: string[], changedThisRun: string[], baseline: Set<string>): string[] {
+	const changed = new Set(changedThisRun);
+	return outside.filter((p) => changed.has(p) && !baseline.has(p));
+}
+
+/** Copies every candidate file's current bytes to readyset/changes/<id>/reverted/<path> before
+ *  the reconciliation turn runs, so anything it reverts or deletes can be restored. Untracked
+ *  files are included. Returns the repo-relative paths actually backed up (a candidate that
+ *  vanished between listing and copying is skipped). */
+async function backupRevertCandidates(cwd: string, changeId: string, candidates: string[]): Promise<string[]> {
+	const backed: string[] = [];
+	for (const rel of candidates) {
+		try {
+			const content = await readFile(join(cwd, rel));
+			const dest = join(changePaths(cwd, changeId).dir, "reverted", rel);
+			await mkdir(dirname(dest), { recursive: true });
+			await writeFile(dest, content);
+			backed.push(rel);
+		} catch {
+			/* gone or unreadable between listing and copy — nothing to restore */
+		}
+	}
+	return backed;
+}
+
+/** sha256 of a file's bytes, or undefined when it is absent/unreadable. */
+async function fileHash(abs: string): Promise<string | undefined> {
+	try {
+		return createHash("sha256").update(await readFile(abs)).digest("hex");
+	} catch {
+		return undefined;
+	}
+}
+
+/** Content hashes for a set of repo-relative paths, in sorted order (stable comparison). */
+async function hashPaths(cwd: string, paths: string[]): Promise<Map<string, string | undefined>> {
+	const out = new Map<string, string | undefined>();
+	for (const rel of [...paths].sort()) out.set(rel, await fileHash(join(cwd, rel)));
+	return out;
 }
 
 /**
@@ -1468,26 +1520,109 @@ async function runScopeReconciliation(
 	record: (phase: PhaseName, edge: "start" | "end", extra?: { model?: string; outcome?: string; counts?: PhaseEvent["counts"] }) => Promise<void>,
 	outside: string[],
 	unjustified: string[],
-): Promise<{ outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number }> {
+): Promise<{ outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number; restored: string[] }> {
 	const outsideBefore = outside.length;
 	const justified = outsideBefore - unjustified.length;
 	if (unjustified.length === 0) {
-		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: 0 };
+		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: 0, restored: [] };
 	}
+
+	// No baseline at all (an older change, or a failed capture): readDirtyBaseline returns an
+	// empty set, which would wrongly read as "nothing was dirty before the run" and offer every
+	// out-of-contract file as a revert candidate. Refuse instead — justify-only.
+	const baseline = await readDirtyBaseline(ctx.cwd, changeId);
+	if (!(await hasDirtyBaseline(ctx.cwd, changeId))) {
+		ctx.ui.notify(
+			`"${changeId}" touched ${unjustified.length} file(s) outside its scope contract, but this change has no dirty baseline (an older change, or the baseline capture failed), so Readyset cannot tell which of them this run actually made — not offering to revert any of them. Justify them under ## Scope deviations in tasks.md instead.`,
+			"warning",
+		);
+		await record("scope-reconcile", "end", {
+			outcome: "no-baseline",
+			counts: { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length },
+		});
+		await appendContext(ctx.cwd, changeId, "Scope reconciliation",
+			`No dirty baseline — revert not offered for ${unjustified.join(", ")}; they may only be justified.`);
+		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length, restored: [] };
+	}
+
+	// The candidate list is computed in code, never taken from the raw out-of-contract set:
+	// (a) outside the contract, (b) changed by THIS run (baseline-subtracted), (c) not in the
+	// dirty baseline. The prompt only ever sees (and may only revert) this list.
+	const changedThisRun = await pathsChangedThisRun(ctx.cwd, changeId);
+	const candidates = revertCandidates(unjustified, changedThisRun, baseline);
+	if (candidates.length === 0) {
+		await record("scope-reconcile", "end", {
+			outcome: "no-candidates",
+			counts: { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length },
+		});
+		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length, restored: [] };
+	}
+
 	if (!turnsAvailableFor(budget, 1)) {
 		ctx.ui.notify(
 			`"${changeId}" touched ${unjustified.length} file(s) outside its scope contract, but reconciling them now would starve the code-review turn of its turn — keeping the turn and showing them at the archive prompt instead.`,
 			"warning",
 		);
 		await record("scope-reconcile", "end", { outcome: "skipped-budget", counts: { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length } });
-		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length };
+		return { outsideBefore, reverted: 0, justified, unjustifiedAfter: unjustified.length, restored: [] };
 	}
 
-	ctx.ui.notify(`Reconciling ${unjustified.length} out-of-contract file(s) for "${changeId}"...`, "info");
+	// Snapshot the protected sets BEFORE the turn, so a restore has exact bytes to write back.
+	// `baseline` is the pre-run dirty set; contract files are the change's own allowed paths;
+	// candidates are authorized, so they are excluded from the restore rule below.
+	const contractBefore = await readScopeContract(ctx.cwd, changeId);
+	const contractPaths = [...(contractBefore.files ?? []), ...contractBefore.newFiles, ...contractBefore.deleteFiles];
+	const baselinePaths = [...baseline].filter(
+		(p) => !p.startsWith(`${READYSET_ROOT}/`) && !p.startsWith(".ai/brainstorms/"),
+	);
+	const protectedPaths = [...new Set([...baselinePaths, ...contractPaths, ...candidates])];
+	const before = new Map<string, Buffer | undefined>();
+	for (const rel of protectedPaths) before.set(rel, await readFile(join(ctx.cwd, rel)).catch(() => undefined));
+
+	// Back up every candidate, then record the backup. Done after the reserve check so a skipped
+	// turn never writes backups.
+	const backed = await backupRevertCandidates(ctx.cwd, changeId, candidates);
+	await appendContext(ctx.cwd, changeId, "Scope reconciliation",
+		`Backed up ${backed.length}/${candidates.length} candidate(s) to reverted/ before the turn: ${backed.join(", ") || "(none)"}.`);
+
+	ctx.ui.notify(`Reconciling ${candidates.length} out-of-contract file(s) for "${changeId}"...`, "info");
 	await record("scope-reconcile", "start", { model: phaseModels.get("apply")?.model });
 	await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
-		spendTurn(pi, ctx, budget, "Scope reconciliation", scopeReconcilePrompt(changeId, unjustified)),
+		spendTurn(pi, ctx, budget, "Scope reconciliation", scopeReconcilePrompt(changeId, candidates)),
 	);
+
+	// Verify afterwards: any protected file that changed or vanished outside the candidate list
+	// is restored byte-for-byte from the pre-turn snapshot and reported loudly.
+	const restored: string[] = [];
+	const violations: string[] = [];
+	for (const [rel, beforeBytes] of before) {
+		const was = beforeBytes === undefined ? undefined : createHash("sha256").update(beforeBytes).digest("hex");
+		const is = await fileHash(join(ctx.cwd, rel));
+		if (was === is) continue;
+		if (beforeBytes === undefined) {
+			// The path did not exist before the turn: a contract `(new)` file it created is fine;
+			// anything else appearing here is the turn writing outside its list.
+			if (!candidates.includes(rel) && !contractBefore.newFiles.includes(rel)) violations.push(rel);
+			continue;
+		}
+		// A protected file changed or was deleted. Restore the exact pre-turn bytes unless the
+		// turn was authorized to touch it (a listed candidate).
+		if (candidates.includes(rel)) continue;
+		await mkdir(dirname(join(ctx.cwd, rel)), { recursive: true });
+		await writeFile(join(ctx.cwd, rel), beforeBytes);
+		restored.push(rel);
+		violations.push(rel);
+	}
+	if (restored.length > 0) {
+		await appendContext(ctx.cwd, changeId, "Scope reconciliation",
+			`⚠ RESTORED ${restored.length} file(s) the reconciliation turn changed or deleted outside its candidate list: ${restored.join(", ")}. ` +
+			"These were restored byte-for-byte from a pre-turn snapshot; re-check the working tree.");
+		ctx.ui.notify(
+			`The scope-reconciliation turn for "${changeId}" touched file(s) it was not authorized to revert (` +
+				`${restored.join(", ")}) — they were restored from a pre-turn snapshot. Review the working tree before archiving.`,
+			"warning",
+		);
+	}
 
 	// Recompute from the working tree; reverted paths are simply no longer outside, justified
 	// paths now have a deviation entry.
@@ -1525,7 +1660,7 @@ async function runScopeReconciliation(
 			` Dangling/new-but-exists after Apply: ${[...refsAfter.missing, ...refsAfter.newButExists].join(", ") || "none"}.`,
 	);
 	await record("scope-reconcile", "end", { model: phaseModels.get("apply")?.model, outcome: counts.unjustifiedAfter === 0 ? "fixed" : "partial", counts });
-	return counts;
+	return { ...counts, restored };
 }
 
 interface ReviewSnapshot {
@@ -2300,7 +2435,7 @@ async function reviewAndMaybeExecute(
 		const outsideBefore = before.noContract ? [] : before.outside;
 		const unjustified = outsideBefore.filter((p) => !justifiedPaths.has(p));
 
-		await runScopeReconciliation(
+		const reconcileResult = await runScopeReconciliation(
 			pi, ctx, budget, chosen.changeId, phaseModels, recordReconcile, outsideBefore, unjustified,
 		);
 
@@ -2402,7 +2537,7 @@ async function reviewAndMaybeExecute(
 			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
 		}
 
-		await offerArchive(ctx, chosen, reviewContent, archiveDriftPaths, recordPhase, skipReason);
+		await offerArchive(ctx, chosen, reviewContent, archiveDriftPaths, recordPhase, skipReason, reconcileResult.restored);
 		return;
 	}
 }
@@ -2425,7 +2560,11 @@ async function offerArchive(
 		extra?: { outcome?: string },
 	) => Promise<void>,
 	skipReason: "skipped-flag" | "skipped-no-trigger" | undefined,
+	restoredPaths: string[],
 ): Promise<void> {
+	const restoredLine = restoredPaths.length > 0
+		? `⚠ ${restoredPaths.length} file(s) the reconciliation turn reverted out of list were RESTORED (${restoredPaths.join(", ")}). `
+		: "";
 	const driftLine = archiveDriftPaths.length > 0
 		? `Apply touched ${archiveDriftPaths.length} file(s) outside the contract (${archiveDriftPaths.join(", ")}). `
 		: "";
@@ -2435,7 +2574,7 @@ async function offerArchive(
 			? `Code review skipped (never): readyset.review.mode = never.`
 			: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
 	const archiveChoice = await ctx.ui.select(
-		`${driftLine}${reviewLine} Archive now?`,
+		`${restoredLine}${driftLine}${reviewLine} Archive now?`,
 		[
 			{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
 			{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
@@ -2600,6 +2739,7 @@ async function runOnDemandReview(
 		driftPaths,
 		recordPhase,
 		undefined,
+		[],
 	);
 }
 

@@ -62,6 +62,18 @@ by phase events, so the benchmark can tune them from real data.
   options and the archive phase events — is now one shared helper the main path and the on-demand
   path both call, so they cannot drift.
 
+- **The review gate** now reconciles scope drift safely. Only a path that is (a) outside the
+  contract, (b) changed by **this run** (baseline-subtracted), and (c) absent from the change's
+  dirty baseline — i.e. not dirty before the run started — is ever offered for revert or deletion,
+  and that candidate list is computed in code and passed to the prompt (never the raw
+  out-of-contract set). With no dirty baseline at all (an older change, or a failed capture) no
+  revert is offered; the turn may only add `## Scope deviations` entries. Before the turn every
+  candidate is copied to `readyset/changes/<id>/reverted/<path>` and the backup is recorded in
+  `CONTEXT.md`. After it, hashes of every baseline-dirty and contract file are compared against a
+  pre-turn snapshot; anything the turn changed or deleted outside its candidate list is restored
+  byte-for-byte from that snapshot, logged loudly in `CONTEXT.md`, and surfaced at the archive
+  prompt.
+
 ## 0.14.0
 
 A scope-and-size pass on top of 0.13.0, still driven by the `v0.12` full-matrix benchmark. It

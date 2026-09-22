@@ -148,6 +148,13 @@ trail, not a planning document. It also carries a one-time `readyset-baseline-di
 the repo paths that were already dirty before the change started — which the gate invariant and
 scope check subtract so unrelated WIP isn't blamed on this change.
 
+The post-Apply **scope reconciliation** turn may only touch this run's *own* out-of-contract
+files — those changed by this run and absent from the dirty baseline; files already dirty before
+the run are never candidates, and with no dirty baseline at all no revert is offered. Its
+candidates are copied to `readyset/changes/<id>/reverted/<path>` before the turn and recorded in
+`CONTEXT.md`, and any file it changes or deletes outside that list is restored byte-for-byte from
+a pre-turn snapshot and logged loudly.
+
 ## What Readyset deliberately does not do
 
 - `validateChange` is a shallow structural check (required sections exist, at least one

@@ -3149,6 +3149,177 @@ await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   assert.match(applyCall.prompt, /smallest change/);
 });
 
+// --- F1: safe scope reconciliation (baseline-subtracted candidates, backups, restore) ---------
+
+await test("F1: a file already dirty before the run is never offered for revert and is byte-identical after reconciliation", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
+  execFileSync("git", ["config", "user.name", "t"], { cwd });
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-q", "-m", "init"], { cwd });
+
+  await writeBrainstorm(cwd, "2026-04-20-f1a.md", {
+    title: "F1 A",
+    status: "proposed",
+    created: "2026-04-20",
+    change_id: "f1a",
+  });
+  const dir = await writeReconcileChange(cwd, "f1a"); // contract names src/keep.ts only
+  // Dirty src/keep.ts with a USER edit AFTER the helper wrote the committed version but BEFORE
+  // the run's baseline is captured (the handler captures it at the start).
+  const keepEdit = "export const keep = 42; // user edit before the run\n";
+  await writeFile(join(cwd, "src", "keep.ts"), keepEdit, "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-20 · F1 A"); // pick
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+
+  // Apply: complete the task AND touch src/mine.ts (out of contract). Leave src/keep.ts alone.
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "mine.ts"), "// out-of-contract, made by this run\n", "utf8");
+  });
+  // Reconciliation: wrongly rewrite the PRE-EXISTING dirty file too.
+  fakePiWrap.queueEffect(async () => {
+    await rm(join(cwd, "src", "mine.ts"), { force: true });
+    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 999; // clobbered by recon\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  const reconPrompt = fakePiWrap.calls.find((c) => /scope contract does NOT name/.test(c.prompt));
+  if (reconPrompt) {
+    assert.match(reconPrompt.prompt, /src\/mine\.ts/, "the candidate list names src/mine.ts");
+    assert.ok(!reconPrompt.prompt.includes("src/keep.ts"), "the pre-run dirty file is NOT listed as a candidate");
+  } else {
+    assert.match(fakePiWrap.calls.find((c) => /Implement the Readyset change/.test(c.prompt))?.prompt ?? "", /Implement/);
+  }
+
+  // The out-of-list rewrite of the pre-existing dirty file was restored byte-for-byte.
+  const keepAfter = await readFile(join(cwd, "src", "keep.ts"), "utf8");
+  assert.equal(keepAfter, keepEdit, "the pre-run dirty file is byte-identical after reconciliation");
+
+  // Backups exist for the candidate.
+  const backup = await readFile(join(dir, "reverted", "src", "mine.ts"), "utf8").catch(() => undefined);
+  assert.equal(backup, "// out-of-contract, made by this run\n", "the candidate was backed up before the turn");
+});
+
+await test("F1: a fresh baseline capture protects pre-existing dirty files (no revert of them)", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  await writeBrainstorm(cwd, "2026-04-21-f1b.md", {
+    title: "F1 B",
+    status: "proposed",
+    created: "2026-04-21",
+    change_id: "f1b",
+  });
+  const dir = await writeReconcileChange(cwd, "f1b");
+  await mkdir(join(cwd, "src"), { recursive: true });
+  // A file dirty before the run's baseline capture (the handler captures one on this path).
+  await writeFile(join(cwd, "src", "user.ts"), "// user WIP before the run\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-21 · F1 B");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "mine.ts"), "// out-of-contract, made by this run\n", "utf8");
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  // Only this run's own out-of-contract file is a candidate; the pre-existing dirty file is not.
+  const reconPrompt = fakePiWrap.calls.find((c) => /scope contract does NOT name/.test(c.prompt));
+  if (reconPrompt) {
+    assert.match(reconPrompt.prompt, /src\/mine\.ts/);
+    assert.ok(!reconPrompt.prompt.includes("src/user.ts"), "a file dirty before the run is never a candidate");
+  }
+  const events = await readPhaseEvents(cwd, "f1b");
+  const recEnd = events.find((e) => e.phase === "scope-reconcile" && e.edge === "end");
+  // A baseline exists here, so the outcome is the ordinary one, never "no-baseline".
+  if (recEnd) assert.notEqual(recEnd.outcome, "no-baseline");
+});
+
+await test("F1: an out-of-list revert by the model is detected and restored", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
+  execFileSync("git", ["config", "user.name", "t"], { cwd });
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "a.ts"), "export const a = 1;\n", "utf8");
+  await writeFile(join(cwd, "src", "b.ts"), "export const b = 1;\n", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-q", "-m", "init"], { cwd });
+  // Two files dirty before the run (both captured into the baseline).
+  const aEdit = "export const a = 2; // user edit\n";
+  const bEdit = "export const b = 2; // user edit\n";
+  await writeFile(join(cwd, "src", "a.ts"), aEdit, "utf8");
+  await writeFile(join(cwd, "src", "b.ts"), bEdit, "utf8");
+
+  await writeBrainstorm(cwd, "2026-04-22-f1c.md", {
+    title: "F1 C",
+    status: "proposed",
+    created: "2026-04-22",
+    change_id: "f1c",
+  });
+  const dir = await writeReconcileChange(cwd, "f1c");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+
+  fakeUiWrap.selectQueue.push("2026-04-22 · F1 C");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakeUiWrap.selectQueue.push("Not yet");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+    await writeFile(join(cwd, "src", "mine.ts"), "// out-of-contract, made by this run\n", "utf8");
+  });
+  // Reconciliation: reverts the candidate correctly, but ALSO overwrites src/a.ts and deletes src/b.ts.
+  fakePiWrap.queueEffect(async () => {
+    await rm(join(cwd, "src", "mine.ts"), { force: true });
+    await writeFile(join(cwd, "src", "a.ts"), "export const a = 777; // out of list\n", "utf8");
+    await rm(join(cwd, "src", "b.ts"), { force: true });
+  });
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(await readFile(join(cwd, "src", "a.ts"), "utf8"), aEdit, "src/a.ts restored to its pre-turn bytes");
+  assert.equal(await readFile(join(cwd, "src", "b.ts"), "utf8"), bEdit, "src/b.ts restored to its pre-turn bytes");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /restored from a pre-turn snapshot/.test(n.message) && n.level === "warning"),
+    "a restore warning fires",
+  );
+  const archivePrompt = fakeUiWrap.selectPrompts.find((p) => /Archive now\?/.test(p));
+  assert.ok(archivePrompt, "an archive prompt exists");
+  assert.match(archivePrompt, /RESTORED/, "the archive prompt carries the RESTORED line");
+});
+
 // --- Conditional / model-aware compaction (C1-C8) ---------------------------------------------
 
 // A fresh full-lane run that reaches the Explore boundary, with a controllable context-usage

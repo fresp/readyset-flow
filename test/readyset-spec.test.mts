@@ -16,6 +16,7 @@ import {
   checkTaskVerification,
   checkPhaseViolations,
   ensureDirtyBaseline,
+  hasDirtyBaseline,
   readDirtyBaseline,
   readScopeContract,
   readScopeDeviations,
@@ -939,6 +940,21 @@ await test("validateChange: observable THENs still pass (exit, stdout, status, f
   const result = await validateChange(cwd, "observable");
   assert.deepEqual(result.issues, []);
   assert.equal(result.ok, true);
+});
+
+await test("hasDirtyBaseline: false with no baseline, true after a capture (even an empty one)", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "hb");
+  // No baseline captured yet.
+  assert.equal(await hasDirtyBaseline(cwd, "hb"), false);
+  // An EMPTY capture still marks a real baseline: readDirtyBaseline would return an empty set
+  // either way, but hasDirtyBaseline must distinguish "the tree was clean" from "no capture".
+  await ensureDirtyBaseline(cwd, "hb", []);
+  assert.equal(await hasDirtyBaseline(cwd, "hb"), true);
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "hb"))], []);
+
+  // A change dir that does not exist at all reads false, not throw.
+  assert.equal(await hasDirtyBaseline(cwd, "does-not-exist"), false);
 });
 
 await test("ensureDirtyBaseline/readDirtyBaseline: round-trip, idempotent, missing -> empty", async () => {
