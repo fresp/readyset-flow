@@ -50,6 +50,21 @@ by phase events, so the benchmark can tune them from real data.
 - **`readyset.review.testPaths`** (default `test/**`, `tests/**`, `**/*.test.*`, `**/*.spec.*`,
   `__tests__/**`) and test-aware **`diff-size`** evaluation. Matched test-only paths are excluded
   from the trigger’s non-test file count; a large test suite alone is not a reason to review.
+- **Narrow verification-fix retry prompt.** When the Apply turn reports all tasks checked but
+  missing `_Verified:` notes, the send-back turn now fires `verificationFixTurnPrompt` instead of
+  re-dispatching the generic `applyTurnPrompt`. This directs the model to add the missing notes to
+  `tasks.md` without modifying application or test code, eliminating redundant implementation turns
+  that led to timeouts and wall-clock inflation.
+- **Pre-existing work and uncommitted edits protection.** `proposeTurnPrompt`, `applyTurnPrompt`,
+  and `SKILL.md` now explicitly instruct the model that uncommitted files, comments (e.g.
+  `// user was editing...`, `// user note...`), and untracked scratch notes are active user WIP.
+  Agents are barred from proposing cleanups or deleting pre-existing comments and hunks, and must
+  plan and edit around existing uncommitted work.
+- **Anti-overengineering constraints in Grill and Propose.** `grillTurnPrompt` and
+  `proposeTurnPrompt` instruct the model not to invent unrequested secondary systems. Identifier
+  headers or attributes (such as `x-api-key` or IP) used for rate limiting or grouping must be
+  treated strictly as bucket keys without adding unasked credential registries, key validation, or
+  401 UNAUTHORIZED responses.
 - **Requested-doc contract repair.** The request and the brainstorm's decision-bearing sections
   are scanned for README, CHANGELOG, and docs mentions, and any requested doc missing from
   `## Files This Change Will Touch` is shown in the gate and added to the same one-shot
