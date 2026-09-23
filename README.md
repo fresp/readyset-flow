@@ -63,11 +63,30 @@ verification, not just a claim. The code-review turn is risk-based: it runs auto
 risky changes and is skipped, with an honest stub, when nothing raises a flag (`--review always`
 forces it, `--review <id>` runs it on demand).
 
+## Benchmark
+
+Readyset is evaluated against native `/plan` using a 12-task headless benchmark suite spanning
+bugfixes, storage migrations, cross-cutting refactors, and ambiguous feature requests:
+
+| Metric | `/plan` (native) | `/readyset` (0.15.0) | Note |
+|---|---:|---:|---|
+| **Code Judge Win Rate** | — | **91%** | 65 wins, 1 tie, 6 losses (blind normalized judging) |
+| **Planning Judge Win Rate** | — | **82%** | 56 wins, 6 ties, 10 losses |
+| **Hidden Test Pass Rate** | 69% | **91%** | **+23 pt** (paired sign test, p=0.021) |
+| **Tasks Fully Solved** | 17% | **53%** | **+36 pt** (100% hidden test pass rate) |
+| **User Work Preserved** | — | **100%** | Byte-identical preservation on pre-existing WIP & untracked files |
+| **Dangling Plan References** | 0.03 | **0.00** | Strict grounding with automated repair (down from 0.53 in v0.12) |
+| **Execution Philosophy** | Fast, ungrounded (~2.4 min) | Grounded, verified (~12–19 min) | Fast lane cuts ~40–54% wall time on scoped bugfixes vs full lane |
+
+See the [comprehensive benchmark methodology and metrics](docs/BENCHMARK.md) for full task-by-task results, judge breakdowns, and trade-off analyses.
+
 ## Learn more
 
 - **[Full guide](docs/GUIDE.md)** — design philosophy, configuration, model/language settings,
   the review gate in detail, CLI validation, uninstalling, what Readyset deliberately doesn't do,
   and the full file/package layout.
+- **[Benchmark deep-dive](docs/BENCHMARK.md)** — methodology, per-task breakdown (T01–T12),
+  judge dimensions, request clarity impact, and resource trade-offs.
 - **[Brainstorming outside omp](resources/brainstorm-ai/README.md)** — write a brainstorm in
   Claude Cowork before you ever open omp.
 

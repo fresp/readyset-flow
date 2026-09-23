@@ -8,522 +8,95 @@ only had that much change in it.
 
 ## 0.15.0 - 2026-09-23
 
-Makes the post-Apply code-review turn risk-based instead of unconditional. The `v0.12` benchmark
-showed that turn is a large share of a run's cost, while review is what protects the test quality
-(91% judge win) and correctness (77%) that are Readyset's strengths — so review stays on risky
-changes and becomes skippable on low-risk ones. The default policy values below are **initial
-values pending benchmark data, not measured optima**; the review/apply split is already recorded
-by phase events, so the benchmark can tune them from real data.
+Introduces risk-based code review, open decision handling, bounded review repairs, and safe scope reconciliation.
 
 ### Added
-
-- **`readyset.review.mode: auto | always | never`** (default `auto`) in
-  `~/.omp/agent/config.yml`, plus a `--review auto|always|never` flag (the flag wins over config
-  for that run). `always` keeps the pre-0.14 behavior of reviewing every run; `never` skips the
-  turn and writes a stub; `auto` runs the review only when at least one **trigger** fires.
-- **A trigger evaluator** (`src/lib/readyset-review-trigger.ts`) driving `auto`: unjustified
-  post-Execute scope drift; an evidence conflict (a checked task whose latest `readyset_verify`
-  record exited non-zero); zero evidence records with at least one task checked; a diff over the
-  size thresholds; a changed path matching a sensitive-path pattern; and `partial`/`ambiguous`
-  clarity. Any one trigger is enough to review. Every trigger is evaluated and recorded whether
-  or not it fires, so the audit trail states what was actually observed.
-- **`readyset.review.fullLane: always | auto`** (default `always`) — a full-lane change keeps its
-  review regardless of triggers unless this is set to `auto`. Never exempts the fast lane.
-- **`readyset.review.maxLines` (default 150), `readyset.review.maxFiles` (default 5), and
-  `readyset.review.sensitivePaths`** (a list; default covers `auth/**`, `security/**`,
-  `**/migrations/**`, `schema/**`, `payment/**`, `crypto/**`, `**/*.pem`, `**/*.key`,
-  `.github/**`, `Dockerfile`, `docker-compose*.yml`, and their nested forms) — the `diff-size` and
-  `sensitive-path` thresholds. The list is deliberately broad: a false-positive trigger costs
-  exactly one review turn.
-- **`--review <change-id>`** — runs exactly one code-review turn on demand for an existing,
-  not-yet-archived change (overwriting any skip stub), then offers archive as usual. The escape
-  hatch when `auto` skipped review but a review is wanted before opening a PR. It uses
-  `fireTurnAndWait`, not the run's turn budget, so it always fires exactly one turn.
-- **A dependency-free glob matcher** (`src/lib/readyset-glob.ts`) for the sensitive-path patterns,
-  supporting `*` (not across `/`), `**` (across `/`, with a leading `**/` matching zero
-  directories), and `?`.
-- **`readyset.scope.protectedPaths`** (default `**/seed*`, `**/seeds/**`, `**/fixtures/**`,
-  `**/*.fixture.*`) and the **`protected-path` review trigger**. A changed path matching one of
-  these patterns warns after Apply and fires review even when the scope contract lists it with a
-  reason; the contract may name such a path only alongside that reason, and review judges whether
-  the change was warranted.
-- **`readyset.review.testPaths`** (default `test/**`, `tests/**`, `**/*.test.*`, `**/*.spec.*`,
-  `__tests__/**`) and test-aware **`diff-size`** evaluation. Matched test-only paths are excluded
-  from the trigger’s non-test file count; a large test suite alone is not a reason to review.
-- **Narrow verification-fix retry prompt.** When the Apply turn reports all tasks checked but
-  missing `_Verified:` notes, the send-back turn now fires `verificationFixTurnPrompt` instead of
-  re-dispatching the generic `applyTurnPrompt`. This directs the model to add the missing notes to
-  `tasks.md` without modifying application or test code, eliminating redundant implementation turns
-  that led to timeouts and wall-clock inflation.
-- **Pre-existing work and uncommitted edits protection.** `proposeTurnPrompt`, `applyTurnPrompt`,
-  and `SKILL.md` now explicitly instruct the model that uncommitted files, comments (e.g.
-  `// user was editing...`, `// user note...`), and untracked scratch notes are active user WIP.
-  Agents are barred from proposing cleanups or deleting pre-existing comments and hunks, and must
-  plan and edit around existing uncommitted work.
-- **Anti-overengineering constraints in Grill and Propose.** `grillTurnPrompt` and
-  `proposeTurnPrompt` instruct the model not to invent unrequested secondary systems. Identifier
-  headers or attributes (such as `x-api-key` or IP) used for rate limiting or grouping must be
-  treated strictly as bucket keys without adding unasked credential registries, key validation, or
-  401 UNAUTHORIZED responses.
-- **Bugfix doc boundaries and negative grounding.** For bugfix, refactor, or chore changes, prompts
-  now explicitly forbid adding or touching documentation files (`README.md`, `docs/*`) unless the
-  user requested it. Furthermore, negative references stating that a file will not be touched or
-  created must not include file extensions (e.g. writing "no changelog entry" rather than
-  "no CHANGELOG.md"), preventing plan-grounding validators from catching nonexistent paths as
-  dangling plan references. Grilling prompt also provides clear fallback to plain chat text when
-  the `readyset_ask` tool is unavailable, preventing extraneous tool discovery turns.
-- **Requested-doc contract repair.** The request and the brainstorm's decision-bearing sections
-  are scanned for README, CHANGELOG, and docs mentions, and any requested doc missing from
-  `## Files This Change Will Touch` is shown in the gate and added to the same one-shot
-  contract-repair turn, marked `(new)` when the file does not yet exist. A mention counts only
-  when its sentence carries an action verb (and no negation), so a doc merely cited as context is
-  never forced into the contract. Migration/release-note/deprecation mentions are advisory only —
-  warned, never repaired.
-- **A stay-in-repo rule and an outside-repo tripwire.** The readyset-bench leak check found the
-  `/readyset` agent searching the host filesystem for Readyset itself in 27/36 v0.12 runs (`find /`,
-  the npx cache, `~/.omp` config and session logs, home-dir notes). Every phase prompt and
-  `src/skill/SKILL.md` now carry a one-line **stay-in-repo rule** from a single shared constant
-  (`STAY_IN_REPO_RULE`), so the wording cannot drift between phases, and the wording that invited
-  the model to look up Readyset's own skill files is gone — the workflow is given by the prompt.
-  omp's extension API exposes `pi.on("tool_call")`, so the tripwire is real, not prompt-only:
-  `bash`/`read`/`grep`/`glob` calls whose arguments name an absolute path outside the repo or use
-  `find /`, `~` or `$HOME` append a `⚠ outside-repo access` entry to `CONTEXT.md`, ride the `gate`
-  `end` phase event as `outsideRepo`, and show in the gate panel and at the archive prompt.
-  Advisory only — nothing is blocked, and a host without the hook (older builds) is a no-op.
-- **A `review` field on the `review` `end` phase event** carrying the resolved mode, every
-  trigger evaluated (name, fired, observed value), the fired trigger names, and the outcome
-  (`ran` / `skipped-no-trigger` / `skipped-flag` / `on-demand`). The existing string `outcome`
-  values are unchanged; this is a separate, nested field.
-- **Open decisions.** `proposal.md` now carries a `## Open Decisions` section (one `### <question>`
-  block per decision, each with `Options` / `Recommended` / `Changes per option` lines) and a
-  `## Assumptions` section (each brainstorm `## Assumed` item restated with the chosen behavior).
-  The Propose prompt answers every question the repo or a lookup can settle, and forbids leaving
-  undecided items "carried open" anywhere else. `readOpenDecisions` / `readAssumptions` parse them;
-  `validateChange` flags (warning-only) any decision without a recommended option. The gate shows
-  the open-decision count and lists each question, the compiled review document gets an **Open
-  decisions** section (with the assumptions), and a **Resolve open decisions** CTA (`[O]`) refines
-  the change with the list so each recommendation can be picked. Approving with open decisions
-  remains possible — warn, never block — and the `gate` `end` phase event records the count.
-- **A single bounded review-fix turn.** `REVIEW.md` now ends with a `## Blocking` section (one
-  bullet per finding that violates a scenario, an explicit requirement, or a recorded decision; the
-  literal `none` when there are none). `readBlockingFindings` reads it; when it is non-empty the
-  run fires **exactly one** review-fix turn (on the apply phase model) to fix only those findings,
-  records a `review-fix` phase event with one of `fixed` / `partial` / `skipped-budget` /
-  `not-needed`, re-runs the post-Apply scope check (warning only, no second reconciliation), and
-  then goes straight to the archive offer. No second review runs.
-- **The Apply prompt applies the recommended option** for any open decision still unresolved at
-  approval, recording each as `- <decision> → <chosen option> → <why>` under a `## Decisions made
-  during Apply` section of `tasks.md`; the `open-decisions` review trigger fires when any remain,
-  and the archive prompt states `blocking: N found, M fixed`.
-- **Assumptions surfaced from grilling through the gate and tests.** Grilling and the fast-lane
-  Propose turn walk an edge-case checklist and record behavior-changing decisions under
-  `## Assumed`/`## Assumptions`; every such assumption gets its own `(assumed)` WHEN/THEN scenario,
-  `readAssumedScenarios` parses them, and the gate lists each before approval. A task that pins one
-  carries `(assumed)` in its description, and a test that pins one says so in its name or an
-  adjacent comment.
-- **Implementer-facing artifact checks.** `validateChange` now flags (warning-only, never blocking)
-  Readyset-internal workflow terms in proposal/design/tasks/spec bodies, while a trailing
-  `## Grounding` section may carry exploration-entry or `verified during planning` anchors without
-  tripping that check.
+- **Risk-based code review**: Added `readyset.review.mode: auto | always | never` and `--review <mode>` CLI flag. In `auto` mode, review triggers on high-risk conditions: scope drift, evidence conflicts, diff size thresholds, sensitive paths, or low clarity.
+- **On-demand review**: Added `--review <change-id>` to run a single review turn on demand for existing unarchived changes.
+- **Open decisions & assumptions**: Added `## Open Decisions` and `## Assumptions` tracking to proposals. Decisions reaching execution are applied cleanly with explicit rationale.
+- **Single bounded review fix**: If `REVIEW.md` reports blocking findings, fires exactly one bounded fix turn to resolve them without looping.
+- **Safe scope reconciliation**: Automatically reverts unintended modifications outside the scope contract after Apply while strictly preserving pre-existing WIP and untracked files.
+- **Bugfix doc scope discipline & negative plan grounding**: Barred bugfixes and refactors from modifying or adding documentation files unless explicitly requested. Negative plan references avoid citing concrete file extensions to prevent dangling reference false positives.
+- **Headless tool discovery fallback**: Grilling falls back immediately to structured chat questions when `readyset_ask` is absent, preventing extraneous tool discovery loops.
+- **Zero-dependency glob matcher**: Added `readyset-glob.ts` for sensitive and protected path pattern matching.
 
 ### Changed
-
-- **Removed the grill prompt's package-path pointer.** `grillTurnPrompt` no longer names
-  `src/skill/mattpocock-grilling.md`; it states the fact-finding rule directly. That prompt was the
-  one model-facing place naming a Readyset package path; neither tool description names one.
-- **The code-review prompt is diff-first.** It now names the run's changed paths up front and
-  instructs the turn to start from their diff, reading `proposal.md`, `design.md`,
-  `specs/**/spec.md`, and `tasks.md` for the scenarios and any *other* file only when the diff
-  needs context — rather than reading the repo. When triggers fired, the prompt names them and
-  asks the findings to focus there. The 0.12 WHEN/THEN-against-behavior rules, the 0.13.x scope
-  deviation judging, and the fast-lane proportionality note are unchanged.
-- **A skipped review writes an honest stub** to `REVIEW.md`
-  (`Review skipped (auto): no risk trigger`, or `Review skipped (never): readyset.review.mode =
-  never`, followed by every trigger and its observed value), and the archive prompt states the
-  skip plainly instead of claiming a review completed. The archive offer itself — its three
-  options and the archive phase events — is now one shared helper the main path and the on-demand
-  path both call, so they cannot drift.
-
-- **The review gate** now reconciles scope drift safely. Only a path that is (a) outside the
-  contract, (b) changed by **this run** (baseline-subtracted), and (c) absent from the change's
-  dirty baseline — i.e. not dirty before the run started — is ever offered for revert or deletion,
-  and that candidate list is computed in code and passed to the prompt (never the raw
-  out-of-contract set). With no dirty baseline at all (an older change, or a failed capture) no
-  revert is offered; the turn may only add `## Scope deviations` entries. Before the turn every
-  candidate is copied to `readyset/changes/<id>/reverted/<path>` and the backup is recorded in
-  `CONTEXT.md`. After it, hashes of every baseline-dirty and contract file are compared against a
-  pre-turn snapshot; anything the turn changed or deleted outside its candidate list is restored
-  byte-for-byte from that snapshot, logged loudly in `CONTEXT.md`, and surfaced at the archive
-  prompt.
-- **Minimal-diff and doc-contract wording.** The Apply/Propose prompts now forbid modifying seed,
-  fixture, or sample data in production paths, adding runtime self-checks/assertions to production
-  code, and changing existing tests' expectations unless the requested behavior changes them; the
-  Apply prompt also requires updating every doc the scope contract lists. The `no-evidence` review
-  trigger is now satisfied by a command-bearing `_Verified:` note as well as by a runtime
-  evidence record, and the glob matcher treats `**/` as zero-or-more directories at any position
-  and matches case-insensitively (which also affects `sensitivePaths`).
+- **Diff-first review**: The code-review prompt now analyzes changed file diffs directly against acceptance criteria rather than re-exploring the whole repo.
+- **Transparent review stubs**: When review is skipped under `auto` mode, writes an auditable stub documenting evaluated triggers instead of claiming a review completed.
 
 ### Fixed
-
-- **Doc-repair false positives, bullet open decisions, and the fix-turn prompt.** Requested-doc
-  repair now scans only the request text (`## Problem / Context`) and the brainstorm's
-  decision-bearing sections (`Scope`, `Acceptance Criteria`, `Decision`), and a doc counts only
-  when its sentence carries an action verb without a negation — so a README merely cited as
-  context is no longer forced into the scope contract, and migration/release-note/deprecation
-  mentions are advisory only. `readOpenDecisions` now parses top-level `- <question>` bullets
-  (inline or indented `Recommended:`), and `validateChange` warns when an `## Open Decisions`
-  section has content but no parsable decision. The review-fix prompt's duplicated seed/self-check
-  sentence and stray backtick are gone.
-
-- **Outside-repo tripwire false positives.** The tripwire no longer counts `grep`'s `pattern` (a
-  regex, never a path), `/dev/*`, or a redirection target like `> /dev/null`, and for bash it
-  counts an absolute token only when its first segment is a real top-level directory on the host
-  (checked once with `existsSync` and cached) — so an API repo's route strings (`/orders/:id`,
-  `/products`) no longer inflate the count. Paths under `/tmp` are reported under a separate
-  **tmp** category (`outsideRepoTmp` on the `gate` `end` event) and excluded from the headline
-  `outsideRepo` number.
-
-- **An explicit `--lane` now lists fast-lane brainstorms in the picker.** `--lane` only filled the
-  run's lane override, while the picker filter still keyed off `--fast` alone — so
-  `/readyset --lane fast`, the run that actually wants a fast-lane brainstorm, filtered the list to
-  empty and returned the "No full-lane brainstorms found" warning instead of opening the picker or
-  the gate. An explicit `--lane fast|full` is the operator's lane answer, so it now loads fast-lane
-  brainstorms too (`--lane full` still lets the operator pick one and runs it on the full lane, the
-  same way `--fast` behaves). The empty-picker warning and the flag description name `--lane`.
+- **Requested-doc repair accuracy**: Scans only request text and decision sections with action verbs, avoiding false positives on docs cited as context.
+- **Outside-repo tripwire**: Eliminated false positives on regex patterns, `/dev/*`, and URL route strings.
+- **Fast-lane picker visibility**: An explicit `--lane fast` now properly surfaces fast-lane brainstorms in the interactive picker.
 
 **Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.14.0...0.15.0
 
 ## 0.14.0
 
-A scope-and-size pass on top of 0.13.0, still driven by the `v0.12` full-matrix benchmark. It
-tightens the one dimension Readyset was still losing — scope discipline — at the before-Apply and
-after-Apply ends, keeps grilling to the questions that actually change the plan, makes the lane
-follow grilling's own signal, compacts prep phases conditionally, and makes the fast lane write a
-genuinely smaller artifact set with per-artifact budgets. Each change states a mechanism; the only
-measured figures cited are the existing v0.12 motivation numbers.
+Introduces dual execution lanes (Fast vs Full), value-of-information grilling, and per-artifact character budgets.
 
 ### Added
-
-- **Value-of-information questioning in grilling.** Every `readyset_ask` question now carries a
-  required `decision` field naming the plan decision it changes and how the plan differs per
-  answer. A round containing any question without a non-blank `decision` is refused before the
-  picker opens — and does not consume the round cap — with a result telling the model to decide
-  that question itself and record it under a new `## Assumed` section of the brainstorm instead.
-  The grilling prompt adds the same rule, plus "stop as soon as no open decisions remain, even in
-  round 1" and a count of open decisions after the fact-finding pass. A question whose answers all
-  lead to the same plan is an assumption, not a question: it is written to `## Assumed` so it is
-  reviewable rather than silently held.
-- **A clarity score on the brainstorm, and a clarity → lane rule.** Grilling now writes `clarity`
-  (`clear` = 0 open decisions after fact-finding, `partial` = 1–2, `ambiguous` = 3+ or an undefined
-  core behavior), `openDecisions`, `questionsAsked`, and — only when it applies — `riskFlag`
-  (`cross-cutting|migration|api-change|security`), plus a one-line `laneReason`, into the
-  brainstorm frontmatter. Code validates those fields (an unknown value reads as absent, so a
-  typo cannot silently change the lane) and recomputes a recommended lane: `clear` → fast,
-  `ambiguous` → full, `partial` → fast unless a risk flag escalates it to full. The picker shows
-  the clarity score and the recommendation when the two disagree.
-- **`readyset.lane.default: ask | auto | fast | full`** (default `ask`) in
-  `~/.omp/agent/config.yml`. `ask` keeps today's behavior (grilling asks the user for the lane
-  and the pick is recorded); `auto` accepts code's clarity → lane recommendation without
-  prompting and warns when it overrides the file's recorded lane; `fast`/`full` force that lane.
-  Precedence is `--lane` > `readyset.lane.default` > the brainstorm's recorded lane. The value is
-  hand-edited YAML (the `configure` wizard does not cover it).
-- **The `grill` phase event carries the signal.** The `grill` `end` event in `CONTEXT.md` now
-  includes a `grill` payload (`clarity`, `openDecisions`, `questionsAsked`, `recommendedLane`,
-  `laneReason`, `riskFlag`), and `PhaseEvent.laneSource` widens to
-  `flag | config-auto | user-pick | brainstorm` so the offline bench can tell an operator-forced
-  lane, a config-decided lane, a lane the user picked during grilling, and a pre-existing
-  brainstorm's own recorded lane apart.
-- **Every run records its effective lane and phase boundaries in `CONTEXT.md`.** `--fast` only
-  filters the picker; `--lane fast|full` is what forces the lane, and nothing recorded which lane a
-  run used. Each phase boundary (grill, explore, propose, refine, gate, apply, review, archive) is
-  now written as its own `<!-- readyset-phase -->` marker plus a one-line `json` fence, recording
-  the phase, a `start`/`end` edge, an ISO timestamp, the effective lane and its source
-  (`flag`/`config-auto`/`user-pick`/`brainstorm`), and where relevant the phase model and an
-  outcome. Phases that exit early still write their `end` via `try/finally`, and the fence is
-  scoped per entry so later braces (e.g. raw Refine feedback) can't corrupt earlier events.
-- **A wrong scope contract is repaired once, automatically, before the gate.** A
-  `## Files This Change Will Touch` path that doesn't exist and isn't marked `(new)` is flagged
-  (`scope refs: DANGLING …`), and after Propose (and after every Refine) Readyset fires at most one
-  repair turn that rewrites only that section, re-checks the planning boundary, then re-checks the
-  contract. The check also gained two cases it was missing — `(new)` on a file that already exists,
-  and `(delete)` on a file that doesn't (`(delete)` is a new marker). Remaining problems still only
-  warn; it never blocks.
-- **Per-artifact character budgets, with a bounded Trim turn.**
-  `readyset.artifacts.budget.<proposal|design|specs|tasks>` in `~/.omp/agent/config.yml` overrides a
-  lane's default (full: proposal 4,000 / design 5,000 / specs 6,000 total / tasks 4,000; fast:
-  proposal 4,000 / tasks 3,000). The Propose prompt states the budgets and the no-restating rules,
-  the gate panel shows an `artifacts: N chars (budget M)` line per artifact, and an overrun only
-  warns — except a file past **1.5×** its budget, which fires at most one planning-only Trim turn
-  (skipped when the turn budget is too tight) recorded as a `trim` phase event with before/after
-  sizes.
-- **`readyset.compact.minContextPercent` and `--compact auto|always|never`.** A phase-boundary
-  compaction now runs only when the host reports context usage at or above this share of the window
-  (default 25), so a fresh session skips it; `--compact always` restores the unconditional behavior
-  and `--compact never` suppresses every boundary. The summarization also runs under the phase's own
-  configured model where one is set.
+- **Dual execution lanes**: Brainstorms classify into `fast` (clear bugfixes/small tasks) and `full` (complex features/migrations). Fast lane writes compact artifacts (`proposal.md` and `tasks.md` only) and skips Explore.
+- **Value-of-information grilling**: Every grilling question must change a plan decision; non-differentiating questions are recorded as assumptions instead.
+- **Clarity-to-lane heuristics**: Automatically maps brainstorm clarity (`clear`, `partial`, `ambiguous`) to recommended execution lanes.
+- **Per-artifact character budgets**: Configurable character limits on planning artifacts with an automated single-turn trim when exceeded by 1.5×.
+- **Conditional boundary compaction**: Automatically compacts context at phase boundaries when context usage exceeds a configured threshold.
 
 ### Changed
-
-- **Apply is accountable to the scope contract.** Readyset's diffs ran **246 vs 107** lines, **5.6
-  vs 4.4** code files, and **0.72 vs 0.39** files outside expected scope against `/plan` on the
-  v0.12 matrix, and the post-Apply check only warned. Apply now gets explicit minimal-diff rules; a
-  file changed outside the contract with no justification is reconciled **once** after Execute
-  (revert it, or record it under `## Scope deviations` in `tasks.md`); the code-review turn judges
-  each deviation. Whatever remains still only warns, and phase events carry the drift counts and the
-  final diff size for the bench.
-- **The fast lane writes a genuinely smaller artifact set: `proposal.md` + `tasks.md` only.** The
-  v0.12 benchmark showed Readyset's planning output at 44,700 chars vs 10,031 for native `/plan`
-  (longer on all 12 tasks), much of it proposal/design/specs/tasks restating each other. The fast
-  lane now skips `design.md` and the spec delta; its acceptance scenarios move to a `## Acceptance`
-  section in `proposal.md` (each `- **WHEN** … **THEN** …` bullet with a `[S1]`, `[S2]`, … id that
-  `tasks.md` references). The lane is recorded on disk as a `lane:` line in `proposal.md`'s
-  frontmatter, so `validateChange`, `archiveChange`, the review overlay, and the standalone
-  `readyset-flow validate` CLI all agree with no run context.
-- **Prep phases compact at their own boundaries, conditionally.** Compaction also fires after
-  grilling, before **Explore**, and after Explore, before **Propose**, not just before Execute.
-  Everything each phase relies on is already on disk, so this is **expected** to cut prep-phase
-  token cost — pending the next benchmark. It only fires when context usage is at or above the
-  threshold (or when `--compact always` forces it), and each boundary records a `compact` phase
-  event so the effect is measurable next time.
+- **Fast-lane artifact compactness**: Replaced multi-file specifications with inline `## Acceptance` WHEN/THEN scenarios in `proposal.md`.
+- **Minimal-diff Apply discipline**: Enforced strict minimal-diff rules during Apply to minimize unneeded edits outside the scope contract.
 
 ### Fixed
-
-- **Turns are reserved for Apply and Review.** Contract repair now fires only while 2 turns remain
-  and scope reconciliation only while 1 does, so a nearly-spent run no longer burns its last turn
-  and ends with no `REVIEW.md`.
-- **Post-Apply contract semantics.** Once Apply has run, `checkScopeRefs` reads with post-Apply
-  semantics and the repair turn never fires (it would strip correct `(new)`/`(delete)` markers),
-  fixing false `NEW-BUT-EXISTS` / `DELETE-BUT-MISSING` when the gate reopens after "Address
-  findings first" or a Refine after Apply.
-- **Every gate start has a matching end.** A keep-context approval records a skipped compact
-  boundary plus the gate end, and both the approve and legacy compact paths record outcome
-  `approve`.
-- **Diff stats see staged changes** (`git diff HEAD --numstat`, falling back to plain `git diff`
-  when there is no HEAD), so a fully staged Apply counts.
-- **Directory contract entries resolve.** `exists()` now stats a path (a directory isn't "missing"),
-  and a contract entry ending in `/` or naming an existing directory matches anything under it.
-- **Scope contracts no longer drop non-JS paths.** The parser only accepted a hard-coded directory
-  or JS/MD/YAML extension whitelist and only stripped commentary after ` -- `, so `app/handler.go`,
-  `packages/core/index.ts`, `.github/workflows/ci.yml`, and `Makefile` never entered the contract.
-  The path is now the first token and the rest is commentary, whatever the separator.
+- **Reserved turns for Apply & Review**: Prevented repair turns from consuming the final turns required for execution and review.
+- **Post-Apply contract semantics**: Corrected contract checks so existing created files are not flagged as duplicates on gate reopen.
 
 **Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.13.0...0.14.0
 
 ## 0.13.0
 
-A quality-and-cost pass driven by the `v0.12` full-matrix benchmark (12 tasks × 3 reps × 2 arms).
-It tightens the one dimension Readyset still didn't win — scope discipline — at the two places it
-was still unchecked, closes the largest objective gap in the report (dangling file references), and
-targets the biggest number in the cost breakdown (prep-phase tokens) (expected, pending the
-next benchmark). Nothing here changes what the gate blocks on; where a check is added it warns, as the
-scope contract already did.
+Implements automated scope contracts, dangling reference repair, and prep-phase context compaction.
 
 ### Added
-
-- **Files the change will create must be marked `(new)`.** The section already listed existing
-  files and to-be-created files together with nothing distinguishing them, which is why an
-  existence check needs a marker. A trailing `(new)` (e.g. `- src/lib/thing.ts (new)`) now marks a
-  file the change creates; an unmarked path still means "must already exist", and the Propose prompt
-  teaches the convention.
-- **Scope is checked again after Apply.** The gate's scope check runs before Apply, so it only ever
-  saw what Propose changed — and Apply is where most of a change's file touches happen. A
-  post-Apply working-tree check now warns and names any out-of-contract file at the **Archive now?**
-  prompt, and records it in `CONTEXT.md`. Advisory: implementation legitimately touches more files
-  than planning did, so archive is still offered rather than blocked.
-- **Every run records its effective lane and phase boundaries in `CONTEXT.md`.** The v0.12 benchmark
-  ran `/readyset --fast`, but `--fast` only filters the picker — `--lane fast|full` is what forces
-  the lane, and nothing recorded which lane a run actually used. Each phase boundary (Grill, Explore,
-  Propose, Refine, gate, Apply, Review, Archive) is now written as its own
-  `<!-- readyset-phase -->` marker plus a one-line `json` fence, recording the phase, a `start`/`end`
-  edge, an ISO timestamp, the effective lane and its source (`flag`/`brainstorm`), and where relevant
-  the phase model and an outcome. readyset-bench's compile step can now split results by lane and
-  attribute session tokens/wall time to phases by timestamp. Advisory only — the existing
-  human-readable phase entries are unchanged and additional.
-- **Dangling contract references are flagged and repaired once, automatically, before the gate.**
-  Readyset named files it would modify that didn't exist at **0.53/run vs 0.03/run** for `/plan` — the
-  largest relative gap of any objective metric in the v0.12 report. A `## Files This Change Will
-  Touch` path that isn't marked `(new)` and doesn't exist is now flagged as
-  `scope refs: DANGLING …` in the gate panel and listed in a new **Scope** section of the review
-  document. The v0.12 data showed warnings alone barely move model behavior, so after the Propose
-  turn (and after every Refine turn) Readyset now fires **at most one** repair turn that rewrites
-  only that section to fix the offending paths, re-checks the planning boundary, and re-checks the
-  contract. The check reports three kinds — dangling, `(new)` on a file that already exists, and
-  `(delete)` on a file that doesn't — and the gate panel and review document show all three. A
-  `(delete)` marker is now understood (a `(delete)` path must exist before Apply and is allowed to
-  be gone afterward). The repair never loops and is skipped when the run has no turn budget left;
-  whatever remains still only warns. Recorded in `CONTEXT.md` and as a `contract-repair` phase
-  event.
-- **Apply is accountable to the scope contract, and pushed toward minimal diffs.** The v0.12
-  benchmark showed Readyset's diffs still ran far larger than `/plan`'s — lines changed **246 vs
-  107**, code files changed **5.6 vs 4.4**, files outside expected scope **0.72 vs 0.39** — and the
-  post-Apply check only warned, which the data showed barely moves behavior. The Apply prompt now
-  states explicit minimal-diff rules (contract files only; no unrequested refactors, renames,
-  reformatting, helper modules, or tests), and the Propose guide requires every task to map to a
-  spec scenario with the minimum file set. After Execute, a file changed outside the contract with
-  no `## Scope deviations` entry triggers **one** reconciliation turn that reverts it or records a
-  justification; whatever remains still only warns. `scope-reconcile` phase events carry
-  `outsideBefore`/`reverted`/`justified`/`unjustifiedAfter` counts, and the apply `end` event now
-  carries the final diff size (`files`/`added`/`deleted`), so readyset-bench can track both directly.
-  The code-review turn receives the deviation list and writes a `## Scope` section.
+- **Scope contract enforcement**: Added `## Files This Change Will Touch` to proposals, distinguishing new files with `(new)` and deletions with `(delete)`.
+- **Dangling reference detection & repair**: Automatically repairs invalid or missing file references in proposal contracts before reaching the review gate.
+- **Post-Apply scope accountability**: Validates working-tree changes against the proposal contract after Apply and surfaces deviations.
+- **Phase boundary telemetry**: Appends machine-parseable phase event markers in `CONTEXT.md` for benchmarking and auditability.
 
 ### Changed
-
-- **Planning phases compact conditionally at every boundary now, not only before Apply.** Prep
-  (Grill → Explore → Propose) was **16×** the plan arm's entire run in tokens — the single biggest
-  number in the cost breakdown — because each phase carried every prior phase's conversation forward
-  at full cache-read cost. Compaction now also fires before Explore (the brainstorm is already on
-  disk) and before Propose (`EXPLORATION.md` is), mirroring the pre-Apply compaction. It is
-  **expected** to reduce prep token cost (mostly cache reads); wall time is unlikely to change much,
-  and the effect on both cost and plan quality is **pending the next benchmark** — this is a
-  mechanism, not a measured outcome. It is now **conditional**: a boundary compacts only when the
-  reported context usage is at or above `readyset.compact.minContextPercent` (default 25), so a
-  fresh session with almost nothing to summarize no longer pays for a summarization turn, and a
-  `--compact auto|always|never` flag forces or disables it. `--compact never` disables every
-  boundary. The summarization also now runs under the phase's own configured model (via the
-  phase-model wrapper) where one is set — omp exposes no compaction-model parameter, so this is the
-  only supported way to influence which model produces the summary. Each boundary records a
-  `compact` phase event carrying its `boundary`, `outcome`, and before/after context percent, so the
-  effect is measurable in the next benchmark.
+- **Prep-phase compaction**: Compaction enabled before Explore and Propose to reduce context bloat from accumulated discussion.
 
 ### Fixed
-
-- **The scope contract no longer drops non-JS paths.** The parser gated every line on a hard-coded
-  directory whitelist (`src|test|tests|bin|examples|lib|docs|scripts|assets|resources|config`) plus
-  a root-level JS/MD/YAML extension whitelist, and only ever stripped commentary after a literal
-  ` -- `. So `app/handler.go`, `packages/core/index.ts`, `.github/workflows/ci.yml`, `Makefile`, and
-  any path with other trailing commentary (`— modified`, `(modified)`, `: note`) never entered the
-  contract at all — which meant the post-Apply check reported them OUT OF SCOPE the moment
-  implementation touched them, and the dangling check never saw them. The parser now reads the
-  first token as the path and treats everything after it as commentary, accepting any path shape
-  (directory separators, dotfiles, `name.ext`, known extensionless files and extensionless paths
-  inside a directory), recognizing numbered list items (`1. src/x.ts`), and finding `(new)` anywhere
-  in that commentary.
+- **Multi-language and non-JS path parsing**: Scope parser accepts any repository path structure regardless of file extension or directory naming.
 
 **Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.12.1...0.13.0
 
 ## 0.12.1
 
-- **The fast lane can reach the review gate again.** `reconcileStatuses` skipped every
-  brainstorm whose lane wasn't `full`, on the stated theory that a fast-lane brainstorm has no
-  change to reconcile against. The fast lane as it actually runs does write a change directory and
-  a proposal — and the skip was not harmless: the post-Propose gate check only opens the gate for a
-  brainstorm whose status is `proposed`, so **every fast-lane change dead-ended at "Propose doesn't
-  look finished" with no gate ever offered**. Measured on `readyset-bench` label `b1-subset-0.12`
-  (4 tasks × 3 reps): `lane=full → gate shown` in 7/7 runs, `lane=fast → gate shown` in 0/5 — a
-  perfect split. This is the actual source of the historical T11/T12 "gate bypass": the gate was
-  never shown, so the only way those runs reached code was the model continuing on its own.
-  The reconciliation now derives from the filesystem alone; the existing `changeState` guard already
-  leaves a fast-lane brainstorm with no change directory untouched, so the lane filter bought
-  nothing.
-- **That failure message now names the real cause.** It claimed "proposal.md not found or empty"
-  for all three failing conditions (no matching brainstorm / status not proposed / empty proposal),
-  which sent a live investigation hunting for a file that was on disk the whole time.
+### Fixed
+- **Fast-lane gate reachability**: Fixed status reconciliation bug that prevented fast-lane changes from displaying the review gate.
+- **Clear failure diagnostics**: Improved error messaging when proposal files are missing or incomplete.
 
 **Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.12.0...0.12.1
 
 ## 0.12.0
 
-A hardening release driven by end-to-end benchmarking (`/readyset` vs omp `/plan` vs Command Code
-plan mode, plus a 9-task paired run): phase discipline is now enforced structurally instead of by
-prompt text alone, the review gate fails closed, per-phase cost has real ceilings, and the docs say
-only what the measurements support. Every item below is a behavior or prompt change traced to a
-specific benchmark observation.
+Hardens workflow integrity with structural gate invariants, fail-closed review decisions, and per-phase cost controls.
 
-### Gate integrity
+### Added
+- **Fail-closed review gate**: Default action at the review gate is Discard, ensuring deliberate operator approval before any code executes.
+- **Propose phase boundary invariant**: Enforces that planning turns write only to designated change directories; unauthorized workspace modifications immediately abort the run.
+- **Per-phase model overrides**: Added `--phase-model` to assign different models to Grill, Explore, Propose, Apply, and Review.
+- **Automatic compaction before Apply**: Clears planning turn history while retaining disk artifacts, cutting cache-read token costs.
+- **Unobservable acceptance criteria checks**: Flags WHEN/THEN scenarios that assert internal code state rather than externally verifiable behavior.
+- **Scope contract foundation**: Added `## Files This Change Will Touch` section to proposals with working-tree change validation at the gate.
+- **Dual lane foundation**: Fast lane folds Explore into Propose and trims artifact overhead for small changes.
 
-- **The Propose turn can no longer implement and ship the change.** Two benchmark runs (T11, T12)
-  wrote implementation code out of the Propose turn, archived the change themselves, and finished
-  with no approval — the prompt said "planning artifacts only", nothing enforced it. After Propose
-  fires, Readyset now snapshots the working tree (`git status --porcelain`) and stops with an error
-  if anything outside `readyset/changes/<id>/` and `.ai/brainstorms/` changed, or if the change
-  directory moved into `archive/` on its own. A violation writes a `STOPPED` entry to `CONTEXT.md`
-  naming the exact paths and **offers no review gate** — the run is over.
-- **The review gate is fail-closed.** "Discard" is now the first option in the classic menu, and
-  nothing runs unless an Approve option is deliberately picked. Previously "Approve & Execute" was
-  first and relied on falsy/missing selections falling through to discard — safe only while every
-  host resolves a selection explicitly. A test pins it: cancelling at the gate fires zero agent
-  turns and leaves `tasks.md` untouched.
-- **Phase budgets, and honest phase accounting in `CONTEXT.md`.** The turn budget counts fired
-  turns, but one turn can churn millions of tokens in tool calls without spending more budget
-  (T12's Explore alone was 51% of a 17.6M-token run). Each phase now has a wall-clock ceiling
-  (default 20 min); Explore and Propose record their elapsed time, and a breach warns visibly
-  instead of failing silently. `CONTEXT.md` entries can no longer claim a clean Propose when the
-  working tree says otherwise.
+### Changed
+- **Behavioral code review**: Evaluates diffs and acceptance scenarios against external behavior rather than checking unit test suite self-reports alone.
+- **Evidence-based grounding trail**: `EXPLORATION.md` logs commands and findings as an auditable trail for proposal claims.
 
-### Cost
-
-- **Per-phase model overrides.** Grill+Explore produced 39% of fresh input at the worst
-  cost-per-value in the benchmark, and `--model` pinned one model for the whole run. New
-  `--phase-model <phase>=<spec>` (repeatable) and `readyset.model.phases.<phase>` config, resolved
-  per phase as flag > config > run pin, for `grill|explore|propose|apply|review` (Refine rides the
-  propose override). An override that fails to resolve warns and falls back to the run model — a
-  phase model is a cost optimization, never a reason to stop the run.
-- **Approve & Execute compacts by default.** Explore/Propose context dominated Apply and Review
-  cost (T01: max context 154k, ~76% of all tokens as cache reads) while everything those phases
-  produced is already persisted under `readyset/changes/<id>/` — Apply re-reads artifacts from
-  disk. **`Approve & Compact` is replaced by `Approve & Execute, keep context`**, the escape hatch
-  in the other direction; sidebar CTAs move from `A/C/R/D` to `A/K/R/D` (`compact` is still
-  accepted from older sidebar builds). A missing or failed `ctx.compact` degrades to plain
-  execution.
-- **Grilling researches once up front, not every round.** One session made 17 bash + 16 read calls
-  spread across rounds for what one upfront pass covers; rounds already batch up to 4 questions, so
-  the cost was per-round research, not round count. Rounds, options, and the no-passive-answer rule
-  are unchanged.
-
-### Claims, scope, and quality
-
-- **The scope contract.** Readyset diffs ran 2× the plan arm's lines, 0.89 files outside expected
-  scope vs 0.42, and one run grew an unasked-for 160-line file — `scope_discipline` was the one
-  dimension Readyset did not win. `proposal.md` must now carry a `## Files This Change Will Touch`
-  section; the gate checks the working tree against it and shows match / OUT OF SCOPE / unknown.
-  Paths under `readyset/` and `.ai/brainstorms/` are always in scope; an absent section is "no
-  contract", never a silent pass. It **warns, never blocks**.
-- **Unobservable acceptance criteria are flagged.** A run shipped "WHEN src/registry.ts is
-  inspected THEN it contains no direct filesystem calls" and validation passed it, though no test
-  could ever check it. `validateChange` now flags requirements whose THEN names only a code
-  property, with no externally checkable signal (exit code, stdout/stderr, HTTP status, file
-  content, command result). Still structural, and the summary keeps its `(structural check)`
-  suffix.
-- **The code review checks behavior, not the suite.** One run's own test asserted the bug it
-  introduced, so "do the tests pass" would confirm it. The review turn now checks scenario
-  conformance against the WHEN/THEN behavior — run the code, read the diff, exercise the endpoint
-  — and distrusts any expected value that could only have come from the implementation under
-  review.
-- **Grounding is documented as auditability, not quality.** Two independent benchmarks measured
-  Readyset's plans as no better grounded than a single read-only pass (~50% in blind judging,
-  twice). The README/GUIDE no longer imply otherwise: `EXPLORATION.md` is an auditable trail, and
-  the Propose prompt requires every repo claim to anchor to a numbered exploration entry or a
-  "verified during planning" note.
-- **"Fresh-context code review" was never true, and is no longer claimed.** The review turn shares
-  the session context — omp's extension API offers no subagent/detached-turn surface. README,
-  GUIDE, SKILL.md and code comments now say "separate turn with adversarial framing", which is the
-  actual mitigation.
-
-### The lane
-
-- **The lane is a real run input, and fast lane actually runs light.** Previously the lane only
-  filtered the brainstorm picker and labeled it — the workflow was identical either way. Grilling
-  now proposes a lane with a one-line reason and the user picks; `--lane fast|full` forces it for
-  the run (flag wins over the file); the picker shows the effective lane. Fast lane folds Explore
-  into Propose (no separate turn; targeted reads noted inline), caps Propose at a tight plan, and
-  skips mutation-testing-style review probes. Full lane is unchanged. The lane trims **volume**,
-  never the behavior-changing questions — the T01/T10 wins came from exactly those.
-
-### Fixes
-
-- **The gate invariant and scope check no longer flag pre-existing repo state as this change's
-  own.** The helper feeding both never diffed against a baseline — it was a raw `git status` read —
-  so any file dirty for unrelated reasons (a WIP edit elsewhere, an untracked scratch note) got
-  misattributed to the current change: a hard stop at the gate for a well-behaved run, or a false
-  OUT-OF-SCOPE warning on every gate render. What was already dirty is now captured once, right
-  after the change directory is scaffolded (first capture wins; never widened), stored inside
-  `CONTEXT.md` so it rides the existing append path and archives with the change. Old changes with
-  no baseline keep the old behavior rather than crashing.
-- **The baseline survives later `CONTEXT.md` writes.** The baseline JSON is now parsed between the
-  fence markers the writer itself created, instead of from the first `{` to the last `}` in the
-  rest of the file. That "last brace" scan would break the moment anything appended later contained
-  a `}` — and Refine appends raw user feedback verbatim, so *"make it return `{status:'ok'}`"*
-  silently emptied the baseline and restored the bug above for the rest of the run.
+### Fixed
+- **Pre-existing repo state isolation**: Working-tree checks subtract the pre-existing dirty baseline so unrelated WIP files are not attributed to the current change.
 
 **Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.11.2...0.12.0
 

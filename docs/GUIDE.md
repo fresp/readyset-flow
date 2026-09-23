@@ -185,6 +185,9 @@ own native multi-question dialog, your recommended answer highlighted, with room
 or discuss instead. The round cap (4 by default) is enforced in code: once hit, the tool stops
 opening the dialog and the model checks in via plain text. Interactive-mode only; in RPC/ACP/print
 modes, or an omp build without it, grilling falls back to a plain-chat back-and-forth, same rules.
+When `readyset_ask` is absent from the model's available tools, grilling falls back immediately to
+asking structured questions directly in chat with explicit options and recommended picks — the prompt
+expressly forbids searching the filesystem, process table, or network for the missing tool.
 Either way it ends once the model writes the brainstorm file and tells you to run `/readyset`
 again to pick it up.
 
@@ -553,6 +556,17 @@ Picks a brainstorm, then depending on its status:
       `fixed` / `partial` / `skipped-budget` / `not-needed`, and the archive prompt states
       `blocking: N found, M fixed`. With no turn budget left it records `skipped-budget` and only
       warns.
+    - **Safe scope reconciliation & WIP preservation.** When files are touched outside the
+      scope contract during Apply, Readyset checks whether they can be safely reconciled. Files not
+      part of the pre-existing dirty baseline or contract are reverted, while pre-existing user WIP,
+      untracked files, and legitimate in-scope edits are strictly preserved (enforcing exact byte
+      identity on untouched workspace files).
+    - **Bugfix doc boundaries & negative grounding.** For bugfixes and targeted refactors, prompt
+      rules explicitly bar modifying or adding documentation files (`README.md`, `docs/*`) to
+      `## Files This Change Will Touch` unless the user explicitly requested doc updates.
+      Additionally, negative plan assertions (confirming that an unrelated file will not be changed)
+      avoid citing real file extensions (e.g. stating "no changelog entry" rather than "no CHANGELOG.md")
+      so automated grounding scanners do not falsely report dangling path references.
 
 ## Uninstall
 
@@ -657,6 +671,8 @@ src/
     readyset-brainstorm.ts   shared helpers: frontmatter parsing, status reconciliation, lane detection
     readyset-spec.ts         Readyset's own change-artifact format: scaffold/validate/progress/archive
     readyset-omp-config.ts   reads omp's own ~/.omp/agent/config.yml for a default --model fallback
+    readyset-review-trigger.ts  risk-based review trigger evaluation and policy (auto/always/never)
+    readyset-glob.ts         zero-dependency glob pattern matching for sensitive/protected paths
     readyset-review-overlay.ts  the Sidebar view Component — pure layout function + a
                              ctx.ui.custom()-driven overlay, zero runtime dependency on @oh-my-pi/pi-tui
     readyset-structural-check.ts  the shared "(structural check)" summary wording validateChange
