@@ -63,6 +63,23 @@ verification, not just a claim. The code-review turn is risk-based: it runs auto
 risky changes and is skipped, with an honest stub, when nothing raises a flag (`--review always`
 forces it, `--review <id>` runs it on demand).
 
+## Benchmark
+
+Readyset is evaluated against native `/plan` using a 12-task headless benchmark suite spanning
+bugfixes, storage migrations, cross-cutting refactors, and ambiguous feature requests:
+
+| Metric | `/plan` (native) | `/readyset` | Improvement |
+|---|---:|---:|---|
+| **Code Judge Win Rate** | — | **91%** | 65 wins, 1 tie, 6 losses (blind normalized judging) |
+| **Planning Judge Win Rate** | — | **82%** | 56 wins, 6 ties, 10 losses |
+| **Hidden Test Pass Rate** | 69% | **91%** | **+23%** (paired sign test, p=0.021) |
+| **Tasks Fully Solved** | 17% | **53%** | **+36%** (100% hidden test pass rate) |
+| **User Edits Preserved** | — | **100%** | Exact byte-identity on pre-existing WIP & untracked files |
+| **Dangling Plan References** | 0.53 | **0.00** | Strict grounding to real repository file paths |
+| **Fast-Lane Execution Duration** | baseline | **~40–54% faster** | Accelerated execution on clear bugfixes and scoped tasks |
+
+See the [benchmark methodology and details](https://github.com/fresp/readyset-flow) for comprehensive metrics.
+
 ## Learn more
 
 - **[Full guide](docs/GUIDE.md)** — design philosophy, configuration, model/language settings,
