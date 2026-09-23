@@ -188,8 +188,11 @@ const PROPOSAL_GUIDE_BULLET = `- proposal.md — must have a "## Why" section (1
   and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
   arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
   the change actually needs — nothing speculative. A file not on this list may not
-  be written during Apply without asking first. Every doc the request or brainstorm asks for
-  (README, CHANGELOG, docs/…) must be in this contract — list it, marking a new file "(new)".
+  be written during Apply without asking first. Every doc the user or brainstorm explicitly asked for
+  must be in this contract — list it, marking a new file "(new)". For bugfix or refactor tasks, do
+  NOT add or touch documentation files (README, docs) unless explicitly requested. Never cite
+  nonexistent file paths with extensions like \`CHANGELOG.md\` when stating absence (write "no changelog entry",
+  not "no CHANGELOG.md"), or the grounding scanner flags it as a dangling reference.
   Migration/release-note/deprecation mentions join the contract only when they match an existing file.
   Also add a \`## Open Decisions\` section (one \`### question\` block as specified in the prompt
   above, or the single line "none") and a \`## Assumptions\` section (one \`- <assumed decision> —
@@ -380,7 +383,16 @@ export function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", 
 		"key strictly as a bucket-identifier string used to group requests — do NOT implement key " +
 		"validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an " +
 		"explicit requirement. When in doubt, leave it out; an unrequested auth layer is a scope violation, " +
-		"not thoroughness.\n" +
+		"not thoroughness.\n\n" +
+		"Bugfix and refactor doc boundary: if this change is a bugfix, refactor, or chore, NEVER touch " +
+		"documentation files (`README.md`, `CHANGELOG.md`, `docs/*`) or add them to `## Files This Change Will Touch` " +
+		"unless documentation was explicitly requested in the prompt. Do not invent doc updates for code fixes.\n\n" +
+		"Negative plan grounding rule: every path mentioned in proposal.md, design.md, or tasks.md is parsed by " +
+		"the grounding validator. When stating that something will NOT be changed or does not exist (e.g. no changelog, " +
+		"no version bump, no new test files), NEVER write file names with extensions like `CHANGELOG.md` or `README.md` " +
+		"or paths like `src/...` if that file does not exist in the repo. Mentioning a non-existent file name with an " +
+		"extension — even when stating absence (e.g. 'no CHANGELOG.md') — flags it as a dangling plan reference. Write " +
+		"'no changelog entry', 'no version bump', or 'no docs update' without file extensions.\n" +
 		"Do not implement code in this turn — planning artifacts only." +
 		(lane === "fast" ? fastLaneProposeSuffix() : "")
 	);
@@ -848,16 +860,17 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 	return withRepoRule(
 		"Grill this raw idea into a decided Readyset brainstorm file — interrogate it, " +
 			`don't just accept it. Ask only questions whose answer changes the plan. Raw idea from the user: "${ideaText}"\n\n` +
-			"Use the `readyset_ask` tool for EVERY round of questions — do not write '❓ Q1 ...' as plain chat text. " +
-			"Give it 2 or more real options per question and mark your own recommended one via recommendedIndex, so " +
-			"the user picks or overrides rather than starting from a blank page. You can keep calling `readyset_ask` " +
-			"round after round in this same turn — you don't need to end your turn between rounds. Keep going until " +
-			"the design is genuinely settled, or until the tool tells you the round cap was hit (then check in: " +
+			"If the `readyset_ask` tool is available in your tools list, call it for questions with 2+ real options " +
+			"per question and mark your own recommended one via recommendedIndex, so the user picks or overrides rather " +
+			"than starting from a blank page. You can keep calling `readyset_ask` round after round in this same turn — " +
+			"you don't need to end your turn between rounds. If `readyset_ask` is NOT in your available tools, or if it " +
+			"reports that the structured picker is unavailable, ask your questions directly in plain chat text formatted " +
+			"with numbered options and your recommended pick. NEVER search the filesystem, network, or process table " +
+			"for `readyset_ask`.\n\n" +
+			"Keep going until the design is genuinely settled, or until the tool tells you the round cap was hit (then check in: " +
 			"summarize what's decided, name what's still open, ask in plain chat whether to keep grilling or write " +
 			"the brainstorm now with the rest under Open Questions — pace check only, not permission to accept a " +
-			"passive answer). If the tool reports the user chose to discuss instead of picking, or that the " +
-			"structured picker isn't available this session, continue that round in plain chat text instead, then go " +
-			"back to `readyset_ask` for the next round once it's resolved. Rules:\n" +
+			"passive answer). Rules:\n" +
 			"- Every `readyset_ask` question MUST carry a `decision` field naming the plan decision it changes and how " +
 			"the plan differs per answer, in one short sentence. A question whose answers would all lead to the same " +
 			"plan must NOT be asked — decide it yourself and record it under a `## Assumed` section in the brainstorm " +
@@ -868,13 +881,13 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"questions answerable right now, all in one round.\n" +
 			"- Before asking anything, walk this edge-case checklist and note which items this idea actually " +
 			"touches: empty/missing values; case sensitivity; boundaries (inclusive/exclusive, time zones, " +
-			"rounding); error codes/messages for invalid input; backward compatibility/deprecation; docs and " +
-			"release artifacts (README, CHANGELOG, versioning); how verification is committed (tests in the " +
-			"suite vs a scratch script; relative vs absolute perf thresholds). For each item that applies, ask " +
-			"only if the answer changes the plan AND the repo cannot settle it — otherwise decide it yourself and " +
-			"record it under `## Assumed` with the concrete behavior chosen (`- <decision> — <behavior> — because " +
-			"all answers led to the same plan`). This is the same value-of-information rule as everywhere else in " +
-			"this prompt, applied to the checklist.\n" +
+			"rounding); error codes/messages for invalid input; backward compatibility/deprecation; release " +
+			"artifacts (versioning or docs ONLY if explicitly requested by the user — never scope doc updates for " +
+			"pure bugfixes); how verification is committed (tests in the suite vs a scratch script; relative vs " +
+			"absolute perf thresholds). For each item that applies, ask only if the answer changes the plan AND the " +
+			"repo cannot settle it — otherwise decide it yourself and record it under `## Assumed` with the concrete " +
+			"behavior chosen (`- <decision> — <behavior> — because all answers led to the same plan`). This is the same " +
+			"value-of-information rule as everywhere else in this prompt, applied to the checklist.\n" +
 			"- After the fact-finding pass, count *open decisions* — choices facts cannot settle that change scope, " +
 			"behavior, or interfaces. Stop as soon as no open decisions remain, even in round 1; the round cap is a " +
 			"ceiling, not a target.\n" +
@@ -902,6 +915,11 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an " +
 			"explicit requirement of the idea. Ask if a real auth requirement seems implied; never " +
 			"assume one into the plan.\n" +
+			"- Working tree and scope discipline: pre-existing uncommitted changes, stray comments in code (e.g. " +
+			"`// user note...`), and untracked files are the user's active work in progress — never treat them as noise " +
+			"to clean up. For bugfix or refactor tasks, do NOT propose, scope, or assume updates to documentation " +
+			"(README, notes, etc.) unless the user explicitly requested documentation. When recording assumed decisions, " +
+			"never cite non-existent file names with extensions like `CHANGELOG.md` (write 'no changelog entry' without `.md`).\n" +
 			(preferredLanguage
 				? `- Preferred language for this discussion: ${preferredLanguage}. Write every question and option ` +
 					"text you pass to `readyset_ask`, and any plain-chat fallback text, in that language from the very " +

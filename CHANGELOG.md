@@ -65,6 +65,13 @@ by phase events, so the benchmark can tune them from real data.
   headers or attributes (such as `x-api-key` or IP) used for rate limiting or grouping must be
   treated strictly as bucket keys without adding unasked credential registries, key validation, or
   401 UNAUTHORIZED responses.
+- **Bugfix doc boundaries and negative grounding.** For bugfix, refactor, or chore changes, prompts
+  now explicitly forbid adding or touching documentation files (`README.md`, `docs/*`) unless the
+  user requested it. Furthermore, negative references stating that a file will not be touched or
+  created must not include file extensions (e.g. writing "no changelog entry" rather than
+  "no CHANGELOG.md"), preventing plan-grounding validators from catching nonexistent paths as
+  dangling plan references. Grilling prompt also provides clear fallback to plain chat text when
+  the `readyset_ask` tool is unavailable, preventing extraneous tool discovery turns.
 - **Requested-doc contract repair.** The request and the brainstorm's decision-bearing sections
   are scanned for README, CHANGELOG, and docs mentions, and any requested doc missing from
   `## Files This Change Will Touch` is shown in the gate and added to the same one-shot
