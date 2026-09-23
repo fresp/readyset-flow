@@ -68,17 +68,18 @@ forces it, `--review <id>` runs it on demand).
 Readyset is evaluated against native `/plan` using a 12-task headless benchmark suite spanning
 bugfixes, storage migrations, cross-cutting refactors, and ambiguous feature requests:
 
-| Metric | `/plan` (native) | `/readyset` | Improvement |
+| Metric | `/plan` (native) | `/readyset` (0.15.0) | Note |
 |---|---:|---:|---|
 | **Code Judge Win Rate** | — | **91%** | 65 wins, 1 tie, 6 losses (blind normalized judging) |
 | **Planning Judge Win Rate** | — | **82%** | 56 wins, 6 ties, 10 losses |
-| **Hidden Test Pass Rate** | 69% | **91%** | **+23%** (paired sign test, p=0.021) |
-| **Tasks Fully Solved** | 17% | **53%** | **+36%** (100% hidden test pass rate) |
-| **User Edits Preserved** | — | **100%** | Exact byte-identity on pre-existing WIP & untracked files |
-| **Dangling Plan References** | 0.53 | **0.00** | Strict grounding to real repository file paths |
-| **Fast-Lane Execution Duration** | baseline | **~40–54% faster** | Accelerated execution on clear bugfixes and scoped tasks |
+| **Hidden Test Pass Rate** | 69% | **91%** | **+23 pt** (paired sign test, p=0.021) |
+| **Tasks Fully Solved** | 17% | **53%** | **+36 pt** (100% hidden test pass rate) |
+| **User Work Preserved** | — | **100%** | Byte-identical preservation on pre-existing WIP & untracked files |
+| **Dangling Plan References** | 0.03 | **0.00** | Strict grounding with automated repair (down from 0.53 in v0.12) |
+| **Execution Philosophy** | Fast, ungrounded (~2.4 min) | Grounded, verified (~12–19 min) | Fast lane cuts ~40–54% wall time on scoped bugfixes vs full lane |
 
-See the [benchmark methodology and details](https://github.com/fresp/readyset-flow) for comprehensive metrics.
+See the [comprehensive benchmark methodology and metrics](docs/BENCHMARK.md) for full task-by-task results, judge breakdowns, and trade-off analyses.
+
 
 ## Learn more
 
