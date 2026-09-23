@@ -60,7 +60,10 @@ Each phase exists to catch something the previous one is bad at catching on its 
    self-checks/assertions to production code; and never change an existing test's expectations
    unless the requested behavior changes them. A task is only checked off once something actually
    verified it (a test run, a curl, a script execution) — not once code was written that's
-   expected to work. See "The `_Verified:` note" below.
+   expected to work. See "The `_Verified:` note" below. Pre-existing uncommitted changes, stray
+   comments (`// user was editing...`, `// user note...`) and untracked files are the user's active
+   work in progress: never clean them up, delete them, or strip them when editing a file — edit
+   around them and keep every pre-existing comment and hunk intact.
 
 5. **Code review** (`REVIEW.md`) — its own turn, after Apply, before Archive. It is told
    explicitly that its job is to find problems, not confirm the work — the turn that just
@@ -107,7 +110,8 @@ I actually looked at" attached does not belong in this file.
   the request or brainstorm asks for (README, CHANGELOG, docs/…) must be listed here, marked
   `(new)` when the change creates it; migration/release-note/deprecation mentions join the
   contract only when they match an existing file. During Apply, every listed doc must actually
-  be updated.
+  be updated. A pre-existing dirty or untracked file is never added to this contract to tidy it —
+  the contract names the files the change writes, not the files that happen to be modified.
 - `## Acceptance` — **fast lane only**; the spec delta's replacement. One `- **WHEN** … **THEN** …`
   bullet per scenario, each with a `[S1]`, `[S2]`, … id.
 - `## Open Decisions` — every decision that is still undecided, one `### <question>` block each

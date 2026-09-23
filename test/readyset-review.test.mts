@@ -494,6 +494,10 @@ await test("verification gate: missing _Verified notes sends back for another ap
     "should have surfaced the missing-verification gate",
   );
   assert.equal(fakePiWrap.calls.length, 3); // apply, apply-again, code-review (no re-propose)
+  // The send-back retry must NOT re-send the full apply prompt — it fires the narrow verification-fix
+  // prompt that forbids code changes (the wall-time / timeout fix).
+  assert.match(fakePiWrap.calls[1].prompt, /Implementation is already finished\. Do NOT modify any code\./);
+  assert.doesNotMatch(fakePiWrap.calls[1].prompt, /Implement the Readyset change "unverified"/);
   assert.ok(fakeUiWrap.notifications.some((n) => /Archived to/.test(n.message)));
 });
 
@@ -4771,6 +4775,7 @@ await test("stay-in-repo rule: every phase prompt and SKILL.md carry it", async 
     ["contract-repair", mod.contractRepairPrompt(["p"])],
     ["trim", mod.trimPrompt([{ file: "proposal", chars: 1, budget: 1 }] as any)],
     ["scope-reconcile", mod.scopeReconcilePrompt("x", ["a.ts"])],
+    ["verification-fix", mod.verificationFixTurnPrompt("x", 2, 3)],
   ];
   for (const [name, prompt] of prompts) {
     assert.match(prompt, /Work only inside the current repository/, `${name} prompt carries the rule`);
@@ -4781,6 +4786,32 @@ await test("stay-in-repo rule: every phase prompt and SKILL.md carry it", async 
   const grill = mod.grillTurnPrompt("idea", "2026-01-01", "ask");
   assert.doesNotMatch(grill, /mattpocock\/skills style/);
   assert.doesNotMatch(grill, /brainstorm-ai skill's own closing/);
+});
+
+await test("prompts: WIP preservation and anti-overengineering constraints are present", async () => {
+  const mod = await loadMod();
+  const propose = mod.proposeTurnPrompt({ changeId: "x", file: ".ai/brainstorms/x.md" } as any);
+  const apply = mod.applyTurnPrompt("x");
+  const grill = mod.grillTurnPrompt("idea", "2026-01-01", "ask");
+
+  // Requirement 1: dirty tree is user WIP; never tidy it / never list untouched files.
+  assert.match(propose, /never add an untouched dirty or untracked file to `## Files This Change Will Touch`/);
+  assert.match(propose, /user note/);
+  assert.match(apply, /keep every pre-existing comment, user note/);
+  assert.match(apply, /never strip, reword, reformat, or delete a stray comment/);
+
+  // Requirement 2: the mandatory note rule leads the apply prompt.
+  const applyIdx = apply.indexOf("MANDATORY: every task you complete");
+  const implIdx = apply.indexOf("Implement the Readyset change");
+  assert.ok(applyIdx >= 0, "the mandatory _Verified: rule is present");
+  assert.ok(implIdx >= 0 && applyIdx < implIdx, "the mandatory rule precedes the implement instruction");
+  assert.match(apply, /will stop and send this change back/);
+
+  // Requirement 3: no phantom auth/401 unless explicitly required.
+  for (const [name, prompt] of [["propose", propose], ["grill", grill]] as const) {
+    assert.match(prompt, /do NOT implement key validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an/, `${name} forbids phantom auth`);
+    assert.match(prompt, /bucket-identifier string/i, `${name} treats the key as a bucket id`);
+  }
 });
 
 await test("outside-repo tripwire: classifies outside-repo calls and ignores in-repo ones", async () => {

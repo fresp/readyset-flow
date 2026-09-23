@@ -367,8 +367,21 @@ export function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", 
 		"directly after the THEN (e.g. `#### Scenario: empty sort is default order (assumed)`). An " +
 		"assumption with no scenario is a decision the tests cannot see.\n\n" +
 		"If EXPLORATION.md surfaced something the brainstorm didn't anticipate (a submodule it didn't mention, a config " +
-		"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it. Do not " +
-		"implement code in this turn — planning artifacts only." +
+		"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it." +
+		"\n\nThe working tree may already be dirty: pre-existing uncommitted changes, stray comments " +
+		"(e.g. `// user was editing...`, `// user note...`), and untracked files are the user's ACTIVE work " +
+		"in progress, not leftovers. NEVER propose cleaning up, removing, or deleting them, and never add an " +
+		"untouched dirty or untracked file to `## Files This Change Will Touch` just to tidy it — the " +
+		"contract names files this change writes, not files that merely exist. Plan to edit AROUND them: " +
+		"read the current file content and make your change fit it, leaving every pre-existing comment and " +
+		"uncommitted hunk exactly as you found it.\n\n" +
+		"Scope discipline: do NOT invent secondary systems that were not requested. If a task asks " +
+		"for rate limiting, throttling, or grouping by a key/header (e.g. `x-api-key`) or by IP, treat that " +
+		"key strictly as a bucket-identifier string used to group requests — do NOT implement key " +
+		"validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an " +
+		"explicit requirement. When in doubt, leave it out; an unrequested auth layer is a scope violation, " +
+		"not thoroughness.\n" +
+		"Do not implement code in this turn — planning artifacts only." +
 		(lane === "fast" ? fastLaneProposeSuffix() : "")
 	);
 }
@@ -401,6 +414,10 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 			openDecisions.map((d) => `- ${d.question} — recommended: ${d.recommended ?? "(none stated)"}`).join("\n")
 		: "";
 	return withRepoRule(
+		"MANDATORY: every task you complete — every `- [ ]` you turn into `- [x]` in " + paths.tasks + " — " +
+		"MUST immediately have an indented `  _Verified: <command and result>_` note on the very next line. " +
+		"A bare `- [x]` with no such note is a hard failure: the run will stop and send this change back for " +
+		"another turn, burning wall-clock time. Never check a box you have not verified and annotated.\n\n" +
 		`Implement the Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, every ` +
 		`specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} before starting. ` +
 		"Loop through pending tasks in tasks.md: make the minimal focused change each task describes, then verify it — run " +
@@ -426,9 +443,31 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 		"production code to verify your own change — that belongs in tests. Never change an existing test's " +
 		"expectations unless the requested behavior changes them. If a file outside the contract is truly " +
 		"required, you may change it, but in the SAME turn record it under `## Scope deviations` in tasks.md as " +
-		"`- <path> — <one-line reason>`.\n\n" +
+		"`- <path> — <one-line reason>`." +
+		"\n\nPre-existing work is not yours to clean up: keep every pre-existing comment, user note " +
+		"(e.g. `// user was editing...`, `// user note...`) and uncommitted hunk intact when you edit a " +
+		"file — never strip, reword, reformat, or delete a stray comment or a hunk you did not write, and " +
+		"never delete or stage away an untracked file that was already there. Edit AROUND it." +
 		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks." +
 		openDecisionsBlock
+	);
+}
+
+/**
+ * Narrow retry prompt for the missing-`_Verified:` send-back path. Implementation is already done;
+ * re-sending the full `applyTurnPrompt` there made the agent re-implement finished work (wall time)
+ * and could exhaust the phase's wall-clock budget before it added the missing notes (timeout). This
+ * prompt forbids touching code and asks only for the notes the verification check counts.
+ */
+export function verificationFixTurnPrompt(changeId: string, missingCount: number, totalChecked: number): string {
+	const paths = changePaths("", changeId);
+	return withRepoRule(
+		`Implementation is already finished. Do NOT modify any code. ` +
+		`${missingCount} of ${totalChecked} checked task(s) in ${paths.tasks} have no _Verified: note under them. ` +
+		"Run the verification commands and update tasks.md by adding the indented " +
+		"`  _Verified: <command and result>_` line immediately beneath each checked task that is " +
+		"missing one. Do not re-implement, refactor, or otherwise touch any source file — your only " +
+		"write is to tasks.md, and only to add the missing notes."
 	);
 }
 
@@ -857,6 +896,12 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
 			"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
 			"real thing. Reserve open questions for what only the user can decide or knows.\n" +
+			"- Do NOT invent secondary systems that were not requested. If the idea asks for rate limiting, " +
+			"throttling, or grouping/partitioning by a key or header (e.g. `x-api-key`) or by IP, treat that " +
+			"key strictly as an opaque bucket-identifier STRING used to group/partition — do NOT implement key " +
+			"validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an " +
+			"explicit requirement of the idea. Ask if a real auth requirement seems implied; never " +
+			"assume one into the plan.\n" +
 			(preferredLanguage
 				? `- Preferred language for this discussion: ${preferredLanguage}. Write every question and option ` +
 					"text you pass to `readyset_ask`, and any plain-chat fallback text, in that language from the very " +
@@ -2656,6 +2701,9 @@ async function reviewAndMaybeExecute(
 		ctx.ui.notify(`Approved. Implementing "${chosen.changeId}"...`, "info");
 
 		let verification: Awaited<ReturnType<typeof checkTaskVerification>>;
+		// Set when the previous iteration ended in a verification send-back, so the next pass fires the
+		// narrow verification-fix prompt instead of the full apply prompt. `undefined` means "full apply".
+		let verificationFix: { missing: number; total: number } | undefined;
 		applyLoop: for (;;) {
 			activeVerifyChangeId = chosen.changeId;
 			let applyFired: boolean;
@@ -2665,7 +2713,12 @@ async function reviewAndMaybeExecute(
 				try {
 					const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
 					applyFired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
-						spendTurn(pi, ctx, budget, "Apply", applyTurnPrompt(chosen.changeId, applyOpenDecisions)),
+						spendTurn(
+							pi, ctx, budget, "Apply",
+							verificationFix
+								? verificationFixTurnPrompt(chosen.changeId, verificationFix.missing, verificationFix.total)
+								: applyTurnPrompt(chosen.changeId, applyOpenDecisions),
+						),
 					);
 				} finally {
 					activeVerifyChangeId = undefined;
@@ -2713,6 +2766,7 @@ async function reviewAndMaybeExecute(
 						options,
 					);
 					if (proceedAnyway === "Send back for verification") {
+						verificationFix = { missing: verification.missing, total: verification.checkedTasks };
 						verificationSendbacks++;
 						ctx.ui.notify(`Asking "${chosen.changeId}" to verify the remaining tasks...`, "info");
 						applyOutcome = "sent-back";
