@@ -6,7 +6,7 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
-## Unreleased
+## 0.15.0 - 2026-09-23
 
 Makes the post-Apply code-review turn risk-based instead of unconditional. The `v0.12` benchmark
 showed that turn is a large share of a run's cost, while review is what protects the test quality
@@ -190,6 +190,8 @@ by phase events, so the benchmark can tune them from real data.
   the gate. An explicit `--lane fast|full` is the operator's lane answer, so it now loads fast-lane
   brainstorms too (`--lane full` still lets the operator pick one and runs it on the full lane, the
   same way `--fast` behaves). The empty-picker warning and the flag description name `--lane`.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.14.0...0.15.0
 
 ## 0.14.0
 
