@@ -4919,11 +4919,46 @@ await test("prompts: WIP preservation and anti-overengineering constraints are p
   assert.ok(implIdx >= 0 && applyIdx < implIdx, "the mandatory rule precedes the implement instruction");
   assert.match(apply, /will stop and send this change back/);
 
-  // Requirement 3: no phantom auth/401 unless explicitly required.
+  // Requirement 3: no phantom auth unless explicitly required -- generalized (no bench-specific
+  // x-api-key/401 example baked into the wording).
   for (const [name, prompt] of [["propose", propose], ["grill", grill]] as const) {
-    assert.match(prompt, /do NOT implement key validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an/, `${name} forbids phantom auth`);
-    assert.match(prompt, /bucket-identifier string/i, `${name} treats the key as a bucket id`);
+    assert.match(prompt, /do NOT invent secondary systems that were not requested/i, `${name} forbids inventing secondary systems`);
+    assert.match(prompt, /authentication, authorization, or credential-validation logic/i, `${name} forbids phantom auth`);
+    assert.doesNotMatch(prompt, /x-api-key/, `${name} carries no bench-specific x-api-key example`);
+    assert.doesNotMatch(prompt, /401 UNAUTHORIZED/, `${name} carries no bench-specific 401 example`);
   }
+});
+
+await test("lane-aware grounding: fast-lane propose/apply never mention EXPLORATION.md/design.md/specs; full lane does; fast propose is smaller than full", async () => {
+  const mod = await loadMod();
+  const brainstorm = { changeId: "x", file: ".ai/brainstorms/x.md" } as any;
+  const fullPropose = mod.proposeTurnPrompt(brainstorm, "full");
+  const fastPropose = mod.proposeTurnPrompt(brainstorm, "fast");
+
+  assert.match(fullPropose, /read readyset\/changes\/x\/EXPLORATION\.md/, "full lane is told to read EXPLORATION.md");
+  assert.doesNotMatch(fastPropose, /read readyset\/changes\/x\/EXPLORATION\.md/, "fast lane is never told to read EXPLORATION.md -- no Explore turn ran");
+  assert.doesNotMatch(fastPropose, /already checked against real repo state in a prior turn/, "fast lane never claims a prior grounding turn already ran");
+
+  // The fix's whole point: fast used to be LARGER than full (contradictory content bloated it).
+  // It must now be smaller, since it carries none of the full-lane-only grounding/design/specs text.
+  assert.ok(
+    fastPropose.length < fullPropose.length,
+    `fast lane propose prompt (${fastPropose.length} chars) should be smaller than full lane's (${fullPropose.length} chars)`,
+  );
+
+  const fullApply = mod.applyTurnPrompt("x", [], "full");
+  const fastApply = mod.applyTurnPrompt("x", [], "fast");
+  assert.match(fullApply, /design\.md/, "full lane apply still reads design.md/specs");
+  assert.match(fullApply, /specs\/\*\*/, "full lane apply still reads specs/**");
+  assert.doesNotMatch(fastApply, /design\.md/, "fast lane apply never mentions design.md -- it doesn't exist");
+  assert.doesNotMatch(fastApply, /specs\/\*\*/, "fast lane apply never mentions specs/** -- fast lane carries no spec delta");
+});
+
+await test("grill prompt: the per-task commit-only/merge-request question and its template field are gone", async () => {
+  const mod = await loadMod();
+  const grill = mod.grillTurnPrompt("idea", "2026-01-01", "ask");
+  assert.doesNotMatch(grill, /commit-only vs\.? commit \+ merge request/i, "the git-flow question is no longer asked (nothing consumed the answer)");
+  assert.doesNotMatch(grill, /Per-task flow/, "the template no longer asks for an unconsumed Per-task flow field");
 });
 
 await test("outside-repo tripwire: classifies outside-repo calls and ignores in-repo ones", async () => {

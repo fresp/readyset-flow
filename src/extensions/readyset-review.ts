@@ -188,8 +188,8 @@ const PROPOSAL_GUIDE_BULLET = `- proposal.md — must have a "## Why" section (1
   one that must already exist — an unmarked path that doesn't exist is a dangling reference and
   gets flagged. Mark a file this change deletes with "(delete)" (e.g. "- src/legacy.ts (delete)");
   it must exist before Apply and is allowed to be gone afterward. This is the scope contract the gate
-  and Apply are checked against — keep it tight (benchmark: readyset diffs ran 2x the plan
-  arm's, and T12 grew an unasked-for 160-line bench file). List the minimum set of files
+  and Apply are checked against — keep it tight: an over-wide contract routinely grows files nobody
+  asked for. List the minimum set of files
   the change actually needs — nothing speculative. A file not on this list may not
   be written during Apply without asking first. Every doc the user or brainstorm explicitly asked for
   must be in this contract — list it, marking a new file "(new)". For bugfix or refactor tasks, do
@@ -316,7 +316,7 @@ export function exploreTurnPrompt(b: BrainstormMeta, submodules: { name: string;
  * 25KB EXPLORATION.md, ~80KB of planning docs, 23 tasks, and a mutation-testing review.
  * Fast lane trims volume — Explore folded into Propose (no separate turn), at most ~8
  * tasks, review without mutation testing — but never the behavior-affecting questions:
- * grilling still asks them, and the T01/T10 wins came from exactly those questions.
+ * grilling still asks them, and real runs' wins came from exactly those questions.
  */
 function fastLaneProposeSuffix(): string {
 	return (
@@ -335,25 +335,34 @@ function fastLaneProposeSuffix(): string {
 
 export function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", budgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full): string {
 	const paths = changePaths("", b.changeId);
+	// Lane-aware grounding: on the full lane, a prior Explore turn already wrote EXPLORATION.md,
+	// so Propose re-reads and anchors to it. On the fast lane, Explore is folded into THIS turn —
+	// no separate turn ran, so telling the model to read a file that does not exist yet (and to
+	// anchor claims to entries in it) is a direct contradiction fastLaneProposeSuffix then has to
+	// paper over. The fast lane instead grounds inline and anchors to its own reads, entirely via
+	// fastLaneProposeSuffix below.
+	const groundingBlock =
+		lane === "fast"
+			? `Create a Readyset change named "${b.changeId}" from the brainstorm at ${b.file}. Read the brainstorm fully first.\n\n`
+			: `Create a Readyset change named "${b.changeId}" from the brainstorm at ${b.file}. ` +
+				`Read the brainstorm fully first, then read ${paths.exploration} — it holds this change's grounding findings, ` +
+				"already checked against real repo state in a prior turn. Do not re-derive or contradict it; every claim in " +
+				"proposal.md/design.md that touches something EXPLORATION.md covered should point back to that finding, not restate " +
+				"a fresh guess.\n\n" +
+				"If you need a fact this change depends on and EXPLORATION.md doesn't cover it — a submodule's gitlink vs. its " +
+				"checked-out commit, an extra config file, anything load-bearing to a Decision or a blocking task — you may check " +
+				"it yourself with a real command, but three things are not optional: (1) never write 'EXPLORATION.md recorded/found " +
+				"this' for something EXPLORATION.md does not actually contain — say 'verified during planning' instead, so the " +
+				"provenance in proposal.md/design.md/tasks.md is never false; (2) append what you checked and found to " +
+				`${paths.exploration} itself (a new '## Additional findings (Propose turn)' section, same one-entry-per-thing-` +
+				"checked format Explore used), so the next person reading EXPLORATION.md sees the complete grounding trail, not " +
+				"just what the Explore turn happened to cover; (3) anchor every repo claim in proposal.md/design.md to a " +
+				"numbered exploration entry or a 'verified during planning' note — file:line, helper name, test name — " +
+				"under a trailing `## Grounding` section in that artifact rather than inline, " +
+				"so a reviewer can check each claim without re-reading the repo. An unanchored claim about the repo is " +
+				"indistinguishable from a guess.\n\n";
 	return withRepoRule(
-		`Create a Readyset change named "${b.changeId}" from the brainstorm at ${b.file}. ` +
-		`Read the brainstorm fully first, then read ${paths.exploration} — it holds this change's grounding findings, ` +
-		"already checked against real repo state in a prior turn. Do not re-derive or contradict it; every claim in " +
-		"proposal.md/design.md that touches something EXPLORATION.md covered should point back to that finding, not restate " +
-		"a fresh guess.\n\n" +
-		"If you need a fact this change depends on and EXPLORATION.md doesn't cover it — a submodule's gitlink vs. its " +
-		"checked-out commit, an extra config file, anything load-bearing to a Decision or a blocking task — you may check " +
-		"it yourself with a real command, but three things are not optional: (1) never write 'EXPLORATION.md recorded/found " +
-		"this' for something EXPLORATION.md does not actually contain — say 'verified during planning' instead, so the " +
-		"provenance in proposal.md/design.md/tasks.md is never false; (2) append what you checked and found to " +
-		`${paths.exploration} itself (a new '## Additional findings (Propose turn)' section, same one-entry-per-thing-` +
-		"checked format Explore used), so the next person reading EXPLORATION.md sees the complete grounding trail, not " +
-		"just what the Explore turn happened to cover; (3) anchor every repo claim in proposal.md/design.md to a " +
-		"numbered exploration entry or a 'verified during planning' note — file:line, helper name, test name — " +
-		"under a trailing `## Grounding` section in that artifact rather than inline, " +
-		"so a reviewer can check each claim without re-reading the repo. An unanchored claim about the repo is " +
-		"indistinguishable from a guess, and the benchmark measured such plans as no better grounded than a " +
-		"single read-only pass.\n\n" +
+		groundingBlock +
 		artifactGuide(lane, budgets) +
 		"\n\nCarry over the brainstorm's Decision, Seam, Scope and Acceptance Criteria (keep the criteria as WHEN/THEN " +
 		"scenarios), and use its Spec Impact section to shape the delta specs. Do not reopen options the brainstorm " +
@@ -372,30 +381,25 @@ export function proposeTurnPrompt(b: BrainstormMeta, lane: ChangeLane = "full", 
 		"changes behavior gets its own WHEN/THEN scenario, marked \"(assumed)\" in the scenario's name or " +
 		"directly after the THEN (e.g. `#### Scenario: empty sort is default order (assumed)`). An " +
 		"assumption with no scenario is a decision the tests cannot see.\n\n" +
-		"If EXPLORATION.md surfaced something the brainstorm didn't anticipate (a submodule it didn't mention, a config " +
-		"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it." +
-		"\n\nThe working tree may already be dirty: pre-existing uncommitted changes, stray comments " +
-		"(e.g. `// user was editing...`, `// user note...`), and untracked files are the user's ACTIVE work " +
+		(lane === "fast"
+			? ""
+			: "If EXPLORATION.md surfaced something the brainstorm didn't anticipate (a submodule it didn't mention, a config " +
+				"value that's already drifted), fold it into What Changes / tasks.md rather than silently dropping it.\n\n") +
+		"The working tree may already be dirty: pre-existing uncommitted changes, stray comments " +
+		"(e.g. an inline `// TODO` or a short user note left by the person working in this repo), and untracked files " +
+		"are the user's ACTIVE work " +
 		"in progress, not leftovers. NEVER propose cleaning up, removing, or deleting them, and never add an " +
 		"untouched dirty or untracked file to `## Files This Change Will Touch` just to tidy it — the " +
 		"contract names files this change writes, not files that merely exist. Plan to edit AROUND them: " +
 		"read the current file content and make your change fit it, leaving every pre-existing comment and " +
 		"uncommitted hunk exactly as you found it.\n\n" +
-		"Scope discipline: do NOT invent secondary systems that were not requested. If a task asks " +
-		"for rate limiting, throttling, or grouping by a key/header (e.g. `x-api-key`) or by IP, treat that " +
-		"key strictly as a bucket-identifier string used to group requests — do NOT implement key " +
-		"validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an " +
-		"explicit requirement. When in doubt, leave it out; an unrequested auth layer is a scope violation, " +
-		"not thoroughness.\n\n" +
+		"Scope discipline: do NOT invent secondary systems that were not requested — for example, don't add " +
+		"authentication, authorization, or credential-validation logic to satisfy an unrelated feature (e.g. rate " +
+		"limiting or grouping requests by some key) unless it was explicitly asked for. When in doubt, leave it out; " +
+		"an unrequested system is a scope violation, not thoroughness.\n\n" +
 		"Bugfix and refactor doc boundary: if this change is a bugfix, refactor, or chore, NEVER touch " +
 		"documentation files (`README.md`, `CHANGELOG.md`, `docs/*`) or add them to `## Files This Change Will Touch` " +
 		"unless documentation was explicitly requested in the prompt. Do not invent doc updates for code fixes.\n\n" +
-		"Negative plan grounding rule: every path mentioned in proposal.md, design.md, or tasks.md is parsed by " +
-		"the grounding validator. When stating that something will NOT be changed or does not exist (e.g. no changelog, " +
-		"no version bump, no new test files), NEVER write file names with extensions like `CHANGELOG.md` or `README.md` " +
-		"or paths like `src/...` if that file does not exist in the repo. Mentioning a non-existent file name with an " +
-		"extension — even when stating absence (e.g. 'no CHANGELOG.md') — flags it as a dangling plan reference. Write " +
-		"'no changelog entry', 'no version bump', or 'no docs update' without file extensions.\n" +
 		"Do not implement code in this turn — planning artifacts only." +
 		(lane === "fast" ? fastLaneProposeSuffix() : "")
 	);
@@ -420,8 +424,12 @@ export function refineTurnPrompt(changeId: string, feedback: string, issues: str
  * review panel can show "N tasks missing verification" as a real signal rather than trusting
  * the same turn's self-report.
  */
-export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = []): string {
+export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = [], lane: ChangeLane = "full"): string {
 	const paths = changePaths("", changeId); // relative paths only; cwd prefix stripped for the prompt
+	// Fast lane carries no design.md and no spec delta (artifactGuide/ARTIFACT_GUIDE_HEADER never
+	// asked Propose to write them) -- telling Apply to read files a fast-lane run never produced
+	// is the same lane contradiction proposeTurnPrompt's grounding block avoids.
+	const readList = lane === "fast" ? `${paths.proposal} and ${paths.tasks}` : `${paths.proposal}, ${paths.design}, every specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks}`;
 	const openDecisionsBlock = openDecisions.length > 0
 		? "\n\nThis change was approved with " + openDecisions.length + " open decision(s) still unresolved. For each one below, apply the " +
 			"RECOMMENDED option — the user approved on that basis — and record it in a `## Decisions made during Apply` section of tasks.md as " +
@@ -433,8 +441,7 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 		"MUST immediately have an indented `  _Verified: <command and result>_` note on the very next line. " +
 		"A bare `- [x]` with no such note is a hard failure: the run will stop and send this change back for " +
 		"another turn, burning wall-clock time. Never check a box you have not verified and annotated.\n\n" +
-		`Implement the Readyset change "${changeId}". Read ${paths.proposal}, ${paths.design}, every ` +
-		`specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} before starting. ` +
+		`Implement the Readyset change "${changeId}". Read ${readList} before starting. ` +
 		"Loop through pending tasks in tasks.md: make the minimal focused change each task describes, then verify it — run " +
 		"the relevant test, hit the endpoint, execute the script, whatever actually exercises the behavior the task " +
 		"describes. Only mark a task complete (`- [ ]` -> `- [x]`) once you have a real result to point to, and immediately " +
@@ -460,7 +467,7 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 		"required, you may change it, but in the SAME turn record it under `## Scope deviations` in tasks.md as " +
 		"`- <path> — <one-line reason>`." +
 		"\n\nPre-existing work is not yours to clean up: keep every pre-existing comment, user note " +
-		"(e.g. `// user was editing...`, `// user note...`) and uncommitted hunk intact when you edit a " +
+		"(e.g. an inline TODO or a short note left by the person working in this repo) and uncommitted hunk intact when you edit a " +
 		"file — never strip, reword, reformat, or delete a stray comment or a hunk you did not write, and " +
 		"never delete or stage away an untracked file that was already there. Edit AROUND it." +
 		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks." +
@@ -883,14 +890,13 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"rules/tiers, or anything else this session's web search tool could actually answer does not belong " +
 			"in a round as an open question or a silent assumption — look it up first, then ask (or state) the " +
 			"real thing. Reserve open questions for what only the user can decide or knows.\n" +
-			"- Do NOT invent secondary systems that were not requested. If the idea asks for rate limiting, " +
-			"throttling, or grouping/partitioning by a key or header (e.g. `x-api-key`) or by IP, treat that " +
-			"key strictly as an opaque bucket-identifier STRING used to group/partition — do NOT implement key " +
-			"validation, key registries, key lookup, or 401 UNAUTHORIZED responses unless authentication was an " +
-			"explicit requirement of the idea. Ask if a real auth requirement seems implied; never " +
+			"- Do NOT invent secondary systems that were not requested — for example, don't add authentication, " +
+			"authorization, or credential-validation logic to satisfy an unrelated feature unless it was explicitly " +
+			"required by the idea. Ask if a real auth requirement seems implied; never " +
 			"assume one into the plan.\n" +
 			"- Working tree and scope discipline: pre-existing uncommitted changes, stray comments in code (e.g. " +
-			"`// user note...`), and untracked files are the user's active work in progress — never treat them as noise " +
+			"an inline TODO or a short user note left by the person working in this repo), " +
+			"and untracked files are the user's active work in progress — never treat them as noise " +
 			"to clean up. For bugfix or refactor tasks, do NOT propose, scope, or assume updates to documentation " +
 			"(README, notes, etc.) unless the user explicitly requested documentation. When recording assumed decisions, " +
 			"never cite non-existent file names with extensions like `CHANGELOG.md` (write 'no changelog entry' without `.md`).\n" +
@@ -926,8 +932,7 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"heavy the later phases run: fast means a lighter Explore folded into Propose, at most ~8 tasks, and " +
 			"no mutation-testing review — so a wrong lane changes cost, not just a label. Behavior-affecting " +
 			"ambiguities must still be asked either way; the lane trims volume, never the questions that change " +
-			"behavior. Also auto-derive (don't ask) the branch type with a one-line reason, and do ask directly " +
-			"(it's a workflow preference the content can't reveal): commit-only vs. commit + merge request per task.\n\n" +
+			"behavior. Also auto-derive (don't ask) the branch type with a one-line reason.\n\n" +
 			"Once — and only once — every one of those is actually resolved or explicitly deferred, write the file " +
 			`to .ai/brainstorms/${today}-<slug>.md (kebab-case slug derived from the title) with exactly this shape:\n\n` +
 			"---\n" +
@@ -947,7 +952,7 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"## Problem / Context\n## Options Explored\n### Option A: <name>\n### Option B: <name>\n" +
 			"## Leaning Direction\n## Decision\n## Assumed\n- none\n## Seam\n## Scope\n## Acceptance Criteria\n## Spec Impact\n" +
 			"## Git Workflow\n- Branch: <type>/<slug>\n- Inference reason: <one line>\n" +
-			"- Lane: <full | fast> — <one line>\n- Per-task flow: <\"commit only\" | \"commit + merge request per task\">\n" +
+			"- Lane: <full | fast> — <one line>\n" +
 			"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +
 			"Under `## Assumed`, list each decision you made yourself without asking — one per line as " +
 			"`- <the decision> — because all answers led to the same plan` — or `- none` if there were none. " +
@@ -3240,7 +3245,7 @@ async function reviewAndMaybeExecute(
 		ctx.ui.notify(`Approved "${chosen.changeId}". Handing off execution to core omp...`, "info");
 
 		const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId).catch(() => []);
-		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions));
+		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions, reviewLane));
 		return;
 	}
 }
