@@ -584,8 +584,9 @@ function compactBeforeProposeGuidance(changeId: string, brainstormFile: string, 
 }
 
 /**
- * Code-review turn — new in pipeline v2, fires after every task is done but before the
- * archive offer. This is the mattpocock/skills "review critically in a separate pass"
+ * Code-review turn — fired on demand by `/readyset --review <change-id>` (runOnDemandReview)
+ * once a handed-off execution is done, before the archive offer; the settle only recommends it
+ * (applyReviewPolicyAtSettle). This is the mattpocock/skills "review critically in a separate pass"
  * pattern: the same turn that just implemented the change is a poor judge of its own diff
  * (it already believes its choices were right), so review happens as its own turn with an
  * explicitly adversarial framing, writing REVIEW.md rather than silently approving.
@@ -1255,9 +1256,11 @@ export async function withPinnedModel<T>(
 		// The approve branch of the gate sets `pendingHandoff` before it fires the execution turn
 		// and returns. Execution is handed to core omp fire-and-forget, so restoring here would
 		// land exactly as the execution turn starts, making it run on the pre-run model instead of
-		// the pinned/apply-phase one. The restore moves to the first terminal agent_end for this
-		// cwd (the agent_end hook -> handlePendingHandoff).
-		const handedOff = pendingHandoff !== undefined && pendingHandoff.cwd === ctx.cwd;
+		// the pinned/apply-phase one. The restore moves to the settle of this session's handoff
+		// (the agent_end hook -> handlePendingHandoff).
+		// Session identity, like every other handoff check (sessionMatches; cwd fallback only when
+		// either side has no session id).
+		const handedOff = pendingHandoff !== undefined && sessionMatches(ctx, pendingHandoff.sessionId, pendingHandoff.cwd);
 		if (!handedOff) {
 			try {
 				await setModel(original);
@@ -3424,6 +3427,10 @@ async function offerArchive(
 	const options = skipReason === "review-failed"
 		? [addressFirst, archiveNow, notYet]
 		: [archiveNow, addressFirst, notYet];
+	// The archive window opens with the offer itself, so every path below -- archived, declined,
+	// dismissed, or failed -- closes a window that was actually opened: one `start`, one `end`.
+	// (It used to open only on "Archive now", leaving every other choice an orphan `end`.)
+	await recordPhase(chosen.changeId, "archive", "start");
 	const archiveChoice = await ctx.ui.select(
 		`${outsideLine}${tmpLine}${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
 		options,
@@ -3436,7 +3443,6 @@ async function offerArchive(
 		return;
 	}
 
-	await recordPhase(chosen.changeId, "archive", "start");
 	try {
 		// The fast lane carries no spec delta. Record that in CONTEXT.md *before*
 		// archiveChange runs — the rename moves the change dir, so the append must land
@@ -3790,10 +3796,11 @@ function registerAskTool(pi: ExtensionAPI): void {
  * Which Readyset change `readyset_verify` should attach evidence to. Module-level, same
  * trade-off `grillRoundState` documents above: `registerTool`'s `execute()` has no per-run
  * channel for extension-local state, only `ctx`, and evidence needs to know which
- * `readyset/changes/<id>/` to write into — a concept Readyset owns, not omp. Set right before
- * an Apply turn fires (see the `applyLoop` call site below) and cleared once that turn
- * finishes, so a `readyset_verify` call outside an active Apply turn gets a clear "not
- * currently applicable" result instead of silently writing evidence to a stale change. Not
+ * `readyset/changes/<id>/` to write into — a concept Readyset owns, not omp. Armed at approve,
+ * right before the execution is handed off to core omp (`reviewAndMaybeExecute`), and cleared by
+ * `settleHandoff` once that handoff settles, so a `readyset_verify` call outside a live handoff
+ * gets a clear "not currently applicable" result instead of silently writing evidence to a
+ * stale change. Not
  * designed for two concurrent Apply turns in the same process — an accepted limitation, not a
  * real scenario this single-session tool needs to guard against.
  */

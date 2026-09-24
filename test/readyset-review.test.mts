@@ -1823,6 +1823,34 @@ await test("on-demand review that writes no REVIEW.md reports 'ran but wrote no 
   assert.notEqual(opts[0].label, "Archive now", "archiving is not the default after a failed review");
   assert.equal(opts[0].label, "Address findings first");
   assert.ok(opts.some((o) => o.label === "Archive now"), "'Archive now' is still offered, just not first");
+
+  // Declining the archive still closes a window that was opened: one start, one end.
+  const archiveEvents = (await readPhaseEvents(cwd, "review-empty")).filter((e) => e.phase === "archive");
+  assert.deepEqual(archiveEvents.map((e) => e.edge), ["start", "end"], "declined archive is a balanced start/end pair");
+  assert.equal(archiveEvents[1].outcome, "Address findings first");
+});
+
+await test("archive events: Archive now also records exactly one start and one end", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-12-archive-balanced.md", {
+    title: "Archive Balanced", status: "approved", created: "2026-07-12", change_id: "archive-balanced",
+  });
+  const dir = await writeProposedChange(cwd, "archive-balanced", ["- src/keep.ts"]);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nnone\n\n## Blocking\n\nnone\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Archive now");
+  await handler("--review archive-balanced", ctx);
+
+  const archiveEvents = (await phaseEventsArchivedOrLive(cwd, "archive-balanced")).filter((e) => e.phase === "archive");
+  assert.deepEqual(archiveEvents.map((e) => e.edge), ["start", "end"], "archived: a balanced start/end pair");
+  assert.equal(archiveEvents[1].outcome, "archived");
 });
 
 await test("handoff model: --phase-model apply=Y sets Y before the handoff and restores the original after settle", async () => {

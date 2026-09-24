@@ -182,8 +182,7 @@ export async function checkPhaseViolations(
  * Appends a dated, phase-tagged entry to this change's CONTEXT.md, creating the file if it
  * doesn't exist. This is called by the extension itself after each phase (deterministic,
  * not something the model can skip) as a lightweight audit trail — it does not depend on the
- * model choosing to write anything useful into it, though the phase prompts also ask the
- * model to add its own notes there for anything a later phase needs to not re-litigate.
+ * model choosing to write anything useful into it (no phase prompt asks the model to).
  */
 export async function appendContext(cwd: string, changeId: string, phase: string, text: string): Promise<void> {
 	const paths = changePaths(cwd, changeId);
