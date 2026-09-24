@@ -2,6 +2,7 @@ import type { BrainstormMeta } from "./readyset-brainstorm.ts";
 import { type ArtifactBudgets, DEFAULT_ARTIFACT_BUDGETS, type LaneDefault } from "./readyset-omp-config.ts";
 import type { ReviewTriggerResult } from "./readyset-review-trigger.ts";
 import { type ChangeLane, type OpenDecision, type ScopeDeviation, changePaths } from "./readyset-spec.ts";
+import type { TestRun, VerifySettings } from "./readyset-verify.ts";
 
 /** Every prompt /readyset fires (grill, explore, propose, refine, apply, review, repair, trim)
  *  and the compaction guidance for each phase boundary. Pure string builders. */
@@ -264,7 +265,54 @@ export function refineTurnPrompt(changeId: string, feedback: string, issues: str
  * review panel can show "N tasks missing verification" as a real signal rather than trusting
  * the same turn's self-report.
  */
-export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] = [], lane: ChangeLane = "full"): string {
+export function applyTurnPrompt(
+	changeId: string,
+	openDecisions: OpenDecision[] = [],
+	lane: ChangeLane = "full",
+	// Default keeps the pre-lite contract (notes required, no test command) for any caller that does
+	// not pass readyset.verify; executeBrainstorm always passes the resolved settings.
+	verify: VerifySettings = { requireNotes: true },
+): string {
+	if (!verify.requireNotes) return applyTurnPromptVerified(changeId, openDecisions, lane, verify.command);
+	return applyTurnPromptWithNotes(changeId, openDecisions, lane);
+}
+
+/** The apply prompt when Readyset verifies deterministically (readyset.verify.requireNotes: false):
+ *  it runs the project's test command itself at readyset_done, so the prompt asks for working code
+ *  and a real check, not for a note ritual or evidence citations. */
+function applyTurnPromptVerified(changeId: string, openDecisions: OpenDecision[], lane: ChangeLane, testCommand: string | undefined): string {
+	const paths = changePaths("", changeId);
+	const readList = lane === "fast"
+		? `${paths.proposal} and ${paths.tasks}`
+		: `${paths.proposal}, ${paths.tasks}, and ${paths.design} / specs under ${paths.specsDir} where they exist`;
+	const openDecisionsBlock = openDecisions.length > 0
+		? "\n\nThis change was approved with " + openDecisions.length + " open decision(s) still unresolved. For each one below, apply the " +
+			"RECOMMENDED option — the user approved on that basis — and record it in a `## Decisions made during Apply` section of tasks.md as " +
+			"`- <decision> → <chosen option> → <why>`.\n" +
+			openDecisions.map((d) => `- ${d.question} — recommended: ${d.recommended ?? "(none stated)"}`).join("\n")
+		: "";
+	const doneCheck = testCommand
+		? `Readyset then runs \`${testCommand}\` itself and refuses "done" if it fails, so run it yourself first.`
+		: "Readyset then closes the execution.";
+	return withRepoRule(
+		`Implement the Readyset change "${changeId}". Read ${readList} first.\n\n` +
+		"Work through the tasks in tasks.md. For each: make the smallest change that satisfies it, check that it " +
+		"actually works (run the relevant test, hit the endpoint, run the script), then tick it `- [ ]` -> `- [x]`. " +
+		"A short `_Verified: …_` note under a task is welcome where the check is not obvious; it is not required. " +
+		"If a test pins behavior that came from an `(assumed)` scenario, say so in its name or a comment.\n\n" +
+		"Stay inside the scope contract (proposal.md `## Files This Change Will Touch`, plus its `(new)`/`(delete)` " +
+		"files). If another file is truly required, change it and record it under `## Scope deviations` in tasks.md " +
+		"as `- <path> — <reason>`. Leave the user's existing edits, comments and untracked files as they are, and do " +
+		"not refactor or reformat code a task does not need.\n\n" +
+		"If a task is unclear or you are blocked, stop and ask — call `readyset_done` with status \"blocked\" and the " +
+		"exact question, ask it, and end your turn. When every task is done, call `readyset_done` with status " +
+		`"done" and a one-line summary as your last action. ${doneCheck}` +
+		openDecisionsBlock
+	);
+}
+
+/** The pre-lite apply prompt, used when readyset.verify.requireNotes is true. */
+function applyTurnPromptWithNotes(changeId: string, openDecisions: OpenDecision[], lane: ChangeLane): string {
 	const paths = changePaths("", changeId); // relative paths only; cwd prefix stripped for the prompt
 	// Fast lane carries no design.md and no spec delta (artifactGuide/ARTIFACT_GUIDE_HEADER never
 	// asked Propose to write them) -- telling Apply to read files a fast-lane run never produced
@@ -390,8 +438,15 @@ export function codeReviewTurnPrompt(
 	deviations: ScopeDeviation[] = [],
 	triggerResult?: ReviewTriggerResult,
 	changedPaths: string[] = [],
+	tests?: TestRun,
 ): string {
 	const paths = changePaths("", changeId);
+	// The one deterministic fact the review starts from: Readyset ran the project's test command.
+	const testsLine = tests
+		? tests.passed
+			? `Readyset ran \`${tests.command}\` just before this review and it passed; do not re-run the whole suite just to confirm that — spend the effort on what the tests do not cover.\n\n`
+			: `Readyset ran \`${tests.command}\` just before this review and it FAILED (${tests.timedOut ? "timed out" : `exit ${tests.exitCode ?? "none"}`}). A failure caused by this change is blocking. Last output:\n\`\`\`\n${tests.tail}\n\`\`\`\n\n`
+		: "";
 	// Lane-aware read list, same reasoning as applyTurnPrompt's: the fast lane never writes
 	// design.md or a spec delta, and its scenarios live under proposal.md's `## Acceptance`.
 	const readList = lane === "fast"
@@ -411,6 +466,7 @@ export function codeReviewTurnPrompt(
 		"your job is to find problems " +
 		"in it, not to confirm it's fine.\n\n" +
 		triggerLine +
+		testsLine +
 		"Write " +
 		paths.review +
 		" covering: (1) does the implementation actually match every requirement's WHEN/THEN scenarios, or does it narrow, " +

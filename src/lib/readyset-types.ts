@@ -3,6 +3,7 @@ import type { ReadysetArgs } from "./readyset-args.ts";
 import type { ArtifactBudgets, LaneDefault, ParsedReviewThresholds, ReviewFullLane, ReviewMode } from "./readyset-omp-config.ts";
 import type { OverlayTheme } from "./readyset-review-overlay.ts";
 import type { PhaseEvent } from "./readyset-spec.ts";
+import type { TestRun, VerifySettings } from "./readyset-verify.ts";
 
 /** Shared types for the /readyset extension, plus its one mutable state store. Stateless: the
  *  store is created by the extension entry (src/extensions/readyset-review.ts), once per module
@@ -242,6 +243,11 @@ export interface PendingHandoff {
 	/** The executing model's latest readyset_done signal, consumed by the next terminal
 	 *  settle (`done` settles as handoff-done; `blocked` is an explicit, non-stall pause). */
 	signal?: HandoffSignal;
+	/** Verification settings resolved at approve (readyset.verify). Absent on handoffs armed by an
+	 *  older version: those keep the old behavior (notes required, no test command). */
+	verify?: VerifySettings;
+	/** The last test run readyset_done performed, reused by the settle that follows. */
+	tests?: TestRun;
 }
 
 /**
@@ -289,4 +295,6 @@ export interface GateRunOptions {
 	 *  the approve branch needs it to work out which model the handed-off execution runs on. */
 	pinnedModel: string | undefined;
 	pinnedModelSource: string;
+	/** readyset.verify, with the test command already resolved for this repo. */
+	verify: VerifySettings;
 }

@@ -6,6 +6,7 @@ import {
 	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
 	parseCompactMinContextPercent,
 	parsePhaseBudgetMinutes,
+	parseVerifyConfig,
 	parseFallbackChain,
 	parseFallbackModel,
 	parseLanguageOverride,
@@ -638,6 +639,16 @@ await test("parseTestPaths/readTestPaths: defaults, overrides, and non-list warn
   assert.deepEqual((await readTestPaths(join(dir, "missing.yml"))).paths, DEFAULT_TEST_PATH_PATTERNS);
   await writeFile(configPath, "readyset:\n  review:\n    testPaths:\n      - unit/**\n", "utf8");
   assert.deepEqual((await readTestPaths(configPath)).paths, ["unit/**"]);
+});
+
+await test("parseVerifyConfig: command, none/off disables, requireNotes defaults to false", () => {
+  assert.deepEqual(parseVerifyConfig("readyset:\n  language: x\n"), { command: undefined, disabled: false, requireNotes: false, warning: undefined });
+  assert.deepEqual(parseVerifyConfig("readyset:\n  verify:\n    command: pnpm test --silent\n"), { command: "pnpm test --silent", disabled: false, requireNotes: false, warning: undefined });
+  assert.equal(parseVerifyConfig("readyset:\n  verify:\n    command: none\n").disabled, true);
+  assert.equal(parseVerifyConfig("readyset:\n  verify:\n    requireNotes: true\n").requireNotes, true);
+  const bad = parseVerifyConfig("readyset:\n  verify:\n    requireNotes: sometimes\n");
+  assert.equal(bad.requireNotes, false);
+  assert.match(bad.warning ?? "", /isn't true or false/);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

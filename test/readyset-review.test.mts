@@ -23,6 +23,8 @@ process.env.READYSET_TEST_CONFIG_PATH = TEST_CONFIG_PATH;
 async function writeConfig(content: string) {
   await writeFile(TEST_CONFIG_PATH, content, "utf8");
 }
+const NOTES_REQUIRED_CONFIG = "readyset:\n  verify:\n    requireNotes: true\n";
+
 async function clearConfig() {
   await rm(TEST_CONFIG_PATH, { force: true });
 }
@@ -865,6 +867,7 @@ await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and
 });
 
 await test("review gate: approving an already-proposed change dispatches apply prompt with verification requirement to omp", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-08-unverified.md", {
     title: "Unverified",
@@ -895,6 +898,7 @@ await test("review gate: approving an already-proposed change dispatches apply p
   assert.match(fakePiWrap.calls[0].prompt, /MANDATORY: every task you complete/);
   assert.match(fakePiWrap.calls[0].prompt, /_Verified: <command and result>_/);
   assert.ok(fakeUiWrap.notifications.some((n) => /Handing off execution to core omp/.test(n.message)));
+  await clearConfig();
 });
 
 await test("propose fails to produce a valid change -> warns, does not enter review", async () => {
@@ -1608,6 +1612,7 @@ await test("readyset_verify: attached while the handoff is armed, detached again
 });
 
 await test("session_stop verification gate: blocks while a checked task lacks a _Verified: note, capped at MAX_VERIFICATION_SENDBACKS, only for the armed change", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-14-sessionstop.md", {
     title: "Session Stop", status: "proposed", created: "2026-07-14", change_id: "session-stop",
@@ -1650,9 +1655,11 @@ await test("session_stop verification gate: blocks while a checked task lacks a 
   // execution) is never gated at all -- only the session that armed the handoff is.
   const otherSession = await sessionStop({ session_id: "another-session" }, { cwd });
   assert.equal(otherSession, undefined, "a subagent's session_stop is not blocked for the parent's tasks.md");
+  await clearConfig();
 });
 
 await test("session_stop verification gate: a subagent session in the same cwd is never blocked, even with budget left", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-14-sessionstop-sub.md", {
     title: "Session Stop Sub", status: "proposed", created: "2026-07-14", change_id: "session-stop-sub",
@@ -1677,9 +1684,11 @@ await test("session_stop verification gate: a subagent session in the same cwd i
   const parent = await sessionStop({}, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.equal(parent?.decision, "block");
   assert.match(parent?.reason ?? "", /1\/2/);
+  await clearConfig();
 });
 
 await test("session_stop verification gate: the cap is per handoff -- a new change in the same session is gated again", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-14-sessionstop-a.md", {
     title: "Session Stop A", status: "proposed", created: "2026-07-14", change_id: "session-stop-a",
@@ -1717,6 +1726,7 @@ await test("session_stop verification gate: the cap is per handoff -- a new chan
   assert.equal(onB?.decision, "block", "change B is gated even though A exhausted its cap");
   assert.match(onB?.reason ?? "", /session-stop-b/);
   assert.match(onB?.reason ?? "", /1\/2/);
+  await clearConfig();
 });
 
 await test("session_stop verification gate: a verified task, or no cwd, never blocks", async () => {
@@ -1770,6 +1780,7 @@ await test("persisted handoff: armed at approve, cleared when a supersede settle
 });
 
 await test("persisted handoff: a restarted process re-attaches this session's handoff, gates session_stop, and settles it", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-21-persist-b.md", {
     title: "Persist B", status: "proposed", created: "2026-07-21", change_id: "persist-b",
@@ -1805,6 +1816,7 @@ await test("persisted handoff: a restarted process re-attaches this session's ha
   assert.deepEqual(applyEvents.map((e) => e.edge), ["start", "end"], "the apply window is balanced across the restart");
   assert.equal(applyEvents[1].outcome, "handoff-settled");
   assert.equal(await fileExists(join(dir, "handoff.json")), false);
+  await clearConfig();
 });
 
 await test("persisted handoff: --review <id> from another session closes an orphaned handoff before reviewing", async () => {
@@ -1877,6 +1889,7 @@ async function armDoneHandoff(slug: string, date: string) {
 }
 
 await test("readyset_done: refuses 'done' with unchecked or unverified tasks, then settles the handoff as handoff-done", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const { cwd, dir, ui, sessionId, agentEnd, signal } = await armDoneHandoff("done-ok", "2026-07-23");
   const toolCtx = eventCtx(cwd, ui.ui, sessionId);
 
@@ -1896,6 +1909,7 @@ await test("readyset_done: refuses 'done' with unchecked or unverified tasks, th
   assert.ok(applyEnd?.reviewPolicy, "the settle's review decision is recorded on the event");
   assert.ok(ui.notifications.some((n) => /signalled done: shipped the endpoint/.test(n.message)));
   assert.equal(await fileExists(join(dir, "handoff.json")), false);
+  await clearConfig();
 });
 
 await test("readyset_done: 'blocked' is an explicit pause, counted on the settle event", async () => {
@@ -1979,6 +1993,104 @@ await test("readyset_done: a subagent session, or no armed handoff, cannot signa
   const other = await freshRepo();
   const loaded = await loadWithDoneTool(makeFakePi(other).pi);
   assert.match(await loaded.signal({ status: "done" }, eventCtx(other, ui.ui, "nobody")), /isn't attached to a handed-off Readyset execution/);
+});
+
+// --- readyset.verify: deterministic verification (lite default: notes optional) ----------------
+
+const TEST_SCRIPT = (exit: number) => JSON.stringify({ name: "fx", scripts: { test: `node -e "process.exit(${exit})"` } });
+
+await test("verify: with notes optional, the apply prompt drops the note ritual and names the test command", async () => {
+  const mod = await loadMod();
+  const lite = mod.applyTurnPrompt("x", [], "full", { command: "npm test", requireNotes: false });
+  assert.doesNotMatch(lite, /MANDATORY/);
+  assert.doesNotMatch(lite, /evidence E00N/);
+  assert.match(lite, /Readyset then runs `npm test` itself and refuses "done" if it fails/);
+  assert.match(lite, /Scope deviations/);
+  const none = mod.applyTurnPrompt("x", [], "fast", { requireNotes: false });
+  assert.match(none, /Readyset then closes the execution/);
+  assert.ok(lite.length < mod.applyTurnPrompt("x").length, "the lite prompt is shorter than the notes-required one");
+});
+
+await test("verify: readyset_done refuses while the project's tests fail, then records the passing run on the settle event", async () => {
+  await clearConfig();
+  const cwd = await freshRepo();
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(1), "utf8"); // failing suite at approve time
+  await writeBrainstorm(cwd, "2026-07-31-verify-run.md", { title: "verify-run", status: "proposed", created: "2026-07-31", change_id: "verify-run" });
+  const dir = await writeProposedChange(cwd, "verify-run", ["- src/keep.ts"]);
+  const fakePiWrap = makeFakePi(cwd);
+  const loaded = await loadWithDoneTool(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  const sessionId = "verify-run-session";
+  const ctx = { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+  ui.selectQueue.push("2026-07-31 · verify-run");
+  ui.selectQueue.push("Approve & Execute, keep context");
+  await loaded.handler("", ctx);
+  assert.match(fakePiWrap.calls.at(-1)!.prompt, /Readyset then runs `npm test` itself/, "the apply prompt names the detected command");
+
+  const toolCtx = eventCtx(cwd, ui.ui, sessionId);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n", "utf8"); // no _Verified note: optional now
+  const refused = await loaded.signal({ status: "done" }, toolCtx);
+  assert.match(refused, /Not recorded: Readyset ran `npm test` and it exited 1/);
+
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(0), "utf8");
+  assert.match(await loaded.signal({ status: "done", summary: "fixed" }, toolCtx), /`npm test` passed .* Recorded as done/);
+  await loaded.agentEnd({ willContinue: false }, toolCtx);
+  const applyEnd = (await readPhaseEvents(cwd, "verify-run")).find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-done");
+  assert.equal(applyEnd?.tests?.command, "npm test");
+  assert.equal(applyEnd?.tests?.passed, true);
+});
+
+await test("verify: a checkbox settle (no readyset_done) runs the tests at settle; failing tests fire tests-failing", async () => {
+  await clearConfig();
+  const cwd = await freshRepo();
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(2), "utf8");
+  await writeBrainstorm(cwd, "2026-08-01-verify-settle.md", { title: "verify-settle", status: "proposed", created: "2026-08-01", change_id: "verify-settle", lane: "fast" });
+  await writeProposedChange(cwd, "verify-settle", ["- src/keep.ts"]);
+  const { fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-08-01 · verify-settle");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("--lane fast", ctx);
+  await markTasksDone(cwd, "verify-settle");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  const applyEnd = (await readPhaseEvents(cwd, "verify-settle")).find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-settled");
+  assert.equal(applyEnd?.tests?.passed, false);
+  assert.equal(applyEnd?.tests?.exitCode, 2);
+  assert.ok(applyEnd?.reviewPolicy?.triggersFired.includes("tests-failing"), JSON.stringify(applyEnd?.reviewPolicy));
+  assert.ok(fakeUiWrap.notifications.some((n) => /Tests are failing after the execution/.test(n.message)));
+});
+
+await test("verify: with notes optional the session_stop gate never blocks", async () => {
+  await clearConfig();
+  const { cwd, dir, ui, sessionId } = await armDoneHandoff("verify-nostop", "2026-08-02");
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 no note\n- [ ] 1.2 todo\n", "utf8");
+  const fakePiWrap = makeFakePi(cwd);
+  const { sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
+  // A fresh instance re-attaches the persisted handoff (verify settings travel with it).
+  assert.equal(await sessionStop({ session_id: sessionId }, { cwd, ui: ui.ui }), undefined);
+});
+
+await test("verify: --review <id> runs the tests first and hands the result to the review", async () => {
+  await clearConfig();
+  const cwd = await freshRepo();
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(3), "utf8");
+  await writeBrainstorm(cwd, "2026-08-03-verify-review.md", { title: "verify-review", status: "approved", created: "2026-08-03", change_id: "verify-review" });
+  const dir = await writeProposedChange(cwd, "verify-review", ["- src/keep.ts"]);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n", "utf8");
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfailing\n\n## Blocking\n\n- tests fail\n", "utf8");
+  });
+  ui.selectQueue.push("Not yet");
+  await handler("--review verify-review", { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle });
+  const prompt = fakePiWrap.calls.find((c) => /Critically review the implementation/.test(c.prompt))!.prompt;
+  assert.match(prompt, /Readyset ran `npm test` just before this review and it FAILED \(exit 3\)/);
+  const reviewEnd = (await readPhaseEvents(cwd, "verify-review")).find((e) => e.phase === "review" && e.edge === "end");
+  assert.equal(reviewEnd?.tests?.exitCode, 3);
+  assert.ok(reviewEnd?.review?.triggersFired.includes("tests-failing"));
 });
 
 await test("review policy at settle: mode=never writes the skip stub", async () => {
@@ -4356,6 +4468,7 @@ async function writeReconcileChange(cwd: string, changeId: string) {
 }
 
 await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
+  await writeConfig(NOTES_REQUIRED_CONFIG); // the pre-lite contract: _Verified notes enforced
   const cwd = await freshRepo();
   execFileSync("git", ["init", "-q"], { cwd });
   await writeBrainstorm(cwd, "2026-04-08-recon8.md", {
@@ -4395,6 +4508,7 @@ await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   assert.match(applyCall.prompt, /Never change an existing test's expectations/);
   assert.match(applyCall.prompt, /every doc the contract lists must be updated/);
   assert.match(applyCall.prompt, /must say so in its name/);
+  await clearConfig();
 });
 
 // --- F2/F3: open decisions + blocking review findings -----------------------------------------

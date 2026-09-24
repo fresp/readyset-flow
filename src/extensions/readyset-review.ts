@@ -4,12 +4,13 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { parseReadysetArgs } from "../lib/readyset-args.ts";
 import { createRuntime } from "../lib/readyset-runtime.ts";
+import { resolveTestCommand, runTestCommand, testRunSummary } from "../lib/readyset-verify.ts";
 import { BRAINSTORM_DIR, type BrainstormMeta, type Lane, changeState, isProposed, loadBrainstorms, markApproved, parseFrontmatter, readClaritySignal, recommendLane, reconcileStatuses, validateBrainstormContent } from "../lib/readyset-brainstorm.ts";
 import { type TurnBudget, createTurnBudget, phaseBudgetExceeded, phaseBudgetLine, startPhaseBudget } from "../lib/readyset-budget.ts";
 import { buildReviewDocument, classicGateSelect, openSidebarOverlay, showReviewPanel, takeReviewSnapshot } from "../lib/readyset-gate-ui.ts";
 import { currentDirtyPaths, pathsChangedThisRun } from "../lib/readyset-git.ts";
 import { asHostEvents, asReviewCtx, compactForPhase, fireTurnAndWait, resolveHostSetModel, sessionMatches, spendTurn, withPhaseModel } from "../lib/readyset-host.ts";
-import { type ParsedReviewThresholds, type ReviewFullLane, type ReviewMode, readArtifactBudgets, readCompactMinContextPercent, readFallbackChain, readLaneDefault, readPhaseBudgetMinutes, readPhaseModels, readPinnedModel, readPreferredLanguage, readReviewFullLane, readReviewMode, readReviewThresholds, readScopeProtectedPaths, readTestPaths } from "../lib/readyset-omp-config.ts";
+import { type ParsedReviewThresholds, type ReviewFullLane, type ReviewMode, readArtifactBudgets, readCompactMinContextPercent, readFallbackChain, readLaneDefault, readPhaseBudgetMinutes, readPhaseModels, readVerifyConfig, type VerifyConfig, readPinnedModel, readPreferredLanguage, readReviewFullLane, readReviewMode, readReviewThresholds, readScopeProtectedPaths, readTestPaths } from "../lib/readyset-omp-config.ts";
 import { classifyOutsideRepoAccess } from "../lib/readyset-outside-repo.ts";
 import { applyTurnPrompt, codeReviewTurnPrompt, compactBeforeExecuteGuidance, compactBeforeExploreGuidance, compactBeforeProposeGuidance, exploreTurnPrompt, proposeTurnPrompt, refineTurnPrompt } from "../lib/readyset-prompts.ts";
 import { runContractRepair, runTrim } from "../lib/readyset-repair.ts";
@@ -409,6 +410,7 @@ async function reviewAndMaybeExecute(
 			sessionId: armingSessionId,
 			armedAt: new Date().toISOString(),
 			reviewPolicy: { mode: reviewMode, fullLane: reviewFullLane, thresholds: reviewThresholds, protectedPaths, testPaths },
+			verify: opts.verify,
 		};
 		await persistPendingHandoff(state.handoff);
 		// readyset_verify is only meaningful while THIS change's Apply is live — armed here (the
@@ -425,7 +427,7 @@ async function reviewAndMaybeExecute(
 		ctx.ui.notify(`Approved "${chosen.changeId}". Handing off execution to core omp...`, "info");
 
 		const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId).catch(() => []);
-		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions, reviewLane));
+		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions, reviewLane, opts.verify));
 		return;
 	}
 }
@@ -566,6 +568,7 @@ async function runOnDemandReview(
 	thresholds: ParsedReviewThresholds,
 	protectedPaths: string[],
 	testPaths: string[],
+	verifyConfig: VerifyConfig = { command: undefined, disabled: false, requireNotes: false, warning: undefined },
 ): Promise<void> {
 	const changeStatus = await changeState(ctx.cwd, changeId);
 	if (changeStatus === "archived") {
@@ -605,7 +608,7 @@ async function runOnDemandReview(
 		id: string,
 		phase: PhaseName,
 		edge: "start" | "end",
-		extra: { model?: string; outcome?: string; review?: PhaseEvent["review"] } = {},
+		extra: { model?: string; outcome?: string; review?: PhaseEvent["review"]; tests?: PhaseEvent["tests"] } = {},
 	): Promise<void> => {
 		await appendPhaseEvent(ctx.cwd, id, { phase, edge, at: new Date().toISOString(), lane, laneSource: "brainstorm", ...extra }).catch(() => {});
 	};
@@ -615,9 +618,14 @@ async function runOnDemandReview(
 	const justified = new Set((await readScopeDeviations(ctx.cwd, changeId)).map((d) => d.path));
 	const driftPaths = (scope.noContract ? [] : scope.outside).filter((p) => !justified.has(p));
 	const brainstorm = await loadBrainstorms(ctx.cwd).then((all) => all.find((b) => b.changeId === changeId));
-	const triggerResult = evaluateReviewTriggers(
-		await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds, (await readOpenDecisions(ctx.cwd, changeId)).length, protectedPaths, testPaths),
-	);
+	// The review starts from a deterministic fact: the project's own test command, run now.
+	const testCommand = resolveTestCommand(ctx.cwd, verifyConfig);
+	if (testCommand) ctx.ui.notify(`Running \`${testCommand}\` before the review...`, "info");
+	const tests = testCommand ? await runTestCommand(ctx.cwd, testCommand) : undefined;
+	const triggerResult = evaluateReviewTriggers({
+		...(await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds, (await readOpenDecisions(ctx.cwd, changeId)).length, protectedPaths, testPaths)),
+		...(tests ? { tests: testRunSummary(tests) } : {}),
+	});
 
 	let reviewContent: string | undefined;
 	let reviewOutcome = "aborted";
@@ -626,7 +634,7 @@ async function runOnDemandReview(
 	try {
 		const deviationsForReview = await readScopeDeviations(ctx.cwd, changeId);
 		await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-			fireTurnAndWait(pi, ctx, codeReviewTurnPrompt(changeId, lane, deviationsForReview, triggerResult, changedPaths)),
+			fireTurnAndWait(pi, ctx, codeReviewTurnPrompt(changeId, lane, deviationsForReview, triggerResult, changedPaths, tests)),
 		);
 		reviewContent = await readReview(ctx.cwd, changeId);
 		reviewOutcome = reviewContent ? "review-written" : "no-review";
@@ -646,6 +654,7 @@ async function runOnDemandReview(
 				triggersFired: triggerResult.fired,
 				outcome: "on-demand",
 			},
+			...(tests ? { tests: testRunSummary(tests) } : {}),
 		});
 	}
 
@@ -826,6 +835,11 @@ export async function executeBrainstorm(
 	const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
 	const fallbackChainSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");
 
+	// readyset.verify: the test command Readyset runs itself at readyset_done / settle / --review,
+	// and whether `_Verified:` notes are still required on top of it.
+	const verifyConfig = await readVerifyConfig();
+	if (verifyConfig.warning) ctx.ui.notify(verifyConfig.warning, "warning");
+
 	const gateRunOptions: GateRunOptions = {
 		phaseModels: phaseModelOverrides,
 		lane: effectiveLane,
@@ -840,6 +854,10 @@ export async function executeBrainstorm(
 		testPaths: testPathsResult.paths,
 		pinnedModel,
 		pinnedModelSource,
+		verify: {
+			command: resolveTestCommand(ctx.cwd, verifyConfig),
+			requireNotes: verifyConfig.requireNotes,
+		},
 	};
 
 	await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
@@ -1282,6 +1300,7 @@ export default function (pi: ExtensionAPI) {
 					reviewThresholds,
 					scopeProtected.paths,
 					testPathsResult.paths,
+					await readVerifyConfig(),
 				);
 				return;
 			}

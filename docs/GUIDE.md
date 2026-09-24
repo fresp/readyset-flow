@@ -331,19 +331,34 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   and the settle has nothing to restore.
 - **The executing model signals the end with `readyset_done`.** The apply prompt tells it to call
   `readyset_done` as its last action:
-  - `status: "done"` is accepted only when every task in `tasks.md` is checked and has its
-    `_Verified:` note. Otherwise the call is refused with the reason, so a premature "done" costs
-    one tool call rather than a wrong settle. The next terminal `agent_end` then closes the handoff
-    as `outcome: "handoff-done"`.
+  - `status: "done"` is accepted only when every task in `tasks.md` is checked and **Readyset's own
+    run of the project's test command passes** (see `readyset.verify` below). A failure is refused
+    with the output tail, so a premature "done" costs one tool call rather than a wrong settle. The
+    next terminal `agent_end` then closes the handoff as `outcome: "handoff-done"`.
   - `status: "blocked"` needs the exact question as its summary. It is an explicit pause: the
-    question is surfaced to you, the execution model stays active, and it never counts toward a
-    stall.
+    question is surfaced to you and the execution model stays active.
 
   Only the arming session can signal; a subagent is told to report to its parent. When no signal
-  arrives, the checkbox/fingerprint inference below is the fallback. The balancing `apply` `end`
+  arrives, every task checked at a terminal turn is the fallback. The balancing `apply` `end`
   event records how the execution got there (`handoff: { pauses, blocks, verificationBlocks,
-  rehydrated, signal }`) and the review policy's decision (`reviewPolicy: { mode, decision,
-  triggersFired }`), so the bench can score handoff outcomes directly.
+  rehydrated, signal }`), the test run (`tests: { command, exitCode, passed, durationMs }`) and the
+  review policy's decision (`reviewPolicy: { mode, decision, triggersFired }`), so the bench can
+  score handoff outcomes directly.
+- **Verification is deterministic (`readyset.verify`).** Readyset runs the project's test command
+  itself — at `readyset_done`, at a checkbox settle, and before an on-demand `--review` — instead of
+  trusting what the model wrote about its checks. The command is `readyset.verify.command`, else
+  `npm test` when `package.json` has a real test script; `command: none` turns it off. A failing
+  run fires the `tests-failing` review trigger, and a passing one counts as evidence (it satisfies
+  `no-evidence`). `_Verified:` notes are optional by default; `readyset.verify.requireNotes: true`
+  restores the older contract (notes required, the session_stop gate below, the note-driven apply
+  prompt).
+
+  ```yaml
+  readyset:
+    verify:
+      command: pnpm test --silent   # default: auto-detect `npm test`; `none` disables
+      requireNotes: false           # true = enforce _Verified: notes as before
+  ```
 - **Settling is simple and idempotent.** The handoff settles on exactly three things:
   `readyset_done` with status `done` (`outcome: "handoff-done"`), a terminal `agent_end` with every
   task checked (`outcome: "handoff-settled"`), or the next `/readyset` command **superseding** it.
@@ -371,7 +386,7 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   a trigger firing, notifies that review is recommended and names `/readyset --review <id>`.
   Planning-only paths (`readyset/**`, `.ai/brainstorms/**`) never count toward a trigger — the model
   updating its own `tasks.md`/`CONTEXT.md` is not a reason to recommend review.
-- **A `session_stop` verification gate** blocks the session that approved the change from ending
+- **A `session_stop` verification gate** (only with `readyset.verify.requireNotes: true`) blocks the session that approved the change from ending
   (up to twice per change) while a checked task in the armed change lacks a `_Verified:` note
   (plain or as a `- _Verified: …` sub-bullet), so "forgot to annotate, moved on" doesn't slip past
   silently. Subagents spawned during the execution are never gated.

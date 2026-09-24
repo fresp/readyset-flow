@@ -242,6 +242,40 @@ export async function readCompactMinContextPercent(configPath: string = OMP_CONF
 	return { percent: parsed.percent, warning: parsed.warning };
 }
 
+export interface VerifyConfig {
+	/** `readyset.verify.command`: the test command to run; undefined = auto-detect. */
+	command: string | undefined;
+	/** `readyset.verify.command: none` (or `off`): run nothing. */
+	disabled: boolean;
+	/** `readyset.verify.requireNotes` (default false): require `_Verified:` notes on checked tasks. */
+	requireNotes: boolean;
+	warning: string | undefined;
+}
+
+/** Parses `readyset.verify.{command,requireNotes}`. Never throws. */
+export function parseVerifyConfig(raw: string): VerifyConfig {
+	const doc = parseYamlSubset(raw);
+	const cmd = getPath(doc, "readyset.verify.command");
+	const notes = getPath(doc, "readyset.verify.requireNotes");
+	const text = typeof cmd === "string" ? cmd.trim() : cmd === undefined ? "" : String(cmd);
+	const disabled = /^(none|off|false)$/i.test(text);
+	let warning: string | undefined;
+	let requireNotes = false;
+	if (notes !== undefined) {
+		const n = String(notes).trim().toLowerCase();
+		if (n === "true") requireNotes = true;
+		else if (n !== "false") warning = `readyset.verify.requireNotes ("${n}") isn't true or false — using false.`;
+	}
+	return { command: disabled || text === "" ? undefined : text, disabled, requireNotes, warning };
+}
+
+/** Reads `readyset.verify` (or `configPath`, for tests). Never throws. */
+export async function readVerifyConfig(configPath: string = OMP_CONFIG_PATH): Promise<VerifyConfig> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { command: undefined, disabled: false, requireNotes: false, warning: undefined };
+	return parseVerifyConfig(raw);
+}
+
 /** Default for `readyset.phaseBudget.minutes`: the wall-clock ceiling on one Explore or Propose
  *  turn before Readyset aborts it. */
 export const DEFAULT_PHASE_BUDGET_MINUTES = 20;

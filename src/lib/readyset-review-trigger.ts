@@ -22,7 +22,8 @@ export type ReviewTriggerName =
 	| "sensitive-path"
 	| "protected-path"
 	| "clarity"
-	| "open-decisions";
+	| "open-decisions"
+	| "tests-failing";
 
 export interface ReviewTriggerInput {
 	/** Unjustified post-reconciliation drift paths (outside contract, no deviation entry). */
@@ -50,6 +51,9 @@ export interface ReviewTriggerInput {
 	testPaths: string[];
 	/** Checked tasks whose `_Verified:` note names a runnable command; > 0 satisfies `no-evidence`. */
 	verifiedCommandNotes: number;
+	/** The project's test command as Readyset ran it itself (readyset-verify.ts), when it did.
+	 *  A failing run fires `tests-failing`; a passing one satisfies `no-evidence`. */
+	tests?: { command: string; exitCode: number | null; passed: boolean };
 	thresholds: { maxLines: number; maxFiles: number; sensitivePaths: string[] };
 }
 
@@ -88,7 +92,7 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 	// A command-bearing note (or one readyset_verify record anywhere) satisfies this trigger —
 	// readyset_verify is optional by design, and a per-task requirement would fire on most runs
 	// and erase the saving.
-	const noEvidence = input.checkedTasks > 0 && input.evidenceTotal === 0 && input.verifiedCommandNotes === 0;
+	const noEvidence = input.checkedTasks > 0 && input.evidenceTotal === 0 && input.verifiedCommandNotes === 0 && input.tests?.passed !== true;
 	evaluated.push({
 		name: "no-evidence",
 		fired: noEvidence,
@@ -97,7 +101,7 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 				? "no tasks checked"
 				: noEvidence
 					? `${input.checkedTasks} checked task(s), 0 evidence records, no _Verified: note names a command either`
-					: `${input.evidenceTotal} evidence record(s), ${input.verifiedCommandNotes} command note(s)`,
+					: `${input.evidenceTotal} evidence record(s), ${input.verifiedCommandNotes} command note(s)${input.tests ? `, tests ${input.tests.passed ? "passed" : "failed"}` : ""}`,
 	});
 
 	// Test-only files do not count toward the size threshold: a large test suite is not itself a
@@ -141,6 +145,12 @@ export function evaluateReviewTriggers(input: ReviewTriggerInput): ReviewTrigger
 		name: "open-decisions",
 		fired: input.openDecisions > 0,
 		value: input.openDecisions > 0 ? `${input.openDecisions} open decision(s)` : "none",
+	});
+
+	evaluated.push({
+		name: "tests-failing",
+		fired: input.tests !== undefined && !input.tests.passed,
+		value: input.tests ? `\`${input.tests.command}\` exited ${input.tests.exitCode ?? "without an exit code"}` : "not run",
 	});
 
 	return { evaluated, fired: evaluated.filter((e) => e.fired).map((e) => e.name), firedSensitivePaths };

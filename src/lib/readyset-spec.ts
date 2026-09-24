@@ -411,6 +411,9 @@ export interface PersistedHandoff {
 	verificationBlocks?: number;
 	/** The executing model's readyset_done signal, not yet consumed by a settle/pause. */
 	signal?: { status: "done" | "blocked"; summary: string; at: string };
+	/** readyset-verify.ts VerifySettings / TestRun, kept opaque here like reviewPolicy. */
+	verify?: unknown;
+	tests?: unknown;
 }
 
 export async function writeHandoffState(cwd: string, state: PersistedHandoff): Promise<void> {
@@ -475,6 +478,8 @@ export interface PhaseEvent {
 	/** `apply` `end` only, handed-off execution: the risk-based review policy's decision at settle
 	 *  (`skipped` wrote REVIEW.md's stub; `recommended` told the user to run --review). */
 	reviewPolicy?: { mode: "auto" | "always" | "never"; decision: "skipped" | "recommended"; triggersFired: string[] };
+	/** `apply` `end` / `review` `end`: the project's test command as Readyset ran it itself. */
+	tests?: { command: string; exitCode: number | null; passed: boolean; durationMs: number };
 	/** `compact` only: which boundary this compaction preceded. */
 	boundary?: "explore" | "propose" | "apply";
 	/** `compact` only: context usage before/after when the host reported it. */

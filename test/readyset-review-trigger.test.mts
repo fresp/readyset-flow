@@ -344,12 +344,12 @@ const baseInput: ReviewTriggerInput = {
   thresholds: { maxLines: 150, maxFiles: 5, sensitivePaths: ["auth/**", "**/auth/**", "Dockerfile"] },
 };
 
-await test("evaluateReviewTriggers: a clean change fires nothing, all eight are evaluated in order", () => {
+await test("evaluateReviewTriggers: a clean change fires nothing, all nine are evaluated in order", () => {
   const r = evaluateReviewTriggers(baseInput);
   assert.deepEqual(r.fired, []);
   assert.deepEqual(
     r.evaluated.map((e) => e.name),
-    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "protected-path", "clarity", "open-decisions"],
+    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "protected-path", "clarity", "open-decisions", "tests-failing"],
   );
   assert.ok(r.evaluated.every((e) => !e.fired));
 });
@@ -357,12 +357,12 @@ await test("evaluateReviewTriggers: a clean change fires nothing, all eight are 
 await test("evaluateReviewTriggers: open-decisions fires when N > 0, not at 0, and is evaluated after clarity", () => {
   const fired = evaluateReviewTriggers({ ...baseInput, openDecisions: 2 });
   assert.deepEqual(fired.fired, ["open-decisions"]);
-  const last = fired.evaluated[fired.evaluated.length - 1];
-  assert.equal(last.name, "open-decisions");
-  assert.equal(last.value, "2 open decision(s)");
+  const od = fired.evaluated.find((e) => e.name === "open-decisions")!;
+  assert.equal(fired.evaluated.indexOf(od), fired.evaluated.findIndex((e) => e.name === "clarity") + 1, "right after clarity");
+  assert.equal(od.value, "2 open decision(s)");
   const none = evaluateReviewTriggers({ ...baseInput, openDecisions: 0 });
   assert.deepEqual(none.fired, []);
-  assert.equal(none.evaluated[none.evaluated.length - 1].value, "none");
+  assert.equal(none.evaluated.find((e) => e.name === "open-decisions")!.value, "none");
 });
 
 await test("evaluateReviewTriggers: protected-path fires on a changed protected file even when the contract lists it", () => {
@@ -905,6 +905,19 @@ await test("end-to-end: a bare --review warns instead of guessing", async () => 
     fakeUiWrap.notifications.some((n) => /Ignoring --review with no mode or change id/.test(n.message)),
     "a bare --review warns",
   );
+});
+
+await test("evaluateReviewTriggers: a failing test run fires tests-failing; a passing one satisfies no-evidence", () => {
+  const failing = evaluateReviewTriggers({ ...baseInput, tests: { command: "npm test", exitCode: 1, passed: false } });
+  assert.ok(failing.fired.includes("tests-failing"));
+  assert.match(failing.evaluated.find((e) => e.name === "tests-failing")!.value, /`npm test` exited 1/);
+
+  const bare = { ...baseInput, evidenceTotal: 0, verifiedCommandNotes: 0 };
+  assert.ok(evaluateReviewTriggers(bare).fired.includes("no-evidence"), "no evidence at all still fires");
+  const passed = evaluateReviewTriggers({ ...bare, tests: { command: "npm test", exitCode: 0, passed: true } });
+  assert.ok(!passed.fired.includes("no-evidence"), "Readyset's own passing test run is evidence");
+  assert.ok(!passed.fired.includes("tests-failing"));
+  assert.equal(evaluateReviewTriggers(baseInput).evaluated.find((e) => e.name === "tests-failing")!.value, "not run");
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

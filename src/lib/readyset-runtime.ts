@@ -10,6 +10,7 @@ import { asReviewCtx, resolveHostSetModel, sessionMatches } from "./readyset-hos
 import { type LaneDefault, readPhaseModels, readPinnedModel } from "./readyset-omp-config.ts";
 import { GRILL_ROUND_CAP, grillTurnPrompt } from "./readyset-prompts.ts";
 import { writeReviewSkipStub } from "./readyset-review-policy.ts";
+import { type TestRun, type VerifySettings, runTestCommand, testRunSummary } from "./readyset-verify.ts";
 import { evaluateReviewTriggers } from "./readyset-review-trigger.ts";
 import { type PhaseEvent, appendContext, appendPhaseEvent, checkScope, checkTaskVerification, clearHandoffState, getProgress, listHandoffStates, readChangeLane, readOpenDecisions, readPhaseEvents, readScopeDeviations, writeHandoffState } from "./readyset-spec.ts";
 import type { ActiveGrillSession, ArmedReviewPolicy, BrainstormExecutionOptions, GrillModelPin, HandoffSignal, OutsideRepoKind, PendingHandoff, ReadysetState, ReviewCtx } from "./readyset-types.ts";
@@ -247,6 +248,8 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			...(handoff.blocks ? { blocks: handoff.blocks } : {}),
 			...(handoff.verificationBlocks ? { verificationBlocks: handoff.verificationBlocks } : {}),
 			...(handoff.signal ? { signal: handoff.signal } : {}),
+			...(handoff.verify ? { verify: handoff.verify } : {}),
+			...(handoff.tests ? { tests: handoff.tests } : {}),
 		}).catch(() => {});
 	}
 
@@ -283,6 +286,8 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			verificationBlocks: mine.verificationBlocks,
 			rehydrated: true,
 			signal: mine.signal,
+			verify: mine.verify as VerifySettings | undefined,
+			tests: mine.tests as TestRun | undefined,
 		};
 		state.verifyChangeId = mine.changeId;
 		(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
@@ -580,6 +585,8 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			verificationBlocks?: number;
 			rehydrated?: boolean;
 			signal?: HandoffSignal;
+			verify?: VerifySettings;
+			tests?: TestRun;
 		},
 		outcome: string,
 	): Promise<void> {
@@ -592,10 +599,16 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			: undefined;
 		const diff = changedPaths ? await applyDiffStats(ctx.cwd, handoff.changeId, changedPaths).catch(() => undefined) : undefined;
 
+		// Deterministic verification: the test run readyset_done just performed is reused (the turn
+		// that sent `done` ended right after it); otherwise a real settle runs the command now.
+		const tests = isRealSettle && handoff.verify?.command
+			? (handoff.tests ?? (await runTestCommand(ctx.cwd, handoff.verify.command).catch(() => undefined)))
+			: undefined;
+
 		// The review decision is taken BEFORE the apply `end` event is written, so the event can carry
 		// it (the bench reads the settle's decision from there rather than from notify text).
 		const reviewDecision = isRealSettle && changedPaths && handoff.reviewPolicy
-			? await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }).catch(() => undefined)
+			? await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }, tests).catch(() => undefined)
 			: undefined;
 
 		await appendPhaseEvent(ctx.cwd, handoff.changeId, {
@@ -615,7 +628,11 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 				...(handoff.signal ? { signal: handoff.signal.status } : {}),
 			},
 			...(reviewDecision ? { reviewPolicy: reviewDecision } : {}),
+			...(tests ? { tests: testRunSummary(tests) } : {}),
 		}).catch(() => {});
+		if (tests && !tests.passed) {
+			ctx.ui.notify(`Tests are failing after the execution of "${handoff.changeId}": \`${tests.command}\` exited ${tests.exitCode ?? "without an exit code"}.`, "warning");
+		}
 		// The window is closed: the persisted copy must not be re-attached by a later process.
 		await clearHandoffState(ctx.cwd, handoff.changeId).catch(() => {});
 
@@ -670,6 +687,7 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 		policy: ArmedReviewPolicy,
 		changedPaths: string[],
 		diff: { files: number; added: number; deleted: number },
+		tests?: TestRun,
 	): Promise<NonNullable<PhaseEvent["reviewPolicy"]>> {
 		const productPaths = changedPaths.filter((p) => !isPlanningPath(p));
 		const lane = (await readChangeLane(ctx.cwd, changeId)) ?? "full";
@@ -682,13 +700,17 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 		// "always", or "auto" on the full lane when the fullLane exemption says full-lane changes
 		// always get reviewed regardless of trigger: no trigger evaluation needed either way.
 		if (policy.mode === "always" || (policy.mode === "auto" && lane === "full" && policy.fullLane === "always")) {
+			// Triggers are not evaluated on this path, but a failing test run is a fact worth
+			// recording and naming, whatever the policy.
+			const testsFailing = tests !== undefined && !tests.passed;
 			ctx.ui.notify(
 				`Review recommended for "${changeId}" (readyset.review.mode = ${policy.mode}` +
 					(policy.mode === "auto" ? ", full lane" : "") +
+					(testsFailing ? ", tests-failing" : "") +
 					`) — run /readyset --review ${changeId}.`,
-				"info",
+				testsFailing ? "warning" : "info",
 			);
-			return { mode: policy.mode, decision: "recommended", triggersFired: [] };
+			return { mode: policy.mode, decision: "recommended", triggersFired: testsFailing ? ["tests-failing"] : [] };
 		}
 
 		// "auto": evaluate the same triggers evaluateReviewTriggers always has, against this run's
@@ -717,6 +739,7 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			protectedPatterns: policy.protectedPaths,
 			testPaths: policy.testPaths,
 			verifiedCommandNotes: verification?.withCommandNote ?? 0,
+			...(tests ? { tests: testRunSummary(tests) } : {}),
 			thresholds: policy.thresholds,
 		});
 
@@ -846,6 +869,9 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 		if (!handoff || !changeId || handoff.changeId !== changeId) return undefined;
 		const stopping = { cwd, sessionManager: sessionId === undefined ? undefined : { getSessionId: () => sessionId } };
 		if (!sessionMatches(stopping, handoff.sessionId, handoff.cwd)) return undefined;
+		// `_Verified:` notes are only enforced when readyset.verify.requireNotes asks for them (older
+		// handoffs without verify settings keep the old, notes-required behavior).
+		if (handoff.verify && !handoff.verify.requireNotes) return undefined;
 		const verification = await checkTaskVerification(cwd, changeId).catch(() => undefined);
 		if (!verification || verification.missing <= 0) return undefined;
 		return { changeId, missing: verification.missing };
@@ -1231,7 +1257,10 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 							'Finish and verify them, or call readyset_done with status "blocked" and the question that stops you.',
 					);
 				}
-				const verification = await checkTaskVerification(cwd, handoff.changeId).catch(() => undefined);
+				// `_Verified:` notes only when readyset.verify.requireNotes asks (older handoffs: always).
+				const verification = !handoff.verify || handoff.verify.requireNotes
+					? await checkTaskVerification(cwd, handoff.changeId).catch(() => undefined)
+					: undefined;
 				if (verification && verification.missing > 0) {
 					return reply(
 						`Not recorded: ${verification.missing} checked task(s) in tasks.md have no _Verified: note. Add one under each ` +
@@ -1245,11 +1274,26 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 							"Fix the task (and re-run readyset_verify) or correct the citation, then call readyset_done again.",
 					);
 				}
-				state.handoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at } };
+				// The deterministic check: Readyset runs the project's test command itself. A failing run
+				// refuses "done" with the output tail — the one verification signal that cannot be a
+				// claim. The passing run is kept for the settle that follows (no second run).
+				let tests: TestRun | undefined;
+				if (handoff.verify?.command) {
+					tests = await runTestCommand(cwd, handoff.verify.command);
+					if (!tests.passed) {
+						state.handoff = { ...handoff, tests: undefined };
+						return reply(
+							`Not recorded: Readyset ran \`${tests.command}\` and it ${tests.timedOut ? "timed out" : `exited ${tests.exitCode ?? "without an exit code"}`}. ` +
+								`Fix the failure, then call readyset_done again. Last output:\n${tests.tail}`,
+						);
+					}
+				}
+				state.handoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at }, ...(tests ? { tests } : {}) };
 				await persistPendingHandoff(state.handoff);
 				await appendContext(cwd, handoff.changeId, "Apply", `Execution signalled done: ${text || "(no summary)"}`).catch(() => {});
 				return reply(
-					"Recorded as done. End your turn now with a short report for the user; Readyset closes the execution, restores " +
+					(tests ? `\`${tests.command}\` passed (${Math.round(tests.durationMs / 1000)}s). ` : "") +
+						"Recorded as done. End your turn now with a short report for the user; Readyset closes the execution, restores " +
 						"the model and applies the review policy when the turn ends.",
 				);
 			},
