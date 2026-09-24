@@ -174,7 +174,7 @@ function makeFakePi(cwd: string) {
 
 function makeFakeUi() {
   const notifications: { message: string; level?: string }[] = [];
-  const widgetHistory: string[][] = [];
+  const widgetHistory: (string[] | undefined)[] = [];
   const widgetKeys: string[] = [];
   const editorTextHistory: string[] = [];
   const selectQueue: (string | undefined)[] = [];
@@ -197,8 +197,10 @@ function makeFakeUi() {
       // Real omp signature is `setWidget(key: string, content: ExtensionWidgetContent, options?)`.
       // A fake that records the first argument as the lines array (as this one used to) cannot
       // tell the correct call apart from `setWidget(lines)`, which the host reads as key = the
-      // array and content = undefined -- so the panel never rendered at all.
-      setWidget(key: string, content: string[]) {
+      // array and content = undefined -- so the panel never rendered at all. `content` is
+      // `string[] | undefined`: undefined with the same key clears the widget (the Review Gate
+      // handoff does exactly that before handing off to omp).
+      setWidget(key: string, content: string[] | undefined) {
         widgetKeys.push(key);
         widgetHistory.push(content);
       },
@@ -579,6 +581,11 @@ await test("approve & execute hands off execution to core omp and exits", async 
   assert.ok(fakeUiWrap.notifications.some((n) => /Handing off execution to core omp/.test(n.message)));
   assert.equal(fakePiWrap.calls.length, 1);
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "partial"/);
+  // The gate's panel is cleared before the handoff, so the review document/widget does not linger
+  // over omp's own execution: setWidget("readyset", undefined), and the editor text emptied.
+  assert.equal(fakeUiWrap.widgetHistory.at(-1), undefined, "the review widget is cleared on handoff");
+  assert.equal(fakeUiWrap.widgetKeys.at(-1), "readyset", "cleared by key, not by passing the lines array");
+  assert.equal(fakeUiWrap.editorTextHistory.at(-1), "", "the editor text is cleared on handoff");
 });
 
 await test("--fast flag includes fast-lane brainstorms; default excludes them", async () => {
@@ -3894,11 +3901,8 @@ await test("stay-in-repo rule: every phase prompt and SKILL.md carry it", async 
     ["refine", mod.refineTurnPrompt("x", "fb", [])],
     ["apply", mod.applyTurnPrompt("x")],
     ["code-review", mod.codeReviewTurnPrompt("x")],
-    ["review-fix", mod.reviewFixTurnPrompt("x", ["f"])],
     ["contract-repair", mod.contractRepairPrompt(["p"])],
     ["trim", mod.trimPrompt([{ file: "proposal", chars: 1, budget: 1 }] as any)],
-    ["scope-reconcile", mod.scopeReconcilePrompt("x", ["a.ts"])],
-    ["verification-fix", mod.verificationFixTurnPrompt("x", 2, 3)],
   ];
   for (const [name, prompt] of prompts) {
     assert.match(prompt, /Work only inside the current repository/, `${name} prompt carries the rule`);

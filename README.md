@@ -36,7 +36,8 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 - **Grill** interrogates the idea until it's unambiguous — a real Q&A, not a rubber stamp. It also
   proposes a **lane** (`--lane fast|full` to force one): fast folds Explore into Propose, caps the
   plan, skips the heavier review probes, and writes a smaller artifact set (proposal + tasks only);
-  full is the workflow below.
+  full is the workflow below. When it finishes, Readyset offers to carry straight on into Explore &
+  Propose — no second `/readyset` run, no re-picking the brainstorm.
 - **Explore** greps the actual repo before anything gets proposed, instead of assuming.
 - **Propose** writes a proposal, design, specs, and tasks — grounded in what Explore found, and
   with a `## Files This Change Will Touch` scope contract the gate checks against. (The fast lane
@@ -44,8 +45,10 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 - **Review** stops for your Approve / Refine / Discard — **Discard is the default**, so nothing
   executes without a deliberate look. Approve & Execute compacts first (Explore/Propose context is
   already persisted to disk); "keep context" is the escape hatch.
-- **Execute** implements the tasks; each one needs a `_Verified:` note, and a separate
-  code-review turn runs before the change is archived.
+- **Execute** is handed off to core omp: approving dispatches the change's `tasks.md` to omp's
+  native runtime and Readyset exits, so subagents, parallel tool calls, and live task-checklist
+  updates work as usual. When it's done, `/readyset --review <change-id>` runs the review turn and
+  archives.
 
 Pin a cheaper model per phase with `--phase-model grill=... --phase-model explore=...` (see the
 [full guide](docs/GUIDE.md#per-phase-models)).
@@ -59,9 +62,9 @@ Plans drift from the repo, reviews get skipped under pressure, and "done" ends u
 model said so." Readyset turns each of those into a structural gate instead of a habit:
 ambiguity gets interrogated before anything is written, every claim about the repo is grounded in
 a dedicated explore phase, nothing executes without an explicit human approve, and "done" needs
-verification, not just a claim. The code-review turn is risk-based: it runs automatically on
-risky changes and is skipped, with an honest stub, when nothing raises a flag (`--review always`
-forces it, `--review <id>` runs it on demand).
+verification, not just a claim. The code-review turn is risk-based and on demand: it evaluates its
+triggers against the working tree and runs when `/readyset --review <change-id>` asks for it,
+skipping with an honest stub when nothing raises a flag.
 
 ## Benchmark
 

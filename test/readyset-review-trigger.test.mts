@@ -146,7 +146,7 @@ function makeFakeUi() {
         return undefined;
       },
       setEditorText(_text: string) {},
-      setWidget(_key: string, _content: string[]) {},
+      setWidget(_key: string, _content: string[] | undefined) {},
       notify(message: string, level?: string) {
         notifications.push({ message, level });
       },

@@ -473,7 +473,9 @@ Picks a brainstorm, then depending on its status:
 - Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
-  implementation legitimately touches more files than planning.
+  implementation legitimately touches more files than planning. Because execution is omp's turn,
+  not Readyset's, Readyset does not revert or repair anything here: the deviations are surfaced
+  when you run the review, and judged there.
   - Apply is also told to keep the **diff minimal**: touch only files in the scope contract and
     update every doc it lists (a listed doc left untouched is a dropped requirement, not a saving).
     Make no refactors/renames/reformatting the task doesn't need, add no unrequested helper
@@ -486,24 +488,8 @@ Picks a brainstorm, then depending on its status:
     `readyset.scope.protectedPaths`), even when the contract lists them with a reason. If a file
     outside the contract is genuinely required, Apply must record it under a
     `## Scope deviations` section in `tasks.md` as `- <path> — <reason>`.
-  - After Execute, a file touched outside the contract with **no** deviation entry is
-    **reconciled once**: one bounded turn reverts it (`git checkout -- <path>`, or deletes it if
-    this run created it — never `git checkout .`/`git stash`/`git reset`/`git clean`) or keeps it
-    and writes a `## Scope deviations` entry. It re-runs the affected tests and updates their
-    `_Verified:` notes after any revert. **Only a path that is (a) outside the contract, (b) changed
-    by this run (baseline-subtracted), and (c) *not* in the change's dirty baseline — i.e. not dirty
-    before the run started — is ever offered for revert or deletion**, and that candidate list is
-    computed in code and handed to the turn; with **no dirty baseline at all** (an older change, or
-    a failed capture) no revert is offered and the turn may only justify. Before the turn, every
-    candidate is copied to `readyset/changes/<id>/reverted/<path>` and the backup is recorded in
-    `CONTEXT.md`; after it, a hash of every baseline-dirty and contract file is compared against a
-    pre-turn snapshot, and **anything the turn changed or deleted outside its candidate list is
-    restored byte-for-byte**, logged loudly, and surfaced at the archive prompt. The turn **runs at
-    most once per Execute**, and is skipped when the run has no turn budget left. Anything still
-    unjustified is named at the **Archive now?** prompt and in `CONTEXT.md` — a **warning, never a
-    block**. If the reconciliation turn itself touches a new out-of-contract file, that is surfaced
-    too. The code-review turn also gets the deviation list and writes a `## Scope` section of
-    `REVIEW.md` judging each deviation necessary-or-gold-plating.
+  - The code-review turn gets that deviation list and writes a `## Scope` section of `REVIEW.md`
+    judging each deviation necessary-or-gold-plating.
 - **Approve & Execute** hands off implementation of the change directly to core omp's native runtime.
   Readyset marks the change approved, logs the handoff in `CONTEXT.md` and phase events (`outcome: "handoff-omp"`),
   clears editor and widget state, sends the execution prompt (`applyTurnPrompt`) to omp via `pi.sendUserMessage`,
@@ -547,22 +533,14 @@ Picks a brainstorm, then depending on its status:
       change (overwriting any stub), which is the escape hatch when `auto` skipped it but you want
       a review before opening a PR. The default values here are **initial, pending benchmark
       data — not measured optima**.
-    - **The review-fix turn.** `REVIEW.md` must end with a `## Blocking` section — one bullet per
-      finding that violates a WHEN/THEN scenario, an explicit requirement (including a doc the
-      request or contract asked for that was never written), or a recorded decision; the literal
-      `none` when there are none. When it is non-empty, the run fires **exactly one** bounded
-      review-fix turn (on the apply phase model) that fixes only those findings and appends a
-      `## Fix turn` section recording each one fixed or not-fixed. No second review runs. The fix
-      turn obeys the same minimal-diff rules as Apply and gets the same post-Apply scope check
-      re-run (warning only — no second reconciliation turn). Its `review-fix` phase event carries
-      `fixed` / `partial` / `skipped-budget` / `not-needed`, and the archive prompt states
-      `blocking: N found, M fixed`. With no turn budget left it records `skipped-budget` and only
-      warns.
-    - **Safe scope reconciliation & WIP preservation.** When files are touched outside the
-      scope contract during Apply, Readyset checks whether they can be safely reconciled. Files not
-      part of the pre-existing dirty baseline or contract are reverted, while pre-existing user WIP,
-      untracked files, and legitimate in-scope edits are strictly preserved (enforcing exact byte
-      identity on untouched workspace files).
+    - **`REVIEW.md`'s `## Blocking` section.** The review turn is told to end `REVIEW.md` with a
+      `## Blocking` section — one bullet per finding that violates a WHEN/THEN scenario, an
+      explicit requirement (including a doc the request or contract asked for that was never
+      written), or a recorded decision; the literal `none` when there are none. Readyset records
+      the section as-is: since execution is omp's turn, there is **no automatic fix turn** — the
+      findings are yours to act on (the archive prompt and the change directory leave them where
+      you can read them), and a non-empty section is a signal to fix before archiving, not a
+      trigger for another turn.
     - **Bugfix doc boundaries & negative grounding.** For bugfixes and targeted refactors, prompt
       rules explicitly bar modifying or adding documentation files (`README.md`, `docs/*`) to
       `## Files This Change Will Touch` unless the user explicitly requested doc updates.

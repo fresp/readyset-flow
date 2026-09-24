@@ -180,24 +180,14 @@ verification), and any correctness bug or regression risk visible in the touched
 whether or not `tasks.md` mentioned it. It ends with a `## Blocking` section — one bullet per
 finding that violates a WHEN/THEN scenario, an explicit requirement (including a doc the request
 or the contract asked for that was never written), or a recorded decision, or the literal `none`.
-A non-empty `## Blocking` fires **exactly one** bounded *review-fix* turn (on the apply phase
-model) that fixes only those findings and appends a `## Fix turn` section recording each one fixed
-or not-fixed; no second review runs. That turn's `review-fix` phase event carries `fixed` /
-`partial` / `skipped-budget` / `not-needed`, it re-runs the post-Apply scope check (warning only),
-and the archive prompt states `blocking: N found, M fixed`.
+Readyset does not fix these itself: execution already belongs to core omp, so a non-empty
+`## Blocking` is yours to act on before archiving, not a trigger for another turn.
 
 **`CONTEXT.md`** — append-only, one `## <Phase> — <ISO timestamp>` entry per phase
 transition, written by the extension automatically. Never hand-edit this file; it's an audit
 trail, not a planning document. It also carries a one-time `readyset-baseline-dirty` block —
 the repo paths that were already dirty before the change started — which the gate invariant and
 scope check subtract so unrelated WIP isn't blamed on this change.
-
-The post-Apply **scope reconciliation** turn may only touch this run's *own* out-of-contract
-files — those changed by this run and absent from the dirty baseline; files already dirty before
-the run are never candidates, and with no dirty baseline at all no revert is offered. Its
-candidates are copied to `readyset/changes/<id>/reverted/<path>` before the turn and recorded in
-`CONTEXT.md`, and any file it changes or deletes outside that list is restored byte-for-byte from
-a pre-turn snapshot and logged loudly.
 
 ## What Readyset deliberately does not do
 

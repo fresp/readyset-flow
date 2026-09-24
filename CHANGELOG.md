@@ -6,17 +6,23 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
-## Unreleased
+## 0.16.0 - 2026-09-24
 
-Introduces seamless Grilling-to-Propose transitions, Review Gate direct handoff to native core OMP runtime, and on-demand code review and archiving.
+Narrows Readyset to the planning half of the workflow — Grill → Explore → Propose → Review Gate — and hands execution off to omp's native runtime instead of running its own apply/review loop.
 
 ### Added
-- **Seamless Grilling → Propose transition**: When grilling finishes and writes `.ai/brainstorms/<date>-<slug>.md`, Readyset immediately prompts the user with a confirmation dialog to proceed with Explore & Propose in the active session, eliminating manual re-selection from the picker while maximizing prompt cache prefix reuse.
-- **Native core OMP handoff at Review Gate**: Scoped Readyset strictly to Grill → Explore → Propose → Review Gate. Upon choosing "Approve & Execute" (or "Approve & Execute, keep context"), Readyset marks the change approved, appends the handoff to `CONTEXT.md` and phase events (`outcome: "handoff-omp"`), clears editor text and widget, dispatches `applyTurnPrompt` via `pi.sendUserMessage` directly to native `omp`, and exits immediately. This enables omp's full native execution capabilities, including subagents, parallel execution, and real-time task checklist updates.
-- **On-demand code review & archiving**: Code review is invoked explicitly via `/readyset --review <change-id>`, which evaluates risk triggers against working tree changes, runs an adversarial code review turn, writes `REVIEW.md`, and prompts to archive the change.
+- **Seamless Grilling → Propose transition**: When a grilling turn finishes and writes its brainstorm, Readyset immediately offers to continue with Explore & Propose in the same session. No second `/readyset` invocation and no re-picking the brainstorm from the picker — the turn sequence keeps the same prompt cache prefix.
+- **Native core omp handoff at the Review Gate**: Approving a change (either **Approve & Execute** or **Approve & Execute, keep context**) now marks it approved, appends the handoff to `CONTEXT.md` and records `outcome: "handoff-omp"` on the apply phase event, clears the editor and widget, dispatches the apply prompt through `pi.sendUserMessage`, and exits the extension command immediately. Execution runs on core omp, so subagents, parallel tool calls, and live task-checklist updates work as they normally do.
+- **On-demand code review & archiving**: `/readyset --review <change-id>` runs the review path explicitly against an existing change — evaluating the risk triggers against the working tree, firing the adversarial review turn, writing `REVIEW.md`, and offering to archive.
 
 ### Changed
-- **De-scoped execution runtime**: Removed internal `applyLoop` (which executed Apply, verification retries, scope reconciliation, and code review within a single command loop) in favor of native core omp execution handoff.
+- **De-scoped execution runtime**: Removed the internal `applyLoop` — Apply, verification retries, scope reconciliation, and the review turn no longer run inside the extension's own command loop. Readyset now ends at the Review Gate; the change's `tasks.md` stays the source of truth omp executes against.
+- **Post-Apply contract semantics**: Reopening the gate on an already-applied change no longer reports false `NEW-BUT-EXISTS` / `DELETE-BUT-MISSING` warnings, and no longer fires a contract-repair turn against an executed change.
+
+### Fixed
+- **`--review` argument parsing**: A flag following `--review` (e.g. `--review <change-id> --lane fast`) is no longer swallowed as a target change id.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.15.0...0.16.0
 
 ## 0.15.0 - 2026-09-23
 
