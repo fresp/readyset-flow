@@ -2937,6 +2937,54 @@ await test("post-Apply scope drift: warns and surfaces the out-of-contract file 
   );
 });
 
+await test("approve base: a file committed during the handed-off execution is picked up by review/scope even though the working tree is clean again", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
+  execFileSync("git", ["config", "user.name", "t"], { cwd });
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "keep.ts"), "// base\n", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-qm", "base"], { cwd });
+
+  await writeBrainstorm(cwd, "2026-02-04-basecommit.md", {
+    title: "Base Commit", status: "proposed", created: "2026-02-04", change_id: "base-commit",
+  });
+  const dir = join(cwd, "readyset", "changes", "base-commit");
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## Files This Change Will Touch\n\n- src/keep.ts\n- src/committed.ts (new)\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 x\n", "utf8");
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-02-04 · Base Commit");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  // The approve base sha was captured at approval time.
+  const { readApproveBase } = await import("../src/lib/readyset-spec.ts");
+  const base = await readApproveBase(cwd, "base-commit");
+  assert.ok(base, "an approve-base sha was recorded");
+
+  // The handed-off execution writes a new file AND commits it -- the working tree is clean again.
+  await writeFile(join(cwd, "src", "committed.ts"), "// new\n", "utf8");
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-qm", "apply work"], { cwd });
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Not yet");
+  await handler("--review base-commit", ctx);
+
+  const reviewCall = fakePiWrap.calls.find((c) => /Critically review the implementation/.test(c.prompt));
+  assert.ok(reviewCall, "the review turn fired");
+  assert.match(reviewCall.prompt, /src\/committed\.ts/, "the committed-but-no-longer-dirty file is still counted as changed this run");
+});
+
 await test("dangling refs: a contract path that doesn't exist and isn't (new) is surfaced in the gate", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-02-04-dangling.md", {

@@ -18,6 +18,8 @@ import {
   ensureDirtyBaseline,
   hasDirtyBaseline,
   readDirtyBaseline,
+  readApproveBase,
+  writeApproveBase,
   readScopeContract,
   readScopeDeviations,
   readOpenDecisions,
@@ -974,6 +976,28 @@ await test("validateChange: observable THENs still pass (exit, stdout, status, f
   const result = await validateChange(cwd, "observable");
   assert.deepEqual(result.issues, []);
   assert.equal(result.ok, true);
+});
+
+await test("writeApproveBase/readApproveBase: round-trip, first-write-wins, missing -> undefined", async () => {
+  const cwd = await freshCwd();
+  await scaffoldChange(cwd, "approve-base");
+
+  // Missing base reads as undefined, never throws.
+  assert.equal(await readApproveBase(cwd, "approve-base"), undefined);
+
+  await writeApproveBase(cwd, "approve-base", "abc1234");
+  assert.equal(await readApproveBase(cwd, "approve-base"), "abc1234");
+
+  // A second write must not move the base -- a re-approve after Refine keeps the first capture.
+  await writeApproveBase(cwd, "approve-base", "def5678");
+  assert.equal(await readApproveBase(cwd, "approve-base"), "abc1234");
+
+  // undefined sha (no commits yet) is a no-op, not a write of "undefined".
+  await writeApproveBase(cwd, "no-commits", undefined);
+  assert.equal(await readApproveBase(cwd, "no-commits"), undefined);
+
+  // A change dir that does not exist at all reads undefined, not throw.
+  assert.equal(await readApproveBase(cwd, "does-not-exist"), undefined);
 });
 
 await test("hasDirtyBaseline: false with no baseline, true after a capture (even an empty one)", async () => {

@@ -29,6 +29,8 @@ import {
 	checkScopeRefs,
 	checkTaskVerification,
 	ensureDirtyBaseline,
+	readApproveBase,
+	writeApproveBase,
 	ensureReadysetRoot,
 	brainstormRequestText,
 	findDocFileWarnings,
@@ -1389,20 +1391,30 @@ export function resetActiveGrillSession(): void {
  * parent-imported extension factory into subagent runtimes in the same process, so module-level
  * state here is shared and a subagent's terminal agent_end shares the parent's cwd.
  */
+/** The risk-based review policy captured at arm time, so the settle path (which runs from the
+ *  `agent_end` hook — no access to the command handler's local config reads) can apply it without
+ *  re-resolving config. Mirrors the same fields `reviewAndMaybeExecute` already threads through. */
+export interface ArmedReviewPolicy {
+	mode: ReviewMode;
+	fullLane: ReviewFullLane;
+	thresholds: ParsedReviewThresholds;
+	protectedPaths: string[];
+	testPaths: string[];
+}
+
 export let pendingHandoff:
 	| {
 			changeId: string;
 			restoreTo: unknown;
 			cwd: string;
 			sessionId?: string;
-			/** `git rev-parse HEAD` captured at approve time, before the handoff fires — see
-			 *  `pathsChangedThisRun`/`applyDiffStats`'s use of it (Fix: approve-base diffing).
-			 *  `undefined` for a repo with no commits yet. */
-			baseSha?: string;
 			/** The progress+tree fingerprint (`computePauseFingerprint`) recorded at the LAST pause,
 			 *  so the next terminal settle can tell "still working" from "stopped making progress" —
 			 *  see `handlePendingHandoff`'s pause branch. `undefined` before the first pause. */
 			pauseFingerprint?: string;
+			/** The review policy this run resolved, captured so a real settle (not a pause or a
+			 *  supersede) can apply it — see `applyReviewPolicyAtSettle`. */
+			reviewPolicy?: ArmedReviewPolicy;
 	  }
 	| undefined;
 
@@ -1627,9 +1639,19 @@ async function executionModelOf(cwd: string, changeId: string): Promise<string |
 export async function settleHandoff(
 	pi: ExtensionAPI,
 	ctx: ReviewCtx,
-	handoff: { changeId: string; restoreTo: unknown },
+	handoff: { changeId: string; restoreTo: unknown; reviewPolicy?: ArmedReviewPolicy },
 	outcome: string,
 ): Promise<void> {
+	// A real settle (the execution actually ran to completion, or stalled with real diff behind
+	// it) gets its diff measured NOW, live, against the approve base — not read back from a stale
+	// event later. `handoff-superseded` skips this: the handoff was abandoned mid-run by a new
+	// /readyset command, so there is nothing conclusive to measure or review yet.
+	const isRealSettle = outcome === "handoff-settled" || outcome === "handoff-stalled";
+	const changedPaths = isRealSettle
+		? await pathsChangedThisRun(ctx.cwd, handoff.changeId).catch(() => [] as string[])
+		: undefined;
+	const diff = changedPaths ? await applyDiffStats(ctx.cwd, handoff.changeId, changedPaths).catch(() => undefined) : undefined;
+
 	await appendPhaseEvent(ctx.cwd, handoff.changeId, {
 		phase: "apply",
 		edge: "end",
@@ -1638,7 +1660,15 @@ export async function settleHandoff(
 		laneSource: "brainstorm",
 		model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
 		outcome,
+		...(diff ? { diff } : {}),
 	}).catch(() => {});
+
+	// readyset_verify is only meaningful while THIS handoff's execution is live.
+	if (activeVerifyChangeId === handoff.changeId) activeVerifyChangeId = undefined;
+
+	if (isRealSettle && changedPaths && handoff.reviewPolicy) {
+		await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }).catch(() => {});
+	}
 
 	if (handoff.restoreTo === undefined) return; // nothing was ever pinned; nothing to restore
 
@@ -1665,6 +1695,87 @@ export async function settleHandoff(
 		);
 	} else {
 		ctx.ui.notify("Execution settled — restored the model this session had before the run.", "info");
+	}
+}
+
+/**
+ * Applies the run's risk-based review policy once a handoff has genuinely settled (not paused,
+ * not superseded) — the automatic post-Apply review turn that used to fire this decision no
+ * longer exists now that Apply is a fire-and-forget handoff to core omp (nothing in this
+ * extension's control flow runs after the handoff returns), so this is the only place left that
+ * ever applies `readyset.review.mode`. Two outcomes, never a review turn fired here (settleHandoff
+ * runs from the `agent_end` hook, with no turn budget of its own):
+ *   - review is skipped (mode `never`, or `auto` with no trigger fired) -> `writeReviewSkipStub`
+ *     records why, so REVIEW.md distinguishes "nothing was checked" from "checked and clean".
+ *   - review is recommended (mode `always`, `auto` on the full lane when the `readyset.review.
+ *     fullLane` exemption is `always`, or `auto` with a trigger fired) -> a notify tells the user
+ *     to run `/readyset --review <id>`, naming which trigger(s) fired when there are any.
+ * `changedPaths`/`diff` are the caller's own live measurement (settleHandoff) — reused rather
+ * than re-measured, so this can never disagree with what the apply `end` event just recorded.
+ */
+async function applyReviewPolicyAtSettle(
+	ctx: ReviewCtx,
+	changeId: string,
+	policy: ArmedReviewPolicy,
+	changedPaths: string[],
+	diff: { files: number; added: number; deleted: number },
+): Promise<void> {
+	const productPaths = changedPaths.filter((p) => !isPlanningPath(p));
+	const lane = (await readChangeLane(ctx.cwd, changeId)) ?? "full";
+
+	if (policy.mode === "never") {
+		await writeReviewSkipStub(ctx.cwd, changeId, { evaluated: [], fired: [], firedSensitivePaths: [] }, "never");
+		return;
+	}
+
+	// "always", or "auto" on the full lane when the fullLane exemption says full-lane changes
+	// always get reviewed regardless of trigger: no trigger evaluation needed either way.
+	if (policy.mode === "always" || (policy.mode === "auto" && lane === "full" && policy.fullLane === "always")) {
+		ctx.ui.notify(
+			`Review recommended for "${changeId}" (readyset.review.mode = ${policy.mode}` +
+				(policy.mode === "auto" ? ", full lane" : "") +
+				`) — run /readyset --review ${changeId}.`,
+			"info",
+		);
+		return;
+	}
+
+	// "auto": evaluate the same triggers evaluateReviewTriggers always has, against this run's
+	// own live diff and scope — never a stale value from an earlier phase event.
+	const scope = await checkScope(ctx.cwd, changeId, productPaths).catch(() => ({ noContract: true as const, outside: [] as string[] }));
+	const justified = new Set((await readScopeDeviations(ctx.cwd, changeId).catch(() => [])).map((d) => d.path));
+	const driftPaths = (scope.noContract ? [] : scope.outside).filter((p) => !justified.has(p));
+	const brainstorm = await loadBrainstorms(ctx.cwd).then((all) => all.find((b) => b.changeId === changeId)).catch(() => undefined);
+	const [conflicts, evidence, verification, progress] = await Promise.all([
+		findEvidenceConflicts(ctx.cwd, changeId),
+		checkTaskEvidence(ctx.cwd, changeId),
+		checkTaskVerification(ctx.cwd, changeId),
+		getProgress(ctx.cwd, changeId),
+	]);
+	const openDecisions = await readOpenDecisions(ctx.cwd, changeId).catch(() => []);
+	const triggerResult = evaluateReviewTriggers({
+		unjustifiedDriftPaths: driftPaths,
+		evidenceConflicts: conflicts,
+		evidenceTotal: evidence.totalRecords,
+		verification,
+		checkedTasks: progress?.done ?? 0,
+		diff,
+		changedPaths: productPaths,
+		clarity: brainstorm?.clarity,
+		openDecisions: openDecisions.length,
+		protectedPatterns: policy.protectedPaths,
+		testPaths: policy.testPaths,
+		verifiedCommandNotes: verification?.withCommandNote ?? 0,
+		thresholds: policy.thresholds,
+	});
+
+	if (triggerResult.fired.length === 0) {
+		await writeReviewSkipStub(ctx.cwd, changeId, triggerResult, "auto");
+	} else {
+		ctx.ui.notify(
+			`Review recommended for "${changeId}": ${triggerResult.fired.join(", ")} — run /readyset --review ${changeId}.`,
+			"warning",
+		);
 	}
 }
 
@@ -1863,38 +1974,73 @@ async function currentDirtyPaths(cwd: string): Promise<string[]> {
 }
 
 /**
+ * Repo-relative paths this change's approve-base commit (`readApproveBase`) has committed since
+ * it was captured — `git diff --name-only <base>..HEAD`. Empty when there is no recorded base
+ * (an older change, or one still at Propose/Refine — no approve has happened yet) or git fails.
+ * Exists so a commit made mid-execution during a long handoff (the model committing its own
+ * work) is not invisible to callers that only look at the current working tree.
+ */
+async function pathsCommittedSinceApproveBase(cwd: string, changeId: string): Promise<string[]> {
+	const base = await readApproveBase(cwd, changeId);
+	if (!base) return [];
+	const run = promisify(execFile);
+	try {
+		const { stdout } = await run("git", ["diff", "--name-only", `${base}..HEAD`], { cwd, timeout: 30000 });
+		return stdout.split("\n").map((p) => p.trim()).filter((p) => p !== "");
+	} catch {
+		return [];
+	}
+}
+
+/**
  * What this run itself changed: current dirty paths minus whatever was already dirty before
- * this change's planning turns ever ran (the baseline captured at scaffold time). Without
- * the subtraction, any file dirty for unrelated reasons — a WIP edit elsewhere, an
- * untracked scratch note — gets misattributed to the current change.
+ * this change's planning turns ever ran (the baseline captured at scaffold time), UNIONED with
+ * whatever this change's approve-base commit has committed since approval
+ * (`pathsCommittedSinceApproveBase`). Without the subtraction, any file dirty for unrelated
+ * reasons — a WIP edit elsewhere, an untracked scratch note — gets misattributed to the current
+ * change. Without the union, a commit made during a handed-off Apply execution (the model
+ * committing its own work, leaving the tree clean again) would silently disappear from scope/
+ * review-trigger accounting — a working-tree-only read sees nothing changed.
  */
 async function pathsChangedThisRun(cwd: string, changeId: string): Promise<string[]> {
-	const [current, baseline] = await Promise.all([
+	const [current, baseline, committed] = await Promise.all([
 		currentDirtyPaths(cwd).catch(() => [] as string[]),
 		readDirtyBaseline(cwd, changeId),
+		pathsCommittedSinceApproveBase(cwd, changeId),
 	]);
-	return current.filter((p) => !baseline.has(p));
+	const dirty = current.filter((p) => !baseline.has(p));
+	return [...new Set([...dirty, ...committed])];
+}
+
+/** True for a path that only Readyset's own planning artifacts touch: `readyset/**` (change
+ *  directories, specs) and `.ai/brainstorms/**`. Excluded from product-code measurements
+ *  (`applyDiffStats`) and from what counts toward a review trigger (`buildReviewTriggerInput`) —
+ *  the model updating its own tasks.md/CONTEXT.md is not a reason to flag drift or recommend
+ *  review, and it is not part of the bench's product-diff number either. */
+function isPlanningPath(p: string): boolean {
+	return p.startsWith(`${READYSET_ROOT}/`) || p.startsWith(".ai/brainstorms/");
 }
 
 /** Final Apply diff size for the bench: files changed and lines added/deleted, from
- *  `git diff HEAD --numstat` (so staged changes count), falling back to plain `git diff` when there
- *  is no HEAD (a fresh repo), over the run's own changed paths, with untracked new files counted by
- *  their line count. Excludes readyset/ (planning artifacts) and .ai/brainstorms/**
- *  (.ai/brainstorms) so the number reflects product code. Returns zeros when git is unavailable. */
-async function applyDiffStats(cwd: string, changedPaths: string[]): Promise<{ files: number; added: number; deleted: number }> {
-	const product = changedPaths.filter(
-		(p) => !p.startsWith(`${READYSET_ROOT}/`) && !p.startsWith(".ai/brainstorms/"),
-	);
+ *  `git diff <base> --numstat` against the change's approve-base commit (so commits made during
+ *  a handed-off execution are included, not just the working tree), falling back to `git diff
+ *  HEAD` and then plain `git diff` when there is no recorded base or no HEAD (a fresh repo), over
+ *  the run's own changed paths, with untracked new files counted by their line count. Excludes
+ *  readyset/ (planning artifacts) and .ai/brainstorms/** (isPlanningPath) so the number reflects
+ *  product code. Returns zeros when git is unavailable. */
+async function applyDiffStats(cwd: string, changeId: string, changedPaths: string[]): Promise<{ files: number; added: number; deleted: number }> {
+	const product = changedPaths.filter((p) => !isPlanningPath(p));
 	if (product.length === 0) return { files: 0, added: 0, deleted: 0 };
 	const run = promisify(execFile);
 	let files = 0, added = 0, deleted = 0;
 	try {
+		const base = await readApproveBase(cwd, changeId);
 		let stdout: string;
 		try {
-			({ stdout } = await run("git", ["diff", "HEAD", "--numstat", "--", ...product], { cwd, timeout: 30000 }));
+			({ stdout } = await run("git", ["diff", ...(base ? [base] : ["HEAD"]), "--numstat", "--", ...product], { cwd, timeout: 30000 }));
 		} catch {
-			// A repo with no commits yet has no HEAD: `git diff HEAD` errors ("unknown revision"),
-			// so fall back to the plain working-tree diff.
+			// No recorded base and no HEAD (a fresh repo): `git diff HEAD` errors ("unknown
+			// revision"), so fall back to the plain working-tree diff.
 			({ stdout } = await run("git", ["diff", "--numstat", "--", ...product], { cwd, timeout: 30000 }));
 		}
 		for (const line of stdout.split("\n")) {
@@ -2965,6 +3111,17 @@ async function reviewAndMaybeExecute(
 			"Apply",
 			"Change approved at the Review Gate. Handing off execution to core omp.",
 		);
+
+		// The approve-base commit: everything scope/review-trigger/diff-stat accounting measures
+		// against from here on. Captured now (before execution ever runs) and only once per change
+		// (writeApproveBase is idempotent) — a re-approve after Refine must not move the base.
+		{
+			const run = promisify(execFile);
+			const approveBaseSha = await run("git", ["rev-parse", "HEAD"], { cwd: ctx.cwd, timeout: 30000 })
+				.then((r) => r.stdout.trim())
+				.catch(() => undefined);
+			await writeApproveBase(ctx.cwd, chosen.changeId, approveBaseSha).catch(() => {});
+		}
 
 		// Precedence mirrors withPhaseModel: the apply phase override wins, else the run's pin, else
 		// the session model untouched. This deliberately does NOT call withPhaseModel — that would

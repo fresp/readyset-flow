@@ -301,6 +301,63 @@ export async function hasDirtyBaseline(cwd: string, changeId: string): Promise<b
 	return parseBaselineEntry(raw) !== undefined;
 }
 
+/** Marker line that opens the approve-base entry inside CONTEXT.md — `git rev-parse HEAD` at the
+ *  moment the change was approved and execution was handed off. Recorded so later diffing (scope,
+ *  review triggers, the Apply `end` event's diff stats) can measure against the commit the run
+ *  actually started from, not just the working tree — commits made during a long-running handoff
+ *  execution are otherwise invisible to a working-tree-only diff. Same fenced-JSON-inside-
+ *  CONTEXT.md pattern as `BASELINE_MARKER`, for the same reasons (see its doc comment). */
+export const APPROVE_BASE_MARKER = "<!-- readyset-approve-base -->";
+
+interface ApproveBaseEntry {
+	sha: string;
+	capturedAt: string;
+}
+
+function parseApproveBaseEntry(raw: string): ApproveBaseEntry | undefined {
+	const idx = raw.indexOf(APPROVE_BASE_MARKER);
+	if (idx === -1) return undefined;
+	const after = raw.slice(idx + APPROVE_BASE_MARKER.length);
+	const fenceStart = after.indexOf(BASELINE_FENCE_OPEN);
+	if (fenceStart === -1) return undefined;
+	const bodyStart = fenceStart + BASELINE_FENCE_OPEN.length;
+	const fenceEnd = after.indexOf(BASELINE_FENCE_CLOSE, bodyStart);
+	if (fenceEnd === -1) return undefined;
+	const body = after.slice(bodyStart, fenceEnd).trim();
+	try {
+		const parsed: unknown = JSON.parse(body);
+		if (parsed === null || typeof parsed !== "object") return undefined;
+		const sha = (parsed as { sha?: unknown }).sha;
+		const capturedAt = (parsed as { capturedAt?: unknown }).capturedAt;
+		if (typeof sha !== "string" || sha === "" || typeof capturedAt !== "string") return undefined;
+		return { sha, capturedAt };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Records this change's approve-base commit — only if none is recorded yet (a Refine loop that
+ *  re-approves after the first handoff already settled must not silently move the base forward).
+ *  `sha` is `undefined` for a repo with no commits yet, in which case this is a no-op: there is no
+ *  base to diff against, and callers fall back to their pre-base-tracking behavior. */
+export async function writeApproveBase(cwd: string, changeId: string, sha: string | undefined): Promise<void> {
+	if (!sha) return;
+	const paths = changePaths(cwd, changeId);
+	const existing = await readFile(paths.context, "utf8").catch(() => undefined);
+	if (existing !== undefined && parseApproveBaseEntry(existing) !== undefined) return;
+	const entry = `\n\n${APPROVE_BASE_MARKER}\n\`\`\`json\n${JSON.stringify({ sha, capturedAt: new Date().toISOString() })}\n\`\`\`\n`;
+	const next = existing === undefined ? `# Context log${entry}` : `${existing.trimEnd()}\n${entry}`;
+	await writeFile(paths.context, next, "utf8");
+}
+
+/** Reads this change's approve-base commit sha, or `undefined` when none was ever recorded (a
+ *  change that predates this mechanism, or one whose approve base failed to write). */
+export async function readApproveBase(cwd: string, changeId: string): Promise<string | undefined> {
+	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
+	if (raw === undefined) return undefined;
+	return parseApproveBaseEntry(raw)?.sha;
+}
+
 /** The phases a Readyset run records boundaries for. */
 export type PhaseName =
 	| "grill" | "explore" | "propose" | "refine" | "gate" | "apply" | "review" | "archive"
