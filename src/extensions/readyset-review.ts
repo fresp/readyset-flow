@@ -1003,6 +1003,11 @@ interface ReviewCtx {
 		current?: () => unknown;
 		resolve?: (spec: string) => unknown;
 	};
+	// Session identity of the ctx. omp's ExtensionContext exposes `sessionManager:
+	// ReadonlySessionManager` (extensions/types.ts), whose `getSessionId(): string` names *this*
+	// session — the child runner reports itself, never its parent. Optional so a host build
+	// without it degrades to cwd matching rather than throwing.
+	sessionManager?: { getSessionId?: () => string };
 	// Confirmed against the real `ExtensionContext` type (extensibility/extensions/types.ts):
 	// `compact(instructionsOrOptions)` is the same public API native /plan's own "Approve and
 	// compact context" option calls internally. `internalGuidance` is piped only to the native
@@ -1357,6 +1362,10 @@ export interface ActiveGrillSession {
 	/** The command ctx's own waitForIdle, captured because the runner closure stays valid after
 	 *  the command handler returns, while the agent_end hook ctx (ExtensionContext) has none. */
 	waitForIdle?: () => Promise<void>;
+	/** The arming session's ctx.sessionManager.getSessionId(), or undefined when the host build
+	 *  does not expose sessionManager. Used by the agent_end handler to reject a subagent's own
+	 *  terminal settle (same cwd, different session) from driving the grill→propose transition. */
+	sessionId?: string;
 }
 
 export let activeGrillSession: ActiveGrillSession | undefined;
@@ -1373,12 +1382,15 @@ export function resetActiveGrillSession(): void {
  * ctx.models.current(); `undefined` when nothing was ever pinned, in which case there is
  * nothing to restore).
  *
- * Single-session limitation: this is module-level process state, like `activeGrillSession`, so a
- * second /readyset run started in the same process before the first handoff settles would
- * overwrite it. Only the approve path sets it, and it is cleared on the first terminal agent_end
- * for the same cwd.
+ * `sessionId` is the arming session's ctx.sessionManager.getSessionId(), or `undefined` when the
+ * host build does not expose `sessionManager` (then matching falls back to cwd). Session identity,
+ * not cwd, is what stops a subagent's settle from ending the parent's handoff: omp rebinds a
+ * parent-imported extension factory into subagent runtimes in the same process, so module-level
+ * state here is shared and a subagent's terminal agent_end shares the parent's cwd.
  */
-export let pendingHandoff: { changeId: string; restoreTo: unknown; cwd: string } | undefined;
+export let pendingHandoff:
+	| { changeId: string; restoreTo: unknown; cwd: string; sessionId?: string }
+	| undefined;
 
 /**
  * The model the current run's `withPinnedModel` captured before it pinned anything. Only
@@ -1392,6 +1404,24 @@ export let handoffRestoreTarget: unknown;
 export function resetPendingHandoff(): void {
 	pendingHandoff = undefined;
 	handoffRestoreTarget = undefined;
+}
+
+/**
+ * Whether an `agent_end` hook ctx belongs to the session that armed `handoff`/the grill session.
+ * Session identity, not cwd: omp rebinds a parent-imported extension factory into subagent
+ * runtimes in the same process (sdk.ts bindPreparedExtensions), so module-level state here is
+ * shared and a subagent's terminal agent_end shares the parent's cwd. Requiring the same session
+ * id stops a child's settle from restoring the parent's model or firing its grill transition.
+ * Falls back to cwd matching when either side cannot report a session id (older host builds).
+ */
+function sessionMatches(
+	ctx: { cwd?: string; sessionManager?: { getSessionId?: () => string } },
+	expectedSessionId: string | undefined,
+	armedCwd: string | undefined,
+): boolean {
+	const ctxId = ctx.sessionManager?.getSessionId?.();
+	if (expectedSessionId === undefined || ctxId === undefined) return ctx.cwd === armedCwd;
+	return ctxId === expectedSessionId;
 }
 
 /**
@@ -1435,6 +1465,7 @@ export function startGrilling(
 			existingFiles: files,
 			execOptions,
 			waitForIdle: ctx.waitForIdle,
+			sessionId: ctx.sessionManager?.getSessionId?.(),
 		};
 	}
 
@@ -1649,7 +1680,7 @@ async function executionComplete(cwd: string, changeId: string): Promise<boolean
 export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
 	const handoff = pendingHandoff;
 	if (!handoff) return;
-	if (handoff.cwd !== ctx.cwd) return; // a different session's settle: leave it
+	if (!sessionMatches(ctx, handoff.sessionId, handoff.cwd)) return; // another session's settle: leave it
 	if (!(await executionComplete(ctx.cwd, handoff.changeId))) {
 		// Execution paused to ask a question / report a blocker. Keep the handoff armed and the
 		// execution model active. The pause is recorded as an `apply` `start` event (the only legal
@@ -2960,8 +2991,10 @@ async function reviewAndMaybeExecute(
 		// capture when there was a pin, else the session model captured above just before the
 		// execution model was applied — so an apply override alone still restores. It stays
 		// undefined when no execution model was applied, in which case handlePendingHandoff has
-		// nothing to restore and short-circuits.
-		pendingHandoff = { changeId: chosen.changeId, restoreTo: restoreTarget, cwd: ctx.cwd };
+		// nothing to restore and short-circuits. `sessionId` is the arming session's own id (the
+		// command ctx has sessionManager), so a subagent's settle in the same cwd cannot end it.
+		const armingSessionId = ctx.sessionManager?.getSessionId?.();
+		pendingHandoff = { changeId: chosen.changeId, restoreTo: restoreTarget, cwd: ctx.cwd, sessionId: armingSessionId };
 
 		if (typeof ctx.ui.setEditorText === "function") {
 			ctx.ui.setEditorText("");
@@ -4117,7 +4150,11 @@ export default function (pi: ExtensionAPI) {
 					"warning",
 				);
 			}
-			if (activeGrillSession?.active) {
+			if (activeGrillSession?.active && sessionMatches(ctx as unknown as ReviewCtx, activeGrillSession.sessionId, ctx.cwd)) {
+				// Guarded here (not inside runGrillEndTransition) because this is where the session
+				// identity is available on the hook ctx: a subagent's own terminal agent_end shares
+				// the parent's cwd, so without this guard its settle would drive the parent's
+				// grill→propose transition.
 				// Belt and braces: omp dispatches this handler detached (`void ...catch(logger.error)`
 				// in agent-session.ts), so a throw here would be invisible to the user. The inner
 				// notify in handleGrillEndTransition handles the common case; this outer one covers a

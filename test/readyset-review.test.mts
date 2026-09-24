@@ -554,6 +554,59 @@ await test("grill→propose transition with an event ctx that has waitForIdle st
   assert.ok(!fakeUiWrap.notifications.some((n) => n.level === "error"));
 });
 
+// The grill session is armed from the command ctx. When that ctx carries a session id, a foreign
+// session's agent_end (same cwd) must not drive the transition; the matching session must.
+async function driveGrillToTransition(cwd: string, fakePiWrap: ReturnType<typeof makeFakePi>, fakeUiWrap: ReturnType<typeof makeFakeUi>, handler: (args: string, ctx: unknown) => Promise<void>, commandSessionId?: string) {
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir);
+  const commandCtx: Record<string, unknown> = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  if (commandSessionId !== undefined) commandCtx.sessionManager = { getSessionId: () => commandSessionId };
+  await handler("--idea Add a health endpoint", commandCtx);
+  await fakePiWrap.waitForIdle();
+}
+
+await test("agent_end: a different session id cannot trigger the grill->propose transition", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  await driveGrillToTransition(cwd, fakePiWrap, fakeUiWrap, handler, "grill-session");
+  assert.equal(fakePiWrap.calls.length, 1, "only the grill turn fired so far");
+
+  await agentEnd(
+    { willContinue: false },
+    eventCtx(cwd, fakeUiWrap.ui, "foreign-session"),
+  );
+
+  assert.ok(
+    !fakeUiWrap.selectPrompts.some((p) => /^Review change "idea"/.test(p)),
+    "a foreign session must not drive the grill transition: " + JSON.stringify(fakeUiWrap.selectPrompts),
+  );
+  assert.equal(fakePiWrap.calls.length, 1, "no further turns fired for a foreign session's settle");
+});
+
+await test("agent_end: the matching session id triggers the grill->propose transition", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  await driveGrillToTransition(cwd, fakePiWrap, fakeUiWrap, handler, "grill-session");
+
+  await agentEnd(
+    { willContinue: false },
+    { cwd, ui: fakeUiWrap.ui, sessionManager: { getSessionId: () => "grill-session" }, isIdle: () => false, hasPendingMessages: () => false },
+  );
+
+  assert.equal(fakePiWrap.calls.length, 3, "grill + explore + propose all fired");
+  assert.ok(fakeUiWrap.selectPrompts.some((p) => /^Review change "idea"/.test(p)), "the matching session drives the transition");
+});
+
 await test("a planning turn that writes outside the change dir during the transition path trips the propose-boundary invariant", async () => {
   const cwd = await freshRepo();
   await execFileSync("git", ["init", "-q"], { cwd });
@@ -1277,6 +1330,51 @@ await test("handoff model: an unreadable tasks.md counts as done so the handoff 
 
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "an unreadable tasks.md still settles");
+});
+
+await test("handoff model: a terminal agent_end from a different session id (same cwd) does not settle", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-09-handoff-subagent.md", {
+    title: "Handoff Subagent", status: "proposed", created: "2026-07-09", change_id: "handoff-subagent",
+  });
+  await writeProposedChange(cwd, "handoff-subagent", ["- src/keep.ts"]);
+  await markTasksDone(cwd, "handoff-subagent");
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-09 · Handoff Subagent");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  await handler("--model pinned-model", ctx);
+
+  // A subagent's own terminal agent_end: same cwd, different session id.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, "subagent-session"));
+  assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "a foreign session must not restore the parent's model");
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-subagent");
+  assert.ok(!events.some((e) => e.phase === "apply" && e.edge === "end"), "a foreign session must not write the parent's apply end");
+
+  // The parent's own terminal settle still works.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the parent session still settles");
+  assert.ok(
+    (await phaseEventsArchivedOrLive(cwd, "handoff-subagent")).some((e) => e.phase === "apply" && e.edge === "end" && e.outcome === "handoff-settled"),
+  );
+});
+
+await test("handoff model: ctx without sessionManager falls back to cwd matching", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-10-handoff-fallback.md", {
+    title: "Handoff Fallback", status: "proposed", created: "2026-07-10", change_id: "handoff-fallback",
+  });
+  await writeProposedChange(cwd, "handoff-fallback", ["- src/keep.ts"]);
+  await markTasksDone(cwd, "handoff-fallback");
+
+  // Command ctx has a session id; the settle ctx does not.
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-10 · Handoff Fallback");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  await handler("--model pinned-model", ctx);
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui)); // no sessionManager
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "falls back to cwd matching and settles");
 });
 
 await test("handoff model: --phase-model apply=Y sets Y before the handoff and restores the original after settle", async () => {
