@@ -1572,6 +1572,54 @@ async function executionModelOf(cwd: string, changeId: string): Promise<string |
 
 /**
  * Settles a pending execution handoff: records the balancing `apply` `end` phase event and
+ * restores the model the session had before the run pinned anything. Shared by the terminal
+ * `agent_end` path (handlePendingHandoff) and the command-start supersede path so the two cannot
+ * drift on the event shape, the restore, or the notify.
+ *
+ * `handoff` is already detached from the module state by the caller, so a throw here cannot leave
+ * a stale handoff armed. Never throws: the event write and the restore each degrade to a warning.
+ */
+export async function settleHandoff(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	handoff: { changeId: string; restoreTo: unknown },
+	outcome: string,
+): Promise<void> {
+	await appendPhaseEvent(ctx.cwd, handoff.changeId, {
+		phase: "apply",
+		edge: "end",
+		at: new Date().toISOString(),
+		lane: (await readChangeLane(ctx.cwd, handoff.changeId)) ?? "full",
+		laneSource: "brainstorm",
+		model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
+		outcome,
+	}).catch(() => {});
+
+	if (handoff.restoreTo === undefined) return; // nothing was ever pinned; nothing to restore
+
+	const setModel = resolveHostSetModel(pi);
+	if (!setModel) {
+		ctx.ui.notify("Couldn't restore the model this session had before the /readyset run — check /model if it looks off.", "warning");
+		return;
+	}
+	try {
+		await setModel(handoff.restoreTo);
+	} catch {
+		ctx.ui.notify("Couldn't restore the model this session had before the /readyset run — check /model if it looks off.", "warning");
+		return;
+	}
+	if (outcome === "handoff-superseded") {
+		ctx.ui.notify(
+			"A new /readyset command superseded the handed-off execution — the model this session had before the run is restored (handoff-superseded).",
+			"warning",
+		);
+	} else {
+		ctx.ui.notify("Execution settled — restored the model this session had before the run.", "info");
+	}
+}
+
+/**
+ * Settles a pending execution handoff: records the balancing `apply` `end` phase event and
  * restores the model the session had before the run pinned anything.
  *
  * Runs from the `agent_end` hook, and only on a terminal settle — see the handler's comment for
@@ -1586,36 +1634,24 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 	if (!handoff) return;
 	if (handoff.cwd !== ctx.cwd) return; // a different session's settle: leave it
 	pendingHandoff = undefined;
-	const restoreTarget = handoff.restoreTo ?? handoffRestoreTarget;
 	handoffRestoreTarget = undefined;
+	await settleHandoff(pi, ctx, handoff, "handoff-settled");
+}
 
-	// Record the boundary BEFORE restoring, so the event carries the model execution actually ran
-	// on rather than the restored one. appendPhaseEvent never throws by design (its callers all
-	// swallow), and this one is wrapped the same way.
-	await appendPhaseEvent(ctx.cwd, handoff.changeId, {
-		phase: "apply",
-		edge: "end",
-		at: new Date().toISOString(),
-		lane: (await readChangeLane(ctx.cwd, handoff.changeId)) ?? "full",
-		laneSource: "brainstorm",
-		model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
-		outcome: "handoff-settled",
-	}).catch(() => {});
-
-	if (restoreTarget === undefined) return; // nothing was ever pinned; nothing to restore
-
-	const setModel = resolveHostSetModel(pi);
-	if (!setModel) {
-		ctx.ui.notify("Couldn't restore the model this session had before the /readyset run — check /model if it looks off.", "warning");
-		return;
-	}
-	try {
-		await setModel(restoreTarget);
-	} catch {
-		ctx.ui.notify("Couldn't restore the model this session had before the /readyset run — check /model if it looks off.", "warning");
-		return;
-	}
-	ctx.ui.notify("Execution settled — restored the model this session had before the run.", "info");
+/**
+ * Settles a pending handoff that a new /readyset command is superseding, instead of dropping it.
+ * The previous behavior (resetPendingHandoff) cleared the state with no model restore and no
+ * balancing `apply` `end` event, so an abandoned or interleaved handoff left the session stuck on
+ * the execution model forever and the phase log with an unclosed `apply`.
+ *
+ * Shares settleHandoff with the terminal-settle path. No-ops when nothing is pending.
+ */
+export async function supersedePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
+	const handoff = pendingHandoff;
+	if (!handoff) return;
+	pendingHandoff = undefined;
+	handoffRestoreTarget = undefined;
+	await settleHandoff(pi, ctx, handoff, "handoff-superseded");
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -2821,6 +2857,11 @@ async function reviewAndMaybeExecute(
 		// branch returns immediately, so withPinnedModel's `finally` would restore the pre-run model
 		// exactly as execution begins. Apply the execution model here and record the handoff so
 		// withPinnedModel leaves the pin alone (see its `finally`) until the execution settles.
+		// The restore target for this handoff: the pin's captured pre-pin model when there was a pin
+		// (withPinnedModel stored it in `handoffRestoreTarget`), else the session model captured at the
+		// capture site below just before the execution model is applied. Stays undefined when no
+		// execution model was ever applied, so the settle has nothing to restore and short-circuits.
+		let restoreTarget: unknown = handoffRestoreTarget;
 		const setModel = resolveHostSetModel(pi);
 		const models = ctx.models;
 		let executionModelApplied = false;
@@ -2841,6 +2882,11 @@ async function reviewAndMaybeExecute(
 					"warning",
 				);
 			} else {
+				// Capture the pre-apply session model only when nothing has captured one yet (no pin) and
+				// we are genuinely about to apply: this instant's models.current() is still the pre-run
+				// session model. On a failed apply the capture is skipped, leaving restoreTarget undefined
+				// so the settle short-circuits the restore (nothing changed, nothing to restore).
+				if (restoreTarget === undefined) restoreTarget = models.current();
 				try {
 					executionModelApplied = (await setModel(resolved)) !== false;
 				} catch {
@@ -2862,10 +2908,12 @@ async function reviewAndMaybeExecute(
 		}
 
 		// Armed before the send below, so withPinnedModel's `finally` (which runs during the
-		// `return` right after) observes it and skips its restore. `handoffRestoreTarget` is what
-		// withPinnedModel captured as the pre-pin model; it is undefined when no pin was configured,
-		// in which case handlePendingHandoff has nothing to restore and short-circuits.
-		pendingHandoff = { changeId: chosen.changeId, restoreTo: handoffRestoreTarget, cwd: ctx.cwd };
+		// `return` right after) observes it and skips its restore. `restoreTarget` is the pin's
+		// capture when there was a pin, else the session model captured above just before the
+		// execution model was applied — so an apply override alone still restores. It stays
+		// undefined when no execution model was applied, in which case handlePendingHandoff has
+		// nothing to restore and short-circuits.
+		pendingHandoff = { changeId: chosen.changeId, restoreTo: restoreTarget, cwd: ctx.cwd };
 
 		if (typeof ctx.ui.setEditorText === "function") {
 			ctx.ui.setEditorText("");
@@ -4006,9 +4054,12 @@ export default function (pi: ExtensionAPI) {
 			if (endEv?.willContinue) return;
 			// A settled execution handoff is handled first, before the grill block, so it still runs
 			// when activeGrillSession is unset (the usual case: approve fires long after grilling).
-			// Await it: this handler is already async and omp awaits the returned promise, so the
-			// restore has completed by the time the notification dispatch finishes. The try/catch
-			// keeps a failure from taking down the grill-transition block below.
+			// We await it so *our own* restore and `apply` `end` write complete before this handler
+			// returns — nothing externally waits on this handler: omp dispatches the extension
+			// `agent_end` notification detached (`void this.#emitAgentEndNotification(...)` in
+			// agent-session.ts, whose `.catch(logger.error)` only logs), so a throw here would be
+			// invisible. The try/catch below exists for exactly that reason, and keeps a failure from
+			// taking down the grill-transition block.
 			try {
 				await handlePendingHandoff(pi, ctx as unknown as ReviewCtx);
 			} catch (err) {
@@ -4055,8 +4106,11 @@ export default function (pi: ExtensionAPI) {
 			await ensureReadysetRoot(ctx.cwd);
 			resetOutsideRepoWatch(ctx.cwd);
 			// A handoff whose execution turn never settled (user aborted the process, or a different
-			// session's settle was never observed) must not linger and hijack this run's restore.
-			resetPendingHandoff();
+			// session's settle was never observed) must not linger. Settle it instead of dropping it:
+			// settling restores the model this session had before the run and closes the `apply`
+			// boundary (handoff-superseded), where the old resetPendingHandoff cleared the state with
+			// no restore and left the session stuck on the execution model.
+			await supersedePendingHandoff(pi, ctx as unknown as ReviewCtx);
 
 			// Risk-based code-review policy, resolved once for the run. `--review
 			// auto|always|never` (flag) wins over readyset.review.mode (config); the trigger

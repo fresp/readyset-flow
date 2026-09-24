@@ -183,10 +183,12 @@ function makeFakeUi() {
   const selectQueue: (string | undefined)[] = [];
   const inputQueue: (string | undefined)[] = [];
   const selectPrompts: string[] = [];
+  const selectOptions: unknown[] = [];
   return {
     ui: {
-      async select(prompt: string, _options: unknown, _opts?: unknown) {
+      async select(prompt: string, options: unknown, _opts?: unknown) {
         selectPrompts.push(prompt);
+        selectOptions.push(options);
         if (selectQueue.length === 0) throw new Error(`select() called with empty queue, prompt: ${prompt}`);
         return selectQueue.shift();
       },
@@ -218,6 +220,7 @@ function makeFakeUi() {
     selectQueue,
     inputQueue,
     selectPrompts,
+    selectOptions,
   };
 }
 
@@ -1076,20 +1079,30 @@ async function gateCtx(cwd: string, extraCtx: Record<string, unknown> = {}) {
   const fakePiWrap = makeFakePi(cwd);
   const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
   const fakeUiWrap = makeFakeUi();
+  const sessionId = "session-under-test";
   const ctx = {
     cwd,
     ui: fakeUiWrap.ui,
     waitForIdle: fakePiWrap.waitForIdle,
     models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+    sessionManager: { getSessionId: () => sessionId },
     ...extraCtx,
   };
-  return { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx };
+  return { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId };
 }
 
 // The ctx omp hands the agent_end hook: no waitForIdle (that is the whole point of Bug 1), and no
-// models either -- the restore goes through pi.setModel, not ctx.models.
-function eventCtx(cwd: string, ui: unknown) {
-  return { cwd, ui };
+// models either -- the restore goes through pi.setModel, not ctx.models. When a session id is
+// given, it carries the same `sessionManager` shape the real ExtensionContext exposes, so the
+// session-id matching can be exercised; without one it exercises the cwd fallback path.
+function eventCtx(cwd: string, ui: unknown, sessionId?: string) {
+  return {
+    cwd,
+    ui,
+    ...(sessionId !== undefined
+      ? { sessionManager: { getSessionId: () => sessionId } }
+      : {}),
+  };
 }
 
 await test("handoff model: --model X pins at the gate, no restore before the handler returns, restore(original) after a terminal agent_end", async () => {
@@ -1102,7 +1115,7 @@ await test("handoff model: --model X pins at the gate, no restore before the han
   });
   await writeProposedChange(cwd, "handoff-pin", ["- src/keep.ts"]);
 
-  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
   fakeUiWrap.selectQueue.push("2026-07-01 · Handoff Pin");
   fakeUiWrap.selectQueue.push("Approve & Execute");
 
@@ -1126,14 +1139,14 @@ await test("handoff model: --model X pins at the gate, no restore before the han
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "handoff-pin"/);
 
   // A non-terminal settle (willContinue: true) must not restore.
-  await agentEnd({ willContinue: true }, eventCtx(cwd, fakeUiWrap.ui));
+  await agentEnd({ willContinue: true }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.ok(
     !fakePiWrap.setModelCalls.includes("session-default-model"),
     "a willContinue settle is not a terminal settle -- no restore",
   );
 
   // The terminal settle restores the pre-run model and records the balancing apply end event.
-  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the pre-run model is restored after the execution settles");
   assert.ok(fakeUiWrap.notifications.some((n) => /Execution settled/.test(n.message)));
 
@@ -1142,6 +1155,72 @@ await test("handoff model: --model X pins at the gate, no restore before the han
   assert.ok(applyEnd, "a balancing apply end event exists");
   assert.equal(applyEnd.outcome, "handoff-settled");
   assert.equal(applyEnd.model, "pinned-model", "the apply end event carries the model execution ran on");
+});
+
+await test("handoff model: apply override without --model captures the session model and restores it after settle", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-05-handoff-applyonly.md", {
+    title: "Handoff Apply Only", status: "proposed", created: "2026-07-05", change_id: "handoff-applyonly",
+  });
+  await writeProposedChange(cwd, "handoff-applyonly", ["- src/keep.ts"]);
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-05 · Handoff Apply Only");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+
+  await handler("--phase-model apply=apply-model", ctx);
+
+  assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:apply-model"], "only the execution model is applied — there is no --model pin");
+  assert.equal(fakePiWrap.calls.length, 1, "the execution prompt was handed off");
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "handoff-applyonly"/);
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the session model captured before setModel is restored");
+
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-applyonly");
+  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-settled");
+  assert.equal(applyEnd?.model, "apply-model");
+});
+
+await test("handoff model: a new /readyset before settle supersedes the handoff — one apply end, restore, no double settle", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-06-handoff-supersede.md", {
+    title: "Handoff Supersede", status: "proposed", created: "2026-07-06", change_id: "handoff-supersede",
+  });
+  await writeProposedChange(cwd, "handoff-supersede", ["- src/keep.ts"]);
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-06 · Handoff Supersede");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+
+  await handler("--model pinned-model", ctx);
+  assert.equal(fakePiWrap.calls.length, 1, "execution was handed off");
+  assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "still armed — no restore yet");
+
+  // A second /readyset lands before any terminal agent_end. `--review <id>` reaches offerArchive,
+  // so queue an answer for its select. The review turn writes nothing (no queueEffect).
+  fakeUiWrap.selectQueue.push("Not yet");
+  await handler("--review handoff-supersede", ctx);
+
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the supersede restores the pre-run model");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /handoff-superseded/.test(n.message)),
+    "the supersede is notified: " + JSON.stringify(fakeUiWrap.notifications),
+  );
+
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-supersede");
+  const applyEnds = events.filter((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnds.length, 1, "exactly one apply end event");
+  assert.equal(applyEnds[0].outcome, "handoff-superseded");
+  assert.equal(applyEnds[0].model, "pinned-model", "the supersede carries the execution model");
+
+  // A later terminal agent_end must add nothing: the handoff is gone.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  const after = await phaseEventsArchivedOrLive(cwd, "handoff-supersede");
+  assert.equal(after.filter((e) => e.phase === "apply" && e.edge === "end").length, 1);
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "no double restore");
 });
 
 await test("handoff model: --phase-model apply=Y sets Y before the handoff and restores the original after settle", async () => {
@@ -1154,7 +1233,7 @@ await test("handoff model: --phase-model apply=Y sets Y before the handoff and r
   });
   await writeProposedChange(cwd, "handoff-phase", ["- src/keep.ts"]);
 
-  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
   fakeUiWrap.selectQueue.push("2026-07-02 · Handoff Phase");
   fakeUiWrap.selectQueue.push("Approve & Execute");
 
@@ -1165,7 +1244,7 @@ await test("handoff model: --phase-model apply=Y sets Y before the handoff and r
     fakeUiWrap.notifications.some((n) => /Execution runs on "apply-model" \(from --phase-model flag\)/.test(n.message)),
   );
 
-  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model");
 
   const events = await phaseEventsArchivedOrLive(cwd, "handoff-phase");
@@ -1184,7 +1263,7 @@ await test("handoff model: Discard restores the model immediately (unchanged beh
   });
   await writeProposedChange(cwd, "handoff-discard", ["- src/keep.ts"]);
 
-  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
   fakeUiWrap.selectQueue.push("2026-07-03 · Handoff Discard");
   fakeUiWrap.selectQueue.push("Discard");
 
@@ -1195,7 +1274,7 @@ await test("handoff model: Discard restores the model immediately (unchanged beh
   assert.equal(fakePiWrap.calls.length, 0, "no execution turn fires on discard");
 
   // A later terminal agent_end must add nothing: no pending handoff, no apply end event.
-  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:pinned-model", "session-default-model"]);
   const events = await phaseEventsArchivedOrLive(cwd, "handoff-discard");
   assert.ok(!events.some((e) => e.phase === "apply" && e.edge === "end"), "no handoff-settled apply end event for a discarded run");
