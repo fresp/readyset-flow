@@ -230,10 +230,6 @@ export interface PendingHandoff {
 	/** ISO timestamp of the approve that armed this handoff (persisted; see
 	 *  `persistPendingHandoff`). */
 	armedAt?: string;
-	/** The progress+tree fingerprint (`computePauseFingerprint`) recorded at the LAST pause,
-	 *  so the next terminal settle can tell "still working" from "stopped making progress" —
-	 *  see `handlePendingHandoff`'s pause branch. `undefined` before the first pause. */
-	pauseFingerprint?: string;
 	/** The review policy this run resolved, captured so a real settle (not a pause or a
 	 *  supersede) can apply it — see `applyReviewPolicyAtSettle`. */
 	reviewPolicy?: ArmedReviewPolicy;

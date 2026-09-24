@@ -47,11 +47,10 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
   already persisted to disk); "keep context" is the escape hatch.
 - **Execute** is handed off to core omp: approving captures the approve-base commit and the
   execution model, dispatches the change's `tasks.md` to omp's native runtime, and Readyset exits,
-  so subagents, parallel tool calls, and live task-checklist updates work as usual. Settling is
-  pause-aware — a terminal turn with tasks still unfinished just pauses (execution model stays
-  active) rather than ending the handoff, and it settles as stalled rather than arming forever if
-  two pauses in a row show no real progress — and keyed by session id, so a subagent's own settle
-  can never end the parent session's handoff. When it's done, Readyset's risk-based review policy
+  so subagents, parallel tool calls, and live task-checklist updates work as usual. The execution
+  ends when the model calls `readyset_done` (or every task is checked); a turn that stops mid-work
+  just pauses, and the next `/readyset` closes an abandoned one. It is keyed by session id, so a
+  subagent's own settle can never end the parent session's handoff. When it's done, Readyset's risk-based review policy
   decides whether to recommend `/readyset --review <change-id>` or skip it with an honest reason.
 
 Pin a cheaper model per phase with `--phase-model grill=... --phase-model explore=...` (see the

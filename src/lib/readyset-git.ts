@@ -1,12 +1,11 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { READYSET_ROOT, getProgress, readApproveBase, readDirtyBaseline } from "./readyset-spec.ts";
 
 /** Git-derived measurements: what this run changed, diff stats against the approve base, and
- *  the pause fingerprint. Never throws on a non-repo; callers treat that as "nothing changed". */
+ *  the run's own changed paths. Never throws on a non-repo; callers treat that as "nothing changed". */
 /**
  * True when the handed-off execution has run every task to completion. An unreadable tasks.md
  * counts as done, so a missing/renamed file cannot leave the handoff armed forever.
@@ -18,25 +17,6 @@ export async function executionComplete(cwd: string, changeId: string): Promise<
 	return progress === undefined || progress.total === 0 || progress.done === progress.total;
 }
 
-/**
- * Fingerprints "how far execution has gotten" at a pause: tasks.md's done/total count plus the
- * raw `git status --porcelain` text (so a change that only rewrites work already counted, or
- * only rearranges the tree without ticking a box, still shows as movement). Two pauses with the
- * same fingerprint mean nothing observable changed between them — see `handlePendingHandoff`'s
- * pause branch, which settles as `"handoff-stalled"` rather than pausing forever. Never throws:
- * an unreadable tasks.md or a git failure still yields a stable (if degraded) fingerprint rather
- * than blocking the pause record.
- */
-export async function computePauseFingerprint(cwd: string, changeId: string): Promise<string> {
-	const progress = await getProgress(cwd, changeId).catch(() => undefined);
-	const run = promisify(execFile);
-	const status = await run("git", ["status", "--porcelain", "-uall"], { cwd, timeout: 30000 })
-		.then((r) => r.stdout)
-		.catch(() => "");
-	return createHash("sha1")
-		.update(`${progress?.done ?? -1}/${progress?.total ?? -1}\n${status}`)
-		.digest("hex");
-}
 
 /**
  * Runs `git status --porcelain` in the repo root and returns the repo-relative paths of every

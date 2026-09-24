@@ -5,7 +5,7 @@ import { basename, join, relative } from "node:path";
 import type { ReadysetArgs } from "./readyset-args.ts";
 import { BRAINSTORM_DIR, type BrainstormMeta, loadBrainstorms, reconcileStatuses } from "./readyset-brainstorm.ts";
 import { EVIDENCE_MAX_OUTPUT_BYTES, EVIDENCE_TIMEOUT_MS, checkTaskEvidence, describeEvidenceConflict, findEvidenceConflicts, persistEvidence, runCommand, truncateForCapture } from "./readyset-evidence.ts";
-import { applyDiffStats, computePauseFingerprint, executionComplete, isPlanningPath, pathsChangedThisRun } from "./readyset-git.ts";
+import { applyDiffStats, executionComplete, isPlanningPath, pathsChangedThisRun } from "./readyset-git.ts";
 import { asReviewCtx, resolveHostSetModel, sessionMatches } from "./readyset-host.ts";
 import { type LaneDefault, readPhaseModels, readPinnedModel } from "./readyset-omp-config.ts";
 import { GRILL_ROUND_CAP, grillTurnPrompt } from "./readyset-prompts.ts";
@@ -242,7 +242,6 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			changeId: handoff.changeId,
 			...(handoff.sessionId !== undefined ? { sessionId: handoff.sessionId } : {}),
 			armedAt: handoff.armedAt ?? new Date().toISOString(),
-			...(handoff.pauseFingerprint !== undefined ? { pauseFingerprint: handoff.pauseFingerprint } : {}),
 			...(handoff.reviewPolicy !== undefined ? { reviewPolicy: handoff.reviewPolicy } : {}),
 			...(handoff.pauses ? { pauses: handoff.pauses } : {}),
 			...(handoff.blocks ? { blocks: handoff.blocks } : {}),
@@ -278,7 +277,6 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			cwd,
 			sessionId: mine.sessionId,
 			armedAt: mine.armedAt,
-			pauseFingerprint: mine.pauseFingerprint,
 			reviewPolicy: mine.reviewPolicy as ArmedReviewPolicy | undefined,
 			pauses: mine.pauses,
 			blocks: mine.blocks,
@@ -585,11 +583,10 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 		},
 		outcome: string,
 	): Promise<void> {
-		// A real settle (the execution signalled done, ran every task to completion, or stalled with
-		// real diff behind it) gets its diff measured NOW, live, against the approve base — not read
+		// A real settle (the execution signalled done, or ran every task to completion) gets its diff measured NOW, live, against the approve base — not read
 		// back from a stale event later — and the review policy applied. `handoff-superseded` and
 		// `handoff-orphaned` skip both: the execution was abandoned mid-run, nothing is conclusive.
-		const isRealSettle = outcome === "handoff-done" || outcome === "handoff-settled" || outcome === "handoff-stalled";
+		const isRealSettle = outcome === "handoff-done" || outcome === "handoff-settled";
 		const changedPaths = isRealSettle
 			? await pathsChangedThisRun(ctx.cwd, handoff.changeId).catch(() => [] as string[])
 			: undefined;
@@ -645,11 +642,6 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 		if (outcome === "handoff-superseded") {
 			ctx.ui.notify(
 				"A new /readyset command superseded the handed-off execution — the model this session had before the run is restored (handoff-superseded).",
-				"warning",
-			);
-		} else if (outcome === "handoff-stalled") {
-			ctx.ui.notify(
-				"The handed-off execution paused twice with no observable progress in between — treating it as stalled and restoring the model this session had before the run.",
 				"warning",
 			);
 		} else {
@@ -773,10 +765,9 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			if (handoff.signal?.status === "blocked") {
 				const blockedProgress = await getProgress(ctx.cwd, handoff.changeId).catch(() => undefined);
 				// An explicit block (readyset_done status "blocked"): the model stopped to ask the user
-				// something it cannot resolve alone. That is a pause by definition, never evidence of a
-				// stall — the fingerprint is reset so the stall check starts fresh after the user answers.
+				// something it cannot resolve alone — surface the question; the handoff stays armed.
 				const summary = handoff.signal.summary;
-				state.handoff = { ...handoff, signal: undefined, pauseFingerprint: undefined, blocks: (handoff.blocks ?? 0) + 1 };
+				state.handoff = { ...handoff, signal: undefined, blocks: (handoff.blocks ?? 0) + 1 };
 				await persistPendingHandoff(state.handoff);
 				const where = `${blockedProgress?.done ?? 0}/${blockedProgress?.total ?? 0} tasks`;
 				await appendContext(ctx.cwd, handoff.changeId, "Apply", `Execution blocked at ${where}: ${summary}`).catch(() => {});
@@ -786,40 +777,16 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 				);
 				return;
 			}
-			// Execution paused to ask a question / report a blocker. Idempotent: the pause is recorded
-			// in CONTEXT.md ONLY, never as a new `apply` `start` phase event — the old behavior wrote one
-			// per pause, so N pauses left N unbalanced `start`s and no `end` (round-3's own probe). A
-			// fingerprint of tasks.md progress + the raw working-tree status is compared against the
-			// fingerprint the LAST pause recorded: identical means nothing observable happened between
-			// the two pauses — the model has genuinely stopped making progress — so this settles as
-			// `"handoff-stalled"` instead of arming forever. A changed fingerprint means real work
-			// happened; the handoff stays armed, only the fingerprint and the CONTEXT.md note update.
+			// Unfinished, no signal: the execution paused (a question, a blocker, or simply a turn that
+			// ended mid-work). It stays armed — execution model active — until readyset_done, all tasks
+			// checked, or the next /readyset command supersedes it. No stall inference: the old
+			// progress+tree fingerprint (two identical pauses => "handoff-stalled") was a guess about a
+			// turn this extension no longer runs, and the source of most handoff bugs.
 			const progress = await getProgress(ctx.cwd, handoff.changeId).catch(() => undefined);
-			const done = progress?.done ?? 0;
-			const total = progress?.total ?? 0;
-			const fingerprint = await computePauseFingerprint(ctx.cwd, handoff.changeId);
-			if (handoff.pauseFingerprint !== undefined && handoff.pauseFingerprint === fingerprint) {
-				state.handoff = undefined;
-				state.handoffRestoreTarget = undefined;
-				await appendContext(
-					ctx.cwd,
-					handoff.changeId,
-					"Apply",
-					`Execution paused twice at ${done}/${total} tasks with no observable progress in between — settling as stalled.`,
-				).catch(() => {});
-				await settleHandoff(pi, ctx, handoff, "handoff-stalled");
-				return;
-			}
-			state.handoff = { ...handoff, pauseFingerprint: fingerprint, pauses: (handoff.pauses ?? 0) + 1 };
+			state.handoff = { ...handoff, pauses: (handoff.pauses ?? 0) + 1 };
 			await persistPendingHandoff(state.handoff);
-			await appendContext(
-				ctx.cwd,
-				handoff.changeId,
-				"Apply",
-				`Execution paused at ${done}/${total} tasks — execution model stays active until all tasks are done or the next /readyset command.`,
-			).catch(() => {});
 			ctx.ui.notify(
-				`Execution paused at ${done}/${total} tasks — execution model stays active. It is restored when all tasks are done or on the next /readyset command.`,
+				`Execution paused at ${progress?.done ?? 0}/${progress?.total ?? 0} tasks — the execution model stays active until it signals readyset_done, all tasks are checked, or the next /readyset command.`,
 				"info",
 			);
 			return; // handoff stays armed; state.handoffRestoreTarget stays set
@@ -1201,14 +1168,14 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 	 * Registers `readyset_done` — the executing model's explicit end-of-execution signal.
 	 *
 	 * Before it existed, "is the handed-off execution over?" was inferred at every terminal
-	 * `agent_end`: all boxes ticked meant settled, anything else a pause, and two pauses with an
-	 * identical progress+tree fingerprint a stall. That inference is the fallback now, not the rule:
+	 * `agent_end`: all boxes ticked meant settled, anything else a pause. The checkbox read is the
+	 * fallback now, not the rule:
 	 *   - `done` is recorded only when every task in tasks.md is checked AND carries a `_Verified:`
 	 *     note (the same check the session_stop gate applies) — otherwise the call is refused with the
 	 *     reason, so a premature "done" costs one tool call, not a wrong settle. The next terminal
 	 *     settle then closes the handoff as `handoff-done` (diff, review policy, model restore).
 	 *   - `blocked` needs the question/blocker as its summary; the next terminal settle records an
-	 *     explicit pause (never counted toward a stall) and surfaces the question to the user.
+	 *     explicit pause and surfaces the question to the user.
 	 * Only the session that armed the handoff may signal it: a subagent reports to its parent, which
 	 * decides. Approval tier `read`: it runs nothing, it only records Readyset's own state.
 	 */

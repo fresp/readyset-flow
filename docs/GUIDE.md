@@ -344,16 +344,12 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   event records how the execution got there (`handoff: { pauses, blocks, verificationBlocks,
   rehydrated, signal }`) and the review policy's decision (`reviewPolicy: { mode, decision,
   triggersFired }`), so the bench can score handoff outcomes directly.
-- **Settling is pause-aware and idempotent.** A *terminal* `agent_end` with tasks still unfinished
-  means execution paused to ask a question or report a blocker, not that it finished: the execution
-  model stays active, the handoff stays armed, and the pause is recorded as a `CONTEXT.md` line
-  only — never a new phase event, so N pauses never leave N unbalanced `apply` `start` events.
-  Each pause is fingerprinted (tasks.md's done/total count plus the raw `git status` text); if the
-  *next* pause's fingerprint is identical to the last one, nothing observably happened in between —
-  the run has genuinely stalled — and it settles right there as `outcome: "handoff-stalled"` rather
-  than arming forever. Real progress between two pauses just updates the fingerprint and the
-  `CONTEXT.md` note. The restore also happens once all tasks are done (`outcome:
-  "handoff-settled"`), or when the next `/readyset` command **supersedes** the handoff — that path
+- **Settling is simple and idempotent.** The handoff settles on exactly three things:
+  `readyset_done` with status `done` (`outcome: "handoff-done"`), a terminal `agent_end` with every
+  task checked (`outcome: "handoff-settled"`), or the next `/readyset` command **superseding** it.
+  A terminal `agent_end` with tasks still unfinished and no signal is a pause: the execution model
+  stays active and the handoff stays armed, never a new phase event. There is no stall inference —
+  an abandoned execution is closed by the next command. The supersede path
   restores the pre-run model and records `outcome: "handoff-superseded"`, so an interleaved run can
   never leave the session stuck. An automatic continuation (`willContinue`, e.g. an auto-retry) is
   never a terminal settle, so it neither pauses nor settles.

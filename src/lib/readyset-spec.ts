@@ -389,7 +389,7 @@ export async function readApproveBase(cwd: string, changeId: string): Promise<st
 
 /** File, inside a change directory, holding a handed-off execution that has not settled yet.
  *  Written when the gate hands execution off to core omp, rewritten at each pause, deleted when
- *  the handoff settles (settled, stalled, superseded or orphaned). The in-memory handoff state in
+ *  the handoff settles (done, settled, superseded or orphaned). The in-memory handoff state in
  *  readyset-review.ts is lost on an omp restart/crash/resume; this file is what lets the next
  *  terminal settle (or `/readyset --review <id>`) still close the `apply` window, re-attach
  *  readyset_verify and apply the review policy instead of leaving an unbalanced `apply` `start`.
@@ -402,8 +402,6 @@ export interface PersistedHandoff {
 	sessionId?: string;
 	/** ISO timestamp of the approve that armed this handoff. */
 	armedAt: string;
-	/** `computePauseFingerprint` at the last pause, if any. */
-	pauseFingerprint?: string;
 	/** The review policy resolved at arm time (readyset-review.ts `ArmedReviewPolicy`), kept
 	 *  opaque here: this file owns the format, the extension owns the meaning. */
 	reviewPolicy?: unknown;
@@ -429,7 +427,6 @@ export async function readHandoffState(cwd: string, changeId: string): Promise<P
 		const p = parsed as Partial<PersistedHandoff>;
 		if (p.changeId !== changeId || typeof p.armedAt !== "string") return undefined;
 		if (p.sessionId !== undefined && typeof p.sessionId !== "string") return undefined;
-		if (p.pauseFingerprint !== undefined && typeof p.pauseFingerprint !== "string") return undefined;
 		return p as PersistedHandoff;
 	} catch {
 		return undefined;
