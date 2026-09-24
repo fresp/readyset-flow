@@ -198,7 +198,6 @@ async function runOnce(opts: {
 
   fakeUiWrap.selectQueue.push(opts.pickLabel);
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  if (opts.archiveChoice) fakeUiWrap.selectQueue.push(opts.archiveChoice);
 
   fakePiWrap.queueEffect(async () => {
     await mkdir(dir, { recursive: true });
@@ -221,22 +220,28 @@ async function runOnce(opts: {
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), opts.applyBody ?? "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
-    for (const path of opts.driftPaths ?? []) {
-      await mkdir(join(opts.cwd, path, ".."), { recursive: true });
-      await writeFile(join(opts.cwd, path), "// drift\n", "utf8");
-    }
-    if (opts.seedEvidence) await seedEvidence(opts.cwd, opts.changeId, "1.1");
-  });
+
+  const ctx = { cwd: opts.cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler(opts.args, ctx);
+
+  // Readyset de-scoped to the Review Gate: once approved, it dispatches Apply to core omp.
+  // We simulate omp completing the tasks and writing any drift paths / evidence:
+  await writeFile(join(dir, "tasks.md"), opts.applyBody ?? "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+  for (const path of opts.driftPaths ?? []) {
+    await mkdir(join(opts.cwd, path, ".."), { recursive: true });
+    await writeFile(join(opts.cwd, path), "// drift\n", "utf8");
+  }
+  if (opts.seedEvidence) await seedEvidence(opts.cwd, opts.changeId, "1.1");
+
+  // Next, user or automation invokes on-demand review for the change:
+  if (opts.archiveChoice) fakeUiWrap.selectQueue.push(opts.archiveChoice);
   if (opts.reviewBody !== undefined) {
     fakePiWrap.queueEffect(async () => {
       await writeFile(join(dir, "REVIEW.md"), opts.reviewBody as string, "utf8");
     });
   }
+  await handler(`--review ${opts.changeId}`, ctx);
 
-  const ctx = { cwd: opts.cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler(opts.args, ctx);
   return { fakePiWrap, fakeUiWrap };
 }
 
@@ -473,7 +478,7 @@ await test("end-to-end: auto reviews a fast-lane change when scope drift fires",
 
   const end = await reviewEndEvent(cwd, "drift-change");
   assert.ok(end?.review, "review end event carries the review field");
-  assert.equal(end?.review?.outcome, "ran");
+  assert.equal(end?.review?.outcome, "on-demand");
   assert.ok((end?.review?.triggersEvaluated.length ?? 0) > 0, "auto evaluates triggers even when the lane exempts nothing");
   assert.ok(end?.review?.triggersFired.includes("scope-drift"), "scope-drift is the trigger that fired");
   assert.match(reviewCall.prompt, /triggered by: scope-drift/);
@@ -505,7 +510,7 @@ await test("end-to-end: sensitive-path fires review on a changed file under src/
   assert.match(reviewCall.prompt, /triggered by: [^.]*sensitive-path/);
   assert.match(reviewCall.prompt, /start from the diff/);
   const end = await reviewEndEvent(cwd, "sensitive-change");
-  assert.equal(end?.review?.outcome, "ran");
+  assert.equal(end?.review?.outcome, "on-demand");
   assert.ok(end?.review?.triggersFired.includes("sensitive-path"), "sensitive-path is the trigger that fired");
 });
 
@@ -562,7 +567,9 @@ await test("end-to-end: auto reviews when a checked task's latest evidence exite
   });
   // Now overwrite the seeded record with a failing one and confirm the trigger evaluates false
   // on the clean run and the conflict path is what the unit test pins (above).
-  assert.equal(second.fakePiWrap.calls.length, 2, "clean evidence + clear clarity skips review");
+  assert.equal(second.fakePiWrap.calls.length, 3, "Propose + Apply handoff + review turn");
+  const end2 = await reviewEndEvent(cwd2, "conflict-change-2");
+  assert.ok(!end2?.review?.triggersFired.includes("evidence-conflict"));
 });
 
 await test("end-to-end: auto reviews a change whose diff exceeds the size thresholds", async () => {
@@ -582,7 +589,9 @@ await test("end-to-end: auto reviews a change whose diff exceeds the size thresh
     reviewBody: "## Findings\n\nBig diff.\n",
     archiveChoice: "Not yet",
   });
-  assert.equal(fakePiWrap.calls.length, 2, "a small diff on a clean change does not fire");
+  assert.equal(fakePiWrap.calls.length, 3, "Propose + Apply handoff + review turn");
+  const endSmall = await reviewEndEvent(cwd, "big-change");
+  assert.ok(!endSmall?.review?.triggersFired.includes("diff-size"), "a small diff on a clean change does not fire diff-size");
 
   // Now the same shape but with a recorded big apply diff: re-run against a fresh change.
   const cwd2 = await freshRepo();
@@ -650,49 +659,37 @@ await test("end-to-end: auto reviews a change whose clarity is partial", async (
   assert.deepEqual(end?.review?.triggersFired, ["clarity"]);
 });
 
-await test("end-to-end: auto skips review, writes a stub, and records every trigger as not fired", async () => {
+await test("end-to-end: main command stops at Review Gate and dispatches to omp without running review", async () => {
   await clearConfig();
   const cwd = await freshRepo();
   await seedBrainstorm(cwd, { changeId: "clean-change", lane: "fast", clarity: "clear" });
 
-  const { fakePiWrap, fakeUiWrap } = await runOnce({
-    cwd,
-    changeId: "clean-change",
-    args: "--lane fast --fast",
-    lane: "fast",
-    pickLabel: "2026-01-01 · My Feature",
-    seedEvidence: true,
-    archiveChoice: "Not yet",
+  const fakePiWrap = makeFakePi();
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const dir = join(cwd, "readyset", "changes", "clean-change");
+  fakeUiWrap.selectQueue.push("2026-01-01 · My Feature");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "proposal.md"),
+      "---\nlane: fast\n---\n## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/thing.ts (new)\n\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
 
-  // Two turns only: Propose + Apply. No Code-review turn fired.
-  assert.equal(fakePiWrap.calls.length, 2, "no review turn on a no-trigger change");
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--lane fast --fast", ctx);
+
+  // Two calls only: Propose turn + sendUserMessage(Apply handoff). No review turn.
+  assert.equal(fakePiWrap.calls.length, 2, "no review turn inside main command");
   assert.ok(!fakePiWrap.calls.some((c) => /Critically review/.test(c.prompt)));
-
-  const stub = await readFile(changePaths(cwd, "clean-change").review, "utf8");
-  assert.match(stub, /Review skipped \(auto\): no risk trigger/);
-
-  const end = await reviewEndEvent(cwd, "clean-change");
-  assert.equal(end?.outcome, "skipped-no-trigger");
-  assert.equal(end?.review?.outcome, "skipped-no-trigger");
-  assert.equal(end?.review?.mode, "auto");
-  assert.deepEqual(
-    end?.review?.triggersEvaluated.map((t) => t.name),
-    ["scope-drift", "evidence-conflict", "no-evidence", "diff-size", "sensitive-path", "protected-path", "clarity", "open-decisions"],
-  );
-  assert.ok(end?.review?.triggersEvaluated.every((t) => !t.fired), "every evaluated trigger must have fired=false");
-  assert.deepEqual(end?.review?.triggersFired, []);
-
-  // CONTEXT.md holds exactly the two `review` events (start + end).
-  const raw = await readFile(changePaths(cwd, "clean-change").context, "utf8");
-  assert.equal((raw.match(/"phase":"review"/g) ?? []).length, 2);
-  assert.match(raw, /"outcome":"skipped-no-trigger"/);
-  assert.match(raw, /"review":\{/);
-
-  assert.ok(fakeUiWrap.selectPrompts.some((p) => /Code review skipped \(auto\): no risk trigger/.test(p)));
+  assert.match(fakePiWrap.calls[1].prompt, /Implement the Readyset change/);
 });
 
-await test("end-to-end: readyset.review.fullLane = always reviews a full-lane change with no triggers", async () => {
+await test("end-to-end: readyset.review.fullLane = always reviews a full-lane change on demand", async () => {
   await clearConfig();
   const cwd = await freshRepo();
   await seedBrainstorm(cwd, { changeId: "full-clean", lane: "full", clarity: "clear" });
@@ -706,73 +703,63 @@ await test("end-to-end: readyset.review.fullLane = always reviews a full-lane ch
     archiveChoice: "Not yet",
   });
 
-  // Full lane: Explore + Propose + Apply + Code review = 4 turns.
-  assert.equal(fakePiWrap.calls.length, 4, "full-lane change is reviewed by default");
+  // Full lane: Explore + Propose + sendUserMessage(Apply) + Code review = 4 calls.
+  assert.equal(fakePiWrap.calls.length, 4, "full-lane change is reviewed on demand");
   assert.match(fakePiWrap.calls[3].prompt, /Critically review the implementation/);
 
   const end = await reviewEndEvent(cwd, "full-clean");
-  assert.equal(end?.review?.outcome, "ran");
+  assert.equal(end?.review?.outcome, "on-demand");
   assert.equal(end?.review?.mode, "auto");
   assert.ok((end?.review?.triggersEvaluated.length ?? 0) > 0, "the full-lane exemption still records the observed triggers");
 });
 
-await test("end-to-end: readyset.review.fullLane = auto lets a full-lane change skip on no triggers", async () => {
-  await writeConfig("readyset:\n  review:\n    mode: auto\n    fullLane: auto\n");
+await test("end-to-end: full-lane change stops at Review Gate and dispatches to omp", async () => {
+  await clearConfig();
   const cwd = await freshRepo();
   await seedBrainstorm(cwd, { changeId: "full-clean-2", lane: "full", clarity: "clear" });
 
-  const { fakePiWrap } = await runOnce({
-    cwd,
-    changeId: "full-clean-2",
-    args: "",
-    pickLabel: "2026-01-01 · My Feature",
-    seedEvidence: true,
-    archiveChoice: "Not yet",
+  const fakePiWrap = makeFakePi();
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const dir = join(cwd, "readyset", "changes", "full-clean-2");
+  fakeUiWrap.selectQueue.push("2026-01-01 · My Feature");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(dir, "specs", "my-cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/thing.ts (new)\n", "utf8");
+    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await writeFile(
+      join(dir, "specs", "my-cap", "spec.md"),
+      "## Purpose\n\nx\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** b\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
 
-  assert.equal(fakePiWrap.calls.length, 3, "fullLane: auto lets the full lane skip too");
-  const end = await reviewEndEvent(cwd, "full-clean-2");
-  assert.equal(end?.review?.outcome, "skipped-no-trigger");
-  await clearConfig();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 3, "Explore + Propose + sendUserMessage(Apply handoff)");
+  assert.ok(!fakePiWrap.calls.some((c) => /Critically review/.test(c.prompt)));
 });
 
-await test("end-to-end: --review never skips a trigger-rich change; --review always reviews a clean one", async () => {
+await test("end-to-end: on-demand review always reviews regardless of triggers", async () => {
   await clearConfig();
   const cwd = await freshRepo();
-  await seedBrainstorm(cwd, { changeId: "never-change", lane: "full", clarity: "ambiguous" });
-
-  const never = await runOnce({
-    cwd,
-    changeId: "never-change",
-    args: "--review never",
-    pickLabel: "2026-01-01 · My Feature",
-    archiveChoice: "Not yet",
-  });
-  assert.equal(never.fakePiWrap.calls.length, 3, "no review turn under --review never");
-  const neverEnd = await reviewEndEvent(cwd, "never-change");
-  assert.equal(neverEnd?.review?.outcome, "skipped-flag");
-  assert.equal(neverEnd?.review?.mode, "never");
-  assert.deepEqual(neverEnd?.review?.triggersEvaluated, []);
-  const stub = await readFile(changePaths(cwd, "never-change").review, "utf8");
-  assert.match(stub, /Review skipped \(never\): readyset.review.mode = never/);
-
-  const cwd2 = await freshRepo();
-  await seedBrainstorm(cwd2, { changeId: "always-change", lane: "fast", clarity: "clear" });
+  await seedBrainstorm(cwd, { changeId: "always-change", lane: "fast", clarity: "clear" });
   const always = await runOnce({
-    cwd: cwd2,
+    cwd,
     changeId: "always-change",
-    args: "--review always --lane fast --fast",
+    args: "--lane fast --fast",
     lane: "fast",
     pickLabel: "2026-01-01 · My Feature",
     seedEvidence: true,
     reviewBody: "## Findings\n\nNothing.\n",
     archiveChoice: "Not yet",
   });
-  assert.equal(always.fakePiWrap.calls.length, 3, "--review always fires the review turn regardless of triggers");
-  const alwaysEnd = await reviewEndEvent(cwd2, "always-change");
-  assert.equal(alwaysEnd?.review?.outcome, "ran");
-  assert.equal(alwaysEnd?.review?.mode, "always");
-  assert.deepEqual(alwaysEnd?.review?.triggersEvaluated, []);
+  assert.equal(always.fakePiWrap.calls.length, 3, "Propose + Apply handoff + on-demand review turn");
+  const alwaysEnd = await reviewEndEvent(cwd, "always-change");
+  assert.equal(alwaysEnd?.review?.outcome, "on-demand");
 });
 
 // ===========================================================================

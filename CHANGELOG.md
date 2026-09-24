@@ -6,6 +6,18 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## Unreleased
+
+Introduces seamless Grilling-to-Propose transitions, Review Gate direct handoff to native core OMP runtime, and on-demand code review and archiving.
+
+### Added
+- **Seamless Grilling → Propose transition**: When grilling finishes and writes `.ai/brainstorms/<date>-<slug>.md`, Readyset immediately prompts the user with a confirmation dialog to proceed with Explore & Propose in the active session, eliminating manual re-selection from the picker while maximizing prompt cache prefix reuse.
+- **Native core OMP handoff at Review Gate**: Scoped Readyset strictly to Grill → Explore → Propose → Review Gate. Upon choosing "Approve & Execute" (or "Approve & Execute, keep context"), Readyset marks the change approved, appends the handoff to `CONTEXT.md` and phase events (`outcome: "handoff-omp"`), clears editor text and widget, dispatches `applyTurnPrompt` via `pi.sendUserMessage` directly to native `omp`, and exits immediately. This enables omp's full native execution capabilities, including subagents, parallel execution, and real-time task checklist updates.
+- **On-demand code review & archiving**: Code review is invoked explicitly via `/readyset --review <change-id>`, which evaluates risk triggers against working tree changes, runs an adversarial code review turn, writes `REVIEW.md`, and prompts to archive the change.
+
+### Changed
+- **De-scoped execution runtime**: Removed internal `applyLoop` (which executed Apply, verification retries, scope reconciliation, and code review within a single command loop) in favor of native core omp execution handoff.
+
 ## 0.15.0 - 2026-09-23
 
 Introduces risk-based code review, open decision handling, bounded review repairs, and safe scope reconciliation.

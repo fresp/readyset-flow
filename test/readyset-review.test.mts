@@ -310,8 +310,6 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
   fakeUiWrap.selectQueue.push("2026-01-01 · My Feature");
   // 2nd select (inside reviewAndMaybeExecute, after propose lands): Approve & Execute
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  // 3rd select: archive prompt (verification note is present, so the "send back" gate is skipped)
-  fakeUiWrap.selectQueue.push("Archive now");
 
   const dir = join(cwd, "readyset", "changes", "my-feature");
 
@@ -332,35 +330,39 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
-  // Apply turn effect: marks all tasks done, with a verification note
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
-  });
-  // Code-review turn effect: writes REVIEW.md
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
 
-  assert.equal(fakePiWrap.calls.length, 4);
+  assert.equal(fakePiWrap.calls.length, 3);
   assert.match(fakePiWrap.calls[0].prompt, /Explore the ground truth for the Readyset change "my-feature"/);
   assert.match(fakePiWrap.calls[1].prompt, /Create a Readyset change named "my-feature"/);
   assert.ok(!/FAST lane/.test(fakePiWrap.calls[1].prompt), "full-lane Propose must not carry the fast-lane suffix");
   assert.match(fakePiWrap.calls[2].prompt, /Implement the Readyset change "my-feature"/);
-  assert.match(fakePiWrap.calls[3].prompt, /Critically review the implementation of Readyset change "my-feature"/);
-  assert.ok(!/mutation-testing-style/.test(fakePiWrap.calls[3].prompt), "full-lane review keeps mutation-testing depth");
 
-  // Brainstorm file should now say approved (markApproved happened before apply)
+  // Brainstorm file should now say approved (markApproved happened before apply handoff)
   const raw = await readFile(join(cwd, ".ai", "brainstorms", "2026-01-01-my-feature.md"), "utf8");
   assert.match(raw, /status: approved/);
+  assert.ok(fakeUiWrap.notifications.some((n) => /Handing off execution to core omp/.test(n.message)));
+
+  // Simulate core omp completing the tasks
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+
+  // On-demand code review and archive
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Archive now");
+  await handler("--review my-feature", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 4);
+  assert.match(fakePiWrap.calls[3].prompt, /Critically review the implementation of Readyset change "my-feature"/);
+  assert.ok(!/mutation-testing-style/.test(fakePiWrap.calls[3].prompt), "full-lane review keeps mutation-testing depth");
 
   // Archive happened: change dir moved, main spec created
   const mainSpec = await readFile(join(cwd, "readyset", "specs", "my-cap", "spec.md"), "utf8");
   assert.match(mainSpec, /Foo/);
 
-  assert.ok(fakeUiWrap.notifications.some((n) => /Implementation complete: 1\/1/.test(n.message)));
   assert.ok(fakeUiWrap.notifications.some((n) => /Archived to/.test(n.message)));
 
   // CONTEXT.md audit trail should have been left behind before the dir got archived-away --
@@ -393,7 +395,6 @@ await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and
 
   fakeUiWrap.selectQueue.push("2026-01-28 · Fast Fix"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Archive now");
 
   const dir = join(cwd, "readyset", "changes", "fast-fix");
 
@@ -408,34 +409,38 @@ await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
-  // Apply effect
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
-  });
-  // Code-review effect
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("--lane fast", ctx);
 
-  // 3 turns, not 4: no Explore turn fired at all.
-  assert.equal(fakePiWrap.calls.length, 3);
+  // 2 calls: Propose turn + Apply handoff to omp (no Explore)
+  assert.equal(fakePiWrap.calls.length, 2);
   assert.ok(!fakePiWrap.calls.some((c) => /Explore the ground truth/.test(c.prompt)), "fast lane must not fire Explore");
   const propose = fakePiWrap.calls.find((c) => /Create a Readyset change/.test(c.prompt));
   assert.ok(propose, "Propose still fires");
   assert.match(propose.prompt, /FAST lane/, "fast-lane Propose carries the tight-planning suffix");
   assert.match(propose.prompt, /at most ~8 tasks/, "fast-lane Propose caps the task count");
-  const review = fakePiWrap.calls.find((c) => /Critically review/.test(c.prompt));
-  assert.ok(review, "Code review still fires");
-  assert.match(review.prompt, /skip mutation-testing-style probes/, "fast-lane review narrows its depth");
 
   // The override must be announced, since the file said full.
   assert.ok(
     fakeUiWrap.notifications.some((n) => /--lane override.*full/.test(n.message)),
     "the --lane override over a differing recorded lane must notify",
   );
+
+  // Simulate omp completing tasks
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+
+  // On-demand code review
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Archive now");
+  await handler("--review fast-fix", ctx);
+
+  assert.equal(fakePiWrap.calls.length, 3);
+  const review = fakePiWrap.calls.find((c) => /Critically review/.test(c.prompt));
+  assert.ok(review, "Code review fires via on-demand");
+  assert.match(review.prompt, /skip mutation-testing-style probes/, "fast-lane review narrows its depth");
 
   // CONTEXT.md records the folded Explore, not a missing one.
   const contextRaw = await readFile(
@@ -447,7 +452,7 @@ await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and
   }
 });
 
-await test("verification gate: missing _Verified notes sends back for another apply turn before code review", async () => {
+await test("review gate: approving an already-proposed change dispatches apply prompt with verification requirement to omp", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-08-unverified.md", {
     title: "Unverified",
@@ -470,35 +475,14 @@ await test("verification gate: missing _Verified notes sends back for another ap
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push("2026-01-08 · Unverified"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Send back for verification"); // missing _Verified: note triggers this gate
-  fakeUiWrap.selectQueue.push("Archive now"); // after the loop re-enters, Approve & Execute again -> Archive now
-
-  // 1st apply effect: checks the box but forgets the _Verified: note
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n", "utf8");
-  });
-  // 2nd apply effect (after "Send back"): adds the note
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: ran it, works_\n", "utf8");
-  });
-  // code-review effect
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
 
-  assert.ok(
-    fakeUiWrap.selectPrompts.some((p) => /have no _Verified: note/.test(p)),
-    "should have surfaced the missing-verification gate",
-  );
-  assert.equal(fakePiWrap.calls.length, 3); // apply, apply-again, code-review (no re-propose)
-  // The send-back retry must NOT re-send the full apply prompt — it fires the narrow verification-fix
-  // prompt that forbids code changes (the wall-time / timeout fix).
-  assert.match(fakePiWrap.calls[1].prompt, /Implementation is already finished\. Do NOT modify any code\./);
-  assert.doesNotMatch(fakePiWrap.calls[1].prompt, /Implement the Readyset change "unverified"/);
-  assert.ok(fakeUiWrap.notifications.some((n) => /Archived to/.test(n.message)));
+  assert.equal(fakePiWrap.calls.length, 1);
+  assert.match(fakePiWrap.calls[0].prompt, /MANDATORY: every task you complete/);
+  assert.match(fakePiWrap.calls[0].prompt, /_Verified: <command and result>_/);
+  assert.ok(fakeUiWrap.notifications.some((n) => /Handing off execution to core omp/.test(n.message)));
 });
 
 await test("propose fails to produce a valid change -> warns, does not enter review", async () => {
@@ -570,7 +554,7 @@ await test("already-proposed brainstorm: goes straight to review gate, refine lo
   assert.match(fakeUiWrap.widgetHistory[1].join("\n"), /pass/);
 });
 
-await test("approve & execute pauses when tasks incomplete (agent stopped early)", async () => {
+await test("approve & execute hands off execution to core omp and exits", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-04-partial.md", { title: "Partial", status: "proposed", created: "2026-01-04", change_id: "partial" });
   const dir = join(cwd, "readyset", "changes", "partial");
@@ -589,17 +573,12 @@ await test("approve & execute pauses when tasks incomplete (agent stopped early)
   fakeUiWrap.selectQueue.push("2026-01-04 · Partial");
   fakeUiWrap.selectQueue.push("Approve & Execute");
 
-  fakePiWrap.queueEffect(async () => {
-    // agent only completes one of two tasks, then "stops" (simulating a blocker)
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n- [ ] 1.2 b\n", "utf8");
-  });
-
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
 
-  assert.ok(fakeUiWrap.notifications.some((n) => /Paused at 1\/2 tasks/.test(n.message) && n.level === "warning"));
-  // no archive prompt should have been offered
-  assert.equal(fakeUiWrap.selectPrompts.length, 2); // pick + review gate only
+  assert.ok(fakeUiWrap.notifications.some((n) => /Handing off execution to core omp/.test(n.message)));
+  assert.equal(fakePiWrap.calls.length, 1);
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "partial"/);
 });
 
 await test("--fast flag includes fast-lane brainstorms; default excludes them", async () => {
@@ -636,11 +615,9 @@ await test("--lane fast lists a fast-lane brainstorm, opens the picker, and runs
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push("2026-01-30 · Fast Street");
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Archive now");
 
   const dir = join(cwd, "readyset", "changes", "fast-street");
-  // Fast lane: the first (and only) planning turn is Propose. Mirrors the fast-lane fixture at
-  // test/readyset-review.test.mts:399-413.
+  // Fast lane: the first (and only) planning turn is Propose.
   fakePiWrap.queueEffect(async () => {
     await mkdir(dir, { recursive: true });
     await writeFile(
@@ -650,19 +627,11 @@ await test("--lane fast lists a fast-lane brainstorm, opens the picker, and runs
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
-  });
-  // Code-review effect (the live fast lane still runs review, just narrowed).
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("--lane fast", ctx);
 
-  // The picker really opened — this is the regression: the bug filtered the list to [] and
-  // warned instead, so select() was never called.
+  // The picker really opened
   assert.equal(fakeUiWrap.selectPrompts.length >= 1, true, "the brainstorm picker opened");
   assert.equal(
     fakeUiWrap.notifications.filter((n) => /No full-lane brainstorms found/.test(n.message)).length,
@@ -670,9 +639,8 @@ await test("--lane fast lists a fast-lane brainstorm, opens the picker, and runs
     "an explicit --lane must not warn that no full-lane brainstorms exist",
   );
 
-  // 3 turns (Propose, Apply, Review) — the fast lane fires no Explore turn (mirrors the
-  // existing fast-lane fixture at test/readyset-review.test.mts:399-413).
-  assert.equal(fakePiWrap.calls.length, 3, "Propose then Apply then Review, no Explore");
+  // 2 calls: Propose then Apply handoff to omp, no Explore
+  assert.equal(fakePiWrap.calls.length, 2, "Propose then handoff to omp, no Explore");
   assert.ok(!fakePiWrap.calls.some((c) => /Explore the ground truth/.test(c.prompt)), "fast lane must not fire Explore");
   assert.ok(fakePiWrap.calls.some((c) => /Create a Readyset change/.test(c.prompt)), "Propose still fires");
 
@@ -2032,16 +2000,6 @@ await test("Approve & Execute compacts first: ctx.compact() with internalGuidanc
 
   fakeUiWrap.selectQueue.push("2026-01-20 · Compact Test"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
-
-  // Apply turn effect
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-  });
-  // Code-review turn effect
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
 
   const compactCalls: unknown[] = [];
   const ctx = {
@@ -2060,13 +2018,12 @@ await test("Approve & Execute compacts first: ctx.compact() with internalGuidanc
   assert.match(opts.internalGuidance ?? "", /readyset\/changes\/compact-test/, "internalGuidance should point at the persisted artifacts");
   assert.equal(opts.suppressContinuation, true, "the caller dispatches Apply itself right after, so continuation must be suppressed");
 
-  // Same destination as Approve & Execute once compaction is done: Apply, then Code review.
-  assert.equal(fakePiWrap.calls.length, 2);
+  // Same destination as Approve & Execute once compaction is done: hands off Apply to core omp.
+  assert.equal(fakePiWrap.calls.length, 1);
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "compact-test"/);
-  assert.match(fakePiWrap.calls[1].prompt, /Critically review the implementation of Readyset change "compact-test"/);
 });
 
-await test("Approve & Execute, keep context skips compact but still runs Apply and Code review", async () => {
+await test("Approve & Execute, keep context skips compact and hands off Apply to omp", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-21-keepctx.md", {
     title: "Keep Context Test",
@@ -2085,16 +2042,8 @@ await test("Approve & Execute, keep context skips compact but still runs Apply a
 
   fakeUiWrap.selectQueue.push("2026-01-21 · Keep Context Test"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
-  fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
 
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  // With a compact-capable ctx, "keep context" must NOT call it — but Apply/Code review fire.
+  // With a compact-capable ctx, "keep context" must NOT call it — but Apply hands off to omp.
   const compactCalls: unknown[] = [];
   const ctx = {
     cwd,
@@ -2107,7 +2056,7 @@ await test("Approve & Execute, keep context skips compact but still runs Apply a
   await handler("", ctx);
 
   assert.equal(compactCalls.length, 0, "keep-context must not compact");
-  assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire");
+  assert.equal(fakePiWrap.calls.length, 1, "Apply handoff should still fire");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "keep-context-test"/);
 });
 
@@ -2130,14 +2079,6 @@ await test("Approve & Execute degrades to plain execution when ctx.compact isn't
 
   fakeUiWrap.selectQueue.push("2026-01-22 · No Compact Test"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet"); // skip the archive prompt
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
 
   // No `compact` on this ctx at all -- an older omp build, or one that never exposed it.
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
@@ -2147,7 +2088,7 @@ await test("Approve & Execute degrades to plain execution when ctx.compact isn't
     fakeUiWrap.notifications.some((n) => /Compact isn't available in this context/.test(n.message)),
     "should warn that it's proceeding without compacting",
   );
-  assert.equal(fakePiWrap.calls.length, 2, "Apply and Code review should still fire");
+  assert.equal(fakePiWrap.calls.length, 1, "Apply handoff should still fire");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "no-compact-test"/);
 });
 
@@ -2258,25 +2199,22 @@ await test("post-Apply scope drift: warns and surfaces the out-of-contract file 
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push("2026-02-03 · Drift Test"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
-  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
-
-  // Apply turn: finish the task AND touch a file outside the contract.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await mkdir(join(cwd, "src"), { recursive: true });
-    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
 
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /outside its scope contract during Apply/.test(n.message) && /src\/rogue\.ts/.test(n.message)),
-    "should warn that Apply drifted outside the scope contract",
-  );
+  // Core omp executes and touches a file outside the contract:
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
+
+  // On-demand review:
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
+  await handler("--review drift-test", ctx);
+
   assert.ok(
     fakeUiWrap.selectPrompts.some((p) => /outside the contract/.test(p) && /src\/rogue\.ts/.test(p)),
     "the archive prompt should surface the drift",
@@ -2462,7 +2400,6 @@ await test("fast-lane run records its effective lane and the full phase-boundary
 
   fakeUiWrap.selectQueue.push("2026-02-01 · Fast Fix"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Archive now");
 
   const dir = join(cwd, "readyset", "changes", "fast-fix");
   // No Explore effect: fast lane never fires an Explore turn.
@@ -2475,15 +2412,17 @@ await test("fast-lane run records its effective lane and the full phase-boundary
     );
     await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
   });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("--lane fast", ctx);
+
+  // Complete tasks and run on-demand review to archive:
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 do thing\n  _Verified: ran the thing, it worked_\n", "utf8");
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nNo blockers found.\n", "utf8");
+  });
+  fakeUiWrap.selectQueue.push("Archive now");
+  await handler("--review fast-fix", ctx);
 
   // The change was archived to changes/archive/<date>-fast-fix/, so the events live in the
   // archived CONTEXT.md. Fall back to the live path if the archive move did not happen.
@@ -2510,14 +2449,13 @@ await test("fast-lane run records its effective lane and the full phase-boundary
   assert.equal(gate.outcome, "approve");
   assert.equal(gate.lane, "fast");
 
-  assert.ok(all.some((e) => e.phase === "apply" && e.edge === "end"), "an apply end event exists");
+  assert.ok(all.some((e) => e.phase === "apply" && e.edge === "start"), "an apply start event exists");
   assert.ok(all.some((e) => e.phase === "review" && e.edge === "end"), "a review end event exists");
   assert.ok(all.some((e) => e.phase === "archive" && e.edge === "end"), "an archive end event exists");
 
   for (const e of all) {
     if (e.phase === "grill") continue;
     assert.equal(e.lane, "fast", `event ${e.phase}/${e.edge} carries the effective lane`);
-    assert.equal(e.laneSource, "flag", `event ${e.phase}/${e.edge} attributes the lane to the flag`);
   }
 
   const grill = all.find((e) => e.phase === "grill" && e.edge === "end");
@@ -2963,318 +2901,6 @@ async function writeReconcileChange(cwd: string, changeId: string) {
   return dir;
 }
 
-await test("S1: unjustified drift triggers exactly one reconciliation turn, which fixes it", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-01-recon1.md", {
-    title: "Reconcile One",
-    status: "proposed",
-    created: "2026-04-01",
-    change_id: "recon1",
-  });
-  const dir = await writeReconcileChange(cwd, "recon1");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-01 · Reconcile One"); // pick
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
-
-  // Apply: complete the task AND touch a file outside the contract.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
-  });
-  // Reconciliation: revert src/rogue.ts.
-  fakePiWrap.queueEffect(async () => {
-    await rm(join(cwd, "src", "rogue.ts"), { force: true });
-  });
-  // Review.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.ok(
-    fakePiWrap.calls.some((c) => /scope contract does NOT name/.test(c.prompt) && /src\/rogue\.ts/.test(c.prompt)),
-    "a reconciliation turn fired naming the out-of-contract file",
-  );
-  const events = await readPhaseEvents(cwd, "recon1");
-  const recStarts = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "start");
-  const recEnds = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "end");
-  assert.equal(recStarts.length, 1, "exactly one reconciliation turn started");
-  assert.equal(recEnds.length, 1, "exactly one reconciliation end event");
-  assert.equal(recEnds[0].outcome, "fixed");
-  assert.equal(recEnds[0].counts?.outsideBefore, 1);
-  assert.equal(recEnds[0].counts?.unjustifiedAfter, 0);
-});
-
-await test("S2: already-justified drift triggers no reconciliation", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-02-recon2.md", {
-    title: "Reconcile Two",
-    status: "proposed",
-    created: "2026-04-02",
-    change_id: "recon2",
-  });
-  const dir = await writeReconcileChange(cwd, "recon2");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-02 · Reconcile Two");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n\n## Scope deviations\n\n- src/rogue.ts — required by scenario X\n", "utf8");
-    await writeFile(join(cwd, "src", "rogue.ts"), "// justified\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.ok(!fakePiWrap.calls.some((c) => /scope contract does NOT name/.test(c.prompt)), "no reconciliation turn fires");
-  const events = await readPhaseEvents(cwd, "recon2");
-  assert.ok(!events.some((e) => e.phase === "scope-reconcile"), "no scope-reconcile event exists");
-});
-
-await test("S3: a clean scope triggers no reconciliation", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-03-recon3.md", {
-    title: "Reconcile Three",
-    status: "proposed",
-    created: "2026-04-03",
-    change_id: "recon3",
-  });
-  const dir = await writeReconcileChange(cwd, "recon3");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-03 · Reconcile Three");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.ok(!fakePiWrap.calls.some((c) => /scope contract does NOT name/.test(c.prompt)), "no reconciliation turn fires");
-  const events = await readPhaseEvents(cwd, "recon3");
-  assert.ok(!events.some((e) => e.phase === "scope-reconcile"), "no scope-reconcile event exists");
-});
-
-await test("S4: an exhausted budget skips reconciliation and keeps the warning", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-04-recon4.md", {
-    title: "Reconcile Four",
-    status: "proposed",
-    created: "2026-04-04",
-    change_id: "recon4",
-  }, VALID_BRAINSTORM_BODY);
-  const dir = await writeReconcileChange(cwd, "recon4");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-04 · Reconcile Four");
-  // 9 Refine rounds consume 9 turns; the Apply turn is the 10th and exhausts the budget.
-  for (let i = 0; i < 9; i++) {
-    fakeUiWrap.selectQueue.push("Refine");
-    fakeUiWrap.inputQueue.push(`round ${i}`);
-  }
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  for (let i = 0; i < 9; i++) {
-    fakePiWrap.queueEffect(async () => {
-      // No-op refine: the contract stays resolvable (src/keep.ts exists).
-      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
-    });
-  }
-  // Apply: unjustified drift.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
-  });
-  // Review.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const events = await readPhaseEvents(cwd, "recon4");
-  const recEnds = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "end");
-  assert.equal(recEnds.length, 1, "exactly one reconciliation end event");
-  assert.equal(recEnds[0].outcome, "skipped-budget");
-  assert.equal(recEnds[0].counts?.unjustifiedAfter, 1);
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /starve the code-review turn/.test(n.message) && n.level === "warning"),
-    "a reserve warning names the code-review turn's retention",
-  );
-  // Observed behavior (pinned, not `||`): the 9 Refine turns plus the Apply turn spend the full
-  // budget, so once Apply completes there is no turn left for the review turn either — the run
-  // stops before Code review with the turn-budget warning, and the reconciliation's own
-  // skipped-budget pre-check writes the `scope-reconcile` event and the drift warning above. The
-  // load-bearing guarantees (skip + warn + never loop) are asserted here; reaching the archive
-  // prompt would require one more budget unit than this recipe has.
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /Turn budget \(10 agent turns\) reached/.test(n.message) && n.level === "warning"),
-    "the run stopped at the turn budget before the review turn",
-  );
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /touched file\(s\) outside its scope contract during Apply/.test(n.message) && /src\/rogue\.ts/.test(n.message)),
-    "the remaining drift still warns at the end",
-  );
-  assert.equal(fakePiWrap.calls.length, 10, "never more than the turn budget of model turns");
-});
-
-await test("S5: a reconciliation turn that touches a new outside file is surfaced", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-05-recon5.md", {
-    title: "Reconcile Five",
-    status: "proposed",
-    created: "2026-04-05",
-    change_id: "recon5",
-  });
-  const dir = await writeReconcileChange(cwd, "recon5");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-05 · Reconcile Five");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
-  });
-  // Reconciliation: creates ANOTHER new outside file instead of fixing anything.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(cwd, "src", "rogue2.ts"), "// a new out-of-contract file\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /changed additional out-of-contract file/.test(n.message) && n.level === "warning"),
-    "a warning surfaces the new out-of-contract file",
-  );
-  const context = await readContext(cwd, "recon5");
-  assert.ok(
-    context?.includes("Reconciliation turn changed file(s) it was not asked to"),
-    "CONTEXT.md records the boundary growth",
-  );
-});
-
-await test("S6: the deviation list reaches the review prompt", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-06-recon6.md", {
-    title: "Reconcile Six",
-    status: "proposed",
-    created: "2026-04-06",
-    change_id: "recon6",
-  });
-  const dir = await writeReconcileChange(cwd, "recon6");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-06 · Reconcile Six");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n\n## Scope deviations\n\n- src/rogue.ts — required\n", "utf8");
-    await writeFile(join(cwd, "src", "rogue.ts"), "// justified\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.ok(
-    fakePiWrap.calls.some((c) => /## Scope/.test(c.prompt) && /src\/rogue\.ts/.test(c.prompt) && /required/.test(c.prompt)),
-    "the review prompt carries the declared deviation with its reason",
-  );
-});
-
-await test("S7: the apply end event carries diff stats", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-07-recon7.md", {
-    title: "Reconcile Seven",
-    status: "proposed",
-    created: "2026-04-07",
-    change_id: "recon7",
-  });
-  const dir = await writeProposedChange(cwd, "recon7", ["- src/keep.ts", "- src/new.ts (new)"]);
-  await mkdir(join(cwd, "src"), { recursive: true });
-  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-07 · Reconcile Seven");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\nexport const more = 3;\n", "utf8");
-    await writeFile(join(cwd, "src", "new.ts"), "export const fresh = true;\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const events = await readPhaseEvents(cwd, "recon7");
-  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
-  assert.ok(applyEnd, "an apply end event exists");
-  assert.equal(applyEnd.outcome, "applied");
-  assert.ok(applyEnd.diff, "the apply end event carries a diff");
-  assert.ok((applyEnd.diff?.files ?? 0) >= 1, "at least one file counted");
-  assert.ok((applyEnd.diff?.added ?? 0) >= 1, "at least one added line counted");
-});
-
 await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   const cwd = await freshRepo();
   execFileSync("git", ["init", "-q"], { cwd });
@@ -3315,177 +2941,6 @@ await test("S8: the Apply prompt carries the minimal-diff rules", async () => {
   assert.match(applyCall.prompt, /Never change an existing test's expectations/);
   assert.match(applyCall.prompt, /every doc the contract lists must be updated/);
   assert.match(applyCall.prompt, /must say so in its name/);
-});
-
-// --- F1: safe scope reconciliation (baseline-subtracted candidates, backups, restore) ---------
-
-await test("F1: a file already dirty before the run is never offered for revert and is byte-identical after reconciliation", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
-  execFileSync("git", ["config", "user.name", "t"], { cwd });
-  await mkdir(join(cwd, "src"), { recursive: true });
-  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
-  execFileSync("git", ["add", "-A"], { cwd });
-  execFileSync("git", ["commit", "-q", "-m", "init"], { cwd });
-
-  await writeBrainstorm(cwd, "2026-04-20-f1a.md", {
-    title: "F1 A",
-    status: "proposed",
-    created: "2026-04-20",
-    change_id: "f1a",
-  });
-  const dir = await writeReconcileChange(cwd, "f1a"); // contract names src/keep.ts only
-  // Dirty src/keep.ts with a USER edit AFTER the helper wrote the committed version but BEFORE
-  // the run's baseline is captured (the handler captures it at the start).
-  const keepEdit = "export const keep = 42; // user edit before the run\n";
-  await writeFile(join(cwd, "src", "keep.ts"), keepEdit, "utf8");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-20 · F1 A"); // pick
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
-
-  // Apply: complete the task AND touch src/mine.ts (out of contract). Leave src/keep.ts alone.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "mine.ts"), "// out-of-contract, made by this run\n", "utf8");
-  });
-  // Reconciliation: wrongly rewrite the PRE-EXISTING dirty file too.
-  fakePiWrap.queueEffect(async () => {
-    await rm(join(cwd, "src", "mine.ts"), { force: true });
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 999; // clobbered by recon\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const reconPrompt = fakePiWrap.calls.find((c) => /scope contract does NOT name/.test(c.prompt));
-  if (reconPrompt) {
-    assert.match(reconPrompt.prompt, /src\/mine\.ts/, "the candidate list names src/mine.ts");
-    assert.ok(!reconPrompt.prompt.includes("src/keep.ts"), "the pre-run dirty file is NOT listed as a candidate");
-  } else {
-    assert.match(fakePiWrap.calls.find((c) => /Implement the Readyset change/.test(c.prompt))?.prompt ?? "", /Implement/);
-  }
-
-  // The out-of-list rewrite of the pre-existing dirty file was restored byte-for-byte.
-  const keepAfter = await readFile(join(cwd, "src", "keep.ts"), "utf8");
-  assert.equal(keepAfter, keepEdit, "the pre-run dirty file is byte-identical after reconciliation");
-
-  // Backups exist for the candidate.
-  const backup = await readFile(join(dir, "reverted", "src", "mine.ts"), "utf8").catch(() => undefined);
-  assert.equal(backup, "// out-of-contract, made by this run\n", "the candidate was backed up before the turn");
-});
-
-await test("F1: a fresh baseline capture protects pre-existing dirty files (no revert of them)", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-04-21-f1b.md", {
-    title: "F1 B",
-    status: "proposed",
-    created: "2026-04-21",
-    change_id: "f1b",
-  });
-  const dir = await writeReconcileChange(cwd, "f1b");
-  await mkdir(join(cwd, "src"), { recursive: true });
-  // A file dirty before the run's baseline capture (the handler captures one on this path).
-  await writeFile(join(cwd, "src", "user.ts"), "// user WIP before the run\n", "utf8");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-21 · F1 B");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "mine.ts"), "// out-of-contract, made by this run\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  // Only this run's own out-of-contract file is a candidate; the pre-existing dirty file is not.
-  const reconPrompt = fakePiWrap.calls.find((c) => /scope contract does NOT name/.test(c.prompt));
-  if (reconPrompt) {
-    assert.match(reconPrompt.prompt, /src\/mine\.ts/);
-    assert.ok(!reconPrompt.prompt.includes("src/user.ts"), "a file dirty before the run is never a candidate");
-  }
-  const events = await readPhaseEvents(cwd, "f1b");
-  const recEnd = events.find((e) => e.phase === "scope-reconcile" && e.edge === "end");
-  // A baseline exists here, so the outcome is the ordinary one, never "no-baseline".
-  if (recEnd) assert.notEqual(recEnd.outcome, "no-baseline");
-});
-
-await test("F1: an out-of-list revert by the model is detected and restored", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
-  execFileSync("git", ["config", "user.name", "t"], { cwd });
-  await mkdir(join(cwd, "src"), { recursive: true });
-  await writeFile(join(cwd, "src", "a.ts"), "export const a = 1;\n", "utf8");
-  await writeFile(join(cwd, "src", "b.ts"), "export const b = 1;\n", "utf8");
-  execFileSync("git", ["add", "-A"], { cwd });
-  execFileSync("git", ["commit", "-q", "-m", "init"], { cwd });
-  // Two files dirty before the run (both captured into the baseline).
-  const aEdit = "export const a = 2; // user edit\n";
-  const bEdit = "export const b = 2; // user edit\n";
-  await writeFile(join(cwd, "src", "a.ts"), aEdit, "utf8");
-  await writeFile(join(cwd, "src", "b.ts"), bEdit, "utf8");
-
-  await writeBrainstorm(cwd, "2026-04-22-f1c.md", {
-    title: "F1 C",
-    status: "proposed",
-    created: "2026-04-22",
-    change_id: "f1c",
-  });
-  const dir = await writeReconcileChange(cwd, "f1c");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-04-22 · F1 C");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "mine.ts"), "// out-of-contract, made by this run\n", "utf8");
-  });
-  // Reconciliation: reverts the candidate correctly, but ALSO overwrites src/a.ts and deletes src/b.ts.
-  fakePiWrap.queueEffect(async () => {
-    await rm(join(cwd, "src", "mine.ts"), { force: true });
-    await writeFile(join(cwd, "src", "a.ts"), "export const a = 777; // out of list\n", "utf8");
-    await rm(join(cwd, "src", "b.ts"), { force: true });
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.equal(await readFile(join(cwd, "src", "a.ts"), "utf8"), aEdit, "src/a.ts restored to its pre-turn bytes");
-  assert.equal(await readFile(join(cwd, "src", "b.ts"), "utf8"), bEdit, "src/b.ts restored to its pre-turn bytes");
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /restored from a pre-turn snapshot/.test(n.message) && n.level === "warning"),
-    "a restore warning fires",
-  );
-  const archivePrompt = fakeUiWrap.selectPrompts.find((p) => /Archive now\?/.test(p));
-  assert.ok(archivePrompt, "an archive prompt exists");
-  assert.match(archivePrompt, /RESTORED/, "the archive prompt carries the RESTORED line");
 });
 
 // --- F2/F3: open decisions + blocking review findings -----------------------------------------
@@ -3596,15 +3051,6 @@ await test("F3: the Apply prompt carries the apply-recommended rule when N > 0",
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push("2026-05-12 · F3 C");
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
@@ -3626,16 +3072,6 @@ await test("F3: the open-decisions trigger fires and the gate end event records 
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push("2026-05-13 · F3 D");
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
-  // Review turn: leave `## Blocking` as none so no fix turn fires.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
@@ -3644,156 +3080,26 @@ await test("F3: the open-decisions trigger fires and the gate end event records 
   const gateEnd = events.find((e) => e.phase === "gate" && e.edge === "end");
   assert.ok(gateEnd, "a gate end event exists");
   assert.equal(gateEnd.openDecisions, 1, "the gate end event records the open-decision count");
-  const reviewEnd = events.find((e) => e.phase === "review" && e.edge === "end");
-  assert.ok(reviewEnd?.review?.triggersFired.includes("open-decisions"), "the open-decisions trigger fired");
-});
 
-await test("F2: blocking findings fire exactly one fix turn", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-05-14-f2a.md", { title: "F2 A", status: "proposed", created: "2026-05-14", change_id: "f2a" });
-  const dir = await writeReconcileChange(cwd, "f2a");
+  // Simulate omp execution
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
 
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-  fakeUiWrap.selectQueue.push("2026-05-14 · F2 A");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
+  // Run on-demand review
   fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
-  // Review writes one blocking finding.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\none problem\n\n## Blocking\n\n- scenario S1 is not met\n", "utf8");
-  });
-  // Fix turn: rewrite REVIEW.md with `## Blocking` empty.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\none problem\n\n## Blocking\n\nnone\n\n## Fix turn\n\n- scenario S1 is not met — fixed: added the branch (ran it)\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const fixCalls = fakePiWrap.calls.filter((c) => /Fix ONLY these|smallest change that addresses/.test(c.prompt));
-  assert.equal(fixCalls.length, 1, "exactly one fix turn fired");
-  const fixPrompt = fixCalls[0].prompt;
-  assert.match(fixPrompt, /scripts, or benchmarks/, "the fix prompt keeps the doc/scripts/benchmarks rule");
-  assert.equal((fixPrompt.match(/never modify seed data/gi) ?? []).length, 1, "the seed-data rule appears exactly once");
-  assert.ok(!/`scripts/.test(fixPrompt), "no stray backtick before scripts");
-  const events = await readPhaseEvents(cwd, "f2a");
-  assert.ok(events.some((e) => e.phase === "review-fix" && e.edge === "start"), "a review-fix start event exists");
-  const fixEnd = events.find((e) => e.phase === "review-fix" && e.edge === "end");
-  assert.equal(fixEnd?.outcome, "fixed");
-});
-
-await test("F2: 'none' fires no fix turn and records not-needed", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-05-15-f2b.md", { title: "F2 B", status: "proposed", created: "2026-05-15", change_id: "f2b" });
-  const dir = await writeReconcileChange(cwd, "f2b");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-  fakeUiWrap.selectQueue.push("2026-05-15 · F2 B");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
   fakePiWrap.queueEffect(async () => {
     await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
   });
+  await handler("--review f3d", ctx);
 
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  assert.ok(!fakePiWrap.calls.some((c) => /Fix ONLY these/.test(c.prompt)), "no fix turn fired");
-  const events = await readPhaseEvents(cwd, "f2b");
-  const fixEnd = events.find((e) => e.phase === "review-fix" && e.edge === "end");
-  assert.equal(fixEnd?.outcome, "not-needed");
-});
-
-await test("F2: an exhausted budget records skipped-budget", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-05-16-f2c.md", { title: "F2 C", status: "proposed", created: "2026-05-16", change_id: "f2c" }, VALID_BRAINSTORM_BODY);
-  const dir = await writeReconcileChange(cwd, "f2c");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-  fakeUiWrap.selectQueue.push("2026-05-16 · F2 C");
-  // 9 Refine turns, then Apply: the budget (10) is spent before the review turn.
-  for (let i = 0; i < 9; i++) {
-    fakeUiWrap.selectQueue.push("Refine");
-    fakeUiWrap.inputQueue.push(`round ${i}`);
-  }
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  for (let i = 0; i < 9; i++) {
-    fakePiWrap.queueEffect(async () => {
-      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
-    });
-  }
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  // The budget was spent by 9 Refines + Apply, so the review turn never runs and the fix path
-  // is not reached; assert no fix prompt fired and the run stopped at the budget.
-  assert.ok(!fakePiWrap.calls.some((c) => /Fix ONLY these/.test(c.prompt)), "no fix turn fired");
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /Turn budget \(10 agent turns\) reached/.test(n.message)),
-    "the run stopped at the turn budget",
-  );
-});
-
-await test("F2: the archive prompt counts blocking findings", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-05-17-f2d.md", { title: "F2 D", status: "proposed", created: "2026-05-17", change_id: "f2d" });
-  const dir = await writeReconcileChange(cwd, "f2d");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-  fakeUiWrap.selectQueue.push("2026-05-17 · F2 D");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nx\n\n## Blocking\n\n- S1 not met\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nx\n\n## Blocking\n\nnone\n\n## Fix turn\n\n- S1 not met — fixed: done\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const archivePrompt = fakeUiWrap.selectPrompts.find((p) => /Archive now\?/.test(p));
-  assert.ok(archivePrompt, "an archive prompt exists");
-  assert.match(archivePrompt, /blocking: 1 found, 1 fixed/);
+  const reviewEvents = await readPhaseEvents(cwd, "f3d");
+  const reviewEnd = reviewEvents.find((e) => e.phase === "review" && e.edge === "end");
+  assert.ok(reviewEnd?.review?.triggersFired.includes("open-decisions"), "the open-decisions trigger fired");
 });
 
 // --- F4/F5: protected paths and requested docs --------------------------------------------------
 
-await test("F4: a changed protected path is warned post-Apply and fires the protected-path trigger", async () => {
+await test("F4: a changed protected path fires the protected-path trigger during on-demand review", async () => {
   const cwd = await freshRepo();
   execFileSync("git", ["init", "-q"], { cwd });
   await clearConfig();
@@ -3816,26 +3122,22 @@ await test("F4: a changed protected path is warned post-Apply and fires the prot
 
   fakeUiWrap.selectQueue.push("2026-06-01 · F4 Protected");
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran `npm test`, all pass_\n", "utf8");
-    await mkdir(join(cwd, "db", "seeds"), { recursive: true });
-    await writeFile(join(cwd, "db/seeds/users.ts"), "export const users = [];\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
 
-  assert.ok(
-    fakeUiWrap.notifications.some(
-      (n) => /changed protected path\(s\) \(db\/seeds\/users\.ts\)/.test(n.message) && n.level === "warning",
-    ),
-    "a protected-path warning names the changed seed file",
-  );
+  // Simulate omp execution touching a protected path
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran `npm test`, all pass_\n", "utf8");
+  await mkdir(join(cwd, "db", "seeds"), { recursive: true });
+  await writeFile(join(cwd, "db/seeds/users.ts"), "export const users = [];\n", "utf8");
+
+  // Run on-demand review
+  fakeUiWrap.selectQueue.push("Not yet");
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
+  });
+  await handler("--review f4protected", ctx);
+
   const events = await readPhaseEvents(cwd, "f4protected");
   const reviewEnd = events.find((e) => e.phase === "review" && e.edge === "end");
   assert.ok(reviewEnd?.review?.triggersFired.includes("protected-path"), "the protected-path trigger fired");
@@ -4137,131 +3439,6 @@ await test("C8: the compaction call runs under the phase model when an override 
   assert.equal(explore.model, "cheap/model", "the compact event names the phase model it ran under");
 });
 
-// --- Turn reserves (task 1) --------------------------------------------------------------------
-
-await test("R1: the repair turn is reserved for Apply/Review, so a nearly-spent run still reaches code review", async () => {
-  const cwd = await freshRepo();
-  await writeBrainstorm(cwd, "2026-06-01-reserve1.md", {
-    title: "Reserve One",
-    status: "proposed",
-    created: "2026-06-01",
-    change_id: "reserve1",
-  }, VALID_BRAINSTORM_BODY);
-  const dir = await writeReconcileChange(cwd, "reserve1"); // contract: src/keep.ts (resolvable)
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-06-01 · Reserve One"); // pick
-  // 8 Refine rounds: the first 7 keep the contract resolvable (one turn each, no repair), the 8th
-  // makes it dangling — at that point spent reaches 8, so the repair's reserve-2 check skips it
-  // and leaves exactly the two turns Apply and Review need.
-  for (let i = 0; i < 8; i++) {
-    fakeUiWrap.selectQueue.push("Refine");
-    fakeUiWrap.inputQueue.push(`round ${i}`);
-  }
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet"); // archive prompt
-
-  for (let i = 0; i < 7; i++) {
-    fakePiWrap.queueEffect(async () => {
-      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
-    });
-  }
-  // Round 8: introduce a dangling contract line so the repair wants a turn at spent=8.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(
-      join(dir, "proposal.md"),
-      "## Why\n\nx\n\n## What Changes\n\n- x\n\n## Files This Change Will Touch\n\n- src/keep.ts\n- src/missing.ts\n",
-      "utf8",
-    );
-  });
-  // Apply: complete the task.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-  });
-  // Review.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const events = await readPhaseEvents(cwd, "reserve1");
-  const repairEnds = events.filter((e) => e.phase === "contract-repair" && e.edge === "end");
-  // The repair either never fired, or it recorded skipped-budget; either way no turn was taken.
-  assert.equal(repairEnds.filter((e) => e.outcome !== "skipped-budget").length, 0, "no repair turn fired at the reserve boundary");
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /starve Apply\/Review/i.test(n.message) && n.level === "warning"),
-    "the reserve notify names Apply/Review retention",
-  );
-  assert.ok(events.some((e) => e.phase === "apply" && e.edge === "end" && e.outcome === "applied"), "Apply ran and applied");
-  assert.ok(
-    events.some((e) => e.phase === "review" && e.edge === "end" && e.outcome === "review-written"),
-    "the reserved turn let code review run and write REVIEW.md",
-  );
-  assert.equal(fakePiWrap.calls.length, 10, "the run used every turn but never exceeded the budget");
-});
-
-await test("R2: reconciliation reserves the code-review turn and still writes REVIEW.md", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  await writeBrainstorm(cwd, "2026-06-02-reserve2.md", {
-    title: "Reserve Two",
-    status: "proposed",
-    created: "2026-06-02",
-    change_id: "reserve2",
-  }, VALID_BRAINSTORM_BODY);
-  const dir = await writeReconcileChange(cwd, "reserve2");
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-06-02 · Reserve Two"); // pick
-  // 8 Refine rounds consume 8 turns (the contract stays resolvable, so no repair turns fire).
-  for (let i = 0; i < 8; i++) {
-    fakeUiWrap.selectQueue.push("Refine");
-    fakeUiWrap.inputQueue.push(`round ${i}`);
-  }
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  for (let i = 0; i < 8; i++) {
-    fakePiWrap.queueEffect(async () => {
-      await writeFile(join(cwd, "src", "keep.ts"), `export const keep = ${i};\n`, "utf8");
-    });
-  }
-  // Apply (turn 9): complete the task and drift outside the contract.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "rogue.ts"), "// outside the contract\n", "utf8");
-  });
-  // Review (turn 10): the reserved turn.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const events = await readPhaseEvents(cwd, "reserve2");
-  const recEnds = events.filter((e) => e.phase === "scope-reconcile" && e.edge === "end");
-  assert.equal(recEnds.length, 1, "one reconciliation end event");
-  assert.equal(recEnds[0].outcome, "skipped-budget", "reconciliation reserved the review turn");
-  assert.ok(
-    fakeUiWrap.notifications.some((n) => /starve the code-review turn/i.test(n.message) && n.level === "warning"),
-    "the reserve notify names the code-review turn",
-  );
-  assert.ok(
-    events.some((e) => e.phase === "review" && e.edge === "end" && e.outcome === "review-written"),
-    "the reserved turn let code review run",
-  );
-  assert.equal(fakePiWrap.calls.length, 10, "never more than the turn budget");
-});
-
 // --- Post-Apply contract semantics (task 2) ----------------------------------------------------
 
 // Drives a change through Apply with a `(new)` file Apply creates and a `(delete)` file Apply
@@ -4287,20 +3464,15 @@ async function runApplyThenReopen(changeId: string) {
 
   fakeUiWrap.selectQueue.push(`2026-07-01 · Post Apply`); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute"); // gate
-  fakeUiWrap.selectQueue.push("Address findings first"); // archive prompt (do NOT archive)
-
-  // Apply: create the (new) file and delete the (delete) file.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "created.ts"), "export const fresh = true;\n", "utf8");
-    await rm(join(cwd, "src", "gone.ts"), { force: true });
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
+
+  // Simulate omp execution
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+  await writeFile(join(cwd, "src", "created.ts"), "export const fresh = true;\n", "utf8");
+  await rm(join(cwd, "src", "gone.ts"), { force: true });
+
   return { cwd, dir, handler, fakePiWrap, fakeUiWrap, ctx };
 }
 
@@ -4437,57 +3609,6 @@ await test("G1: every gate path closes its boundary, with the outcome matching t
     );
     c.extra?.(events);
   }
-});
-
-// --- Diff stats see staged changes (task 4) ----------------------------------------------------
-
-await test("D1: the apply diff stats count fully staged (git add-ed) changes", async () => {
-  const cwd = await freshRepo();
-  execFileSync("git", ["init", "-q"], { cwd });
-  // Commit a baseline so HEAD exists and a staged modification shows up against it.
-  await writeFile(join(cwd, "README.md"), "baseline\n", "utf8");
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"], { cwd });
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"], { cwd });
-
-  await writeBrainstorm(cwd, "2026-09-01-staged.md", {
-    title: "Staged",
-    status: "proposed",
-    created: "2026-09-01",
-    change_id: "staged",
-  });
-  const dir = await writeProposedChange(cwd, "staged", ["- src/keep.ts"]);
-  await mkdir(join(cwd, "src"), { recursive: true });
-  await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 1;\n", "utf8");
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"], { cwd });
-  execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "keep"], { cwd });
-
-  const fakePiWrap = makeFakePi(cwd);
-  const handler = await loadHandler(fakePiWrap.pi);
-  const fakeUiWrap = makeFakeUi();
-
-  fakeUiWrap.selectQueue.push("2026-09-01 · Staged");
-  fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Not yet");
-
-  // Apply: modify src/keep.ts and STAGE it, leaving nothing unstaged.
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-    await writeFile(join(cwd, "src", "keep.ts"), "export const keep = 2;\nexport const more = 3;\n", "utf8");
-    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "add", "src/keep.ts"], { cwd });
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
-
-  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
-  await handler("", ctx);
-
-  const events = await readPhaseEvents(cwd, "staged");
-  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
-  assert.ok(applyEnd, "an apply end event exists");
-  assert.equal(applyEnd.outcome, "applied");
-  assert.ok((applyEnd.diff?.files ?? 0) >= 1, "the staged file is counted (git diff --numstat would report 0)");
-  assert.ok((applyEnd.diff?.added ?? 0) >= 1, "the staged added lines are counted");
 });
 
 // --- Fast-lane artifact set + per-artifact budgets + the bounded Trim turn -------------------
@@ -4728,17 +3849,19 @@ await test("fast lane: archiving notifies info-level 'no spec delta' and CONTEXT
   const fakeUiWrap = makeFakeUi();
   fakeUiWrap.selectQueue.push("2026-05-01 · Fast Archive"); // pick
   fakeUiWrap.selectQueue.push("Approve & Execute");
-  fakeUiWrap.selectQueue.push("Archive now");
-
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
-  });
-  fakePiWrap.queueEffect(async () => {
-    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
-  });
 
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("--lane fast", ctx);
+
+  // Simulate omp execution
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran it_\n", "utf8");
+
+  // Run on-demand review and archive
+  fakeUiWrap.selectQueue.push("Archive now");
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n", "utf8");
+  });
+  await handler("--review fast-archive", ctx);
 
   const infoNotice = fakeUiWrap.notifications.find((n) => /Archived to/.test(n.message) && n.level === "info");
   assert.ok(infoNotice, "an info-level archive notice fired");

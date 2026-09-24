@@ -17,7 +17,7 @@ Work only inside the current repository (the working directory). Never search or
 ## The phase order, and why it's in this order
 
 ```
-Explore -> Propose -> (Review gate: Approve / Refine / Discard) -> Apply -> Code review -> Archive
+Explore -> Propose -> (Review gate: Approve / Refine / Discard) -> Apply (Core omp) -> Code review -> Archive
 ```
 
 On the **fast lane** (a small, well-understood change) Explore is folded into Propose — no
@@ -50,12 +50,14 @@ Each phase exists to catch something the previous one is bad at catching on its 
 
 3. **Review gate** — a human decides: Approve & Execute, Refine (describe what's wrong, loops
    back into another Propose-equivalent turn), or Discard. Nothing executes without this, and
-   Discard is the default: the gate is fail-closed, so cancelling runs nothing.
+   Discard is the default: the gate is fail-closed, so cancelling runs nothing. Approving hands off
+   execution directly to core omp's native runtime.
 
-4. **Apply** — implements `tasks.md` one task at a time. Keep the diff minimal: touch only files
-   in the scope contract, update every doc it lists (an untouched listed doc is a dropped
-   requirement, not a saving), make no unrequested refactors/renames/reformatting/helpers, and
-   change tests only to exercise the specs' WHEN/THEN scenarios. Never modify seed data,
+4. **Apply** — executed directly by core omp, implementing `tasks.md` one task at a time. Core omp
+   runs with full native support for subagents, parallel execution, and task updates. Keep the diff
+   minimal: touch only files in the scope contract, update every doc it lists (an untouched listed doc
+   is a dropped requirement, not a saving), make no unrequested refactors/renames/reformatting/helpers,
+   and change tests only to exercise the specs' WHEN/THEN scenarios. Never modify seed data,
    fixtures, or sample data in production paths unless the request asks for it; never add runtime
    self-checks/assertions to production code; and never change an existing test's expectations
    unless the requested behavior changes them. A task is only checked off once something actually
@@ -65,12 +67,10 @@ Each phase exists to catch something the previous one is bad at catching on its 
    work in progress: never clean them up, delete them, or strip them when editing a file — edit
    around them and keep every pre-existing comment and hunk intact.
 
-5. **Code review** (`REVIEW.md`) — its own turn, after Apply, before Archive. It is told
-   explicitly that its job is to find problems, not confirm the work — the turn that just
-   implemented something is a poor judge of its own diff, since it already believes its
-   choices were correct. (Not a fresh session — omp's extension API offers none — so the
-   adversarial framing is the mitigation.) If this phase finds nothing, it says so plainly
-   rather than padding the file to look thorough.
+5. **Code review** (`REVIEW.md`) — run on-demand via `/readyset --review <change-id>` after Apply,
+   before Archive. It evaluates risk triggers against working tree changes and runs an adversarial
+   review turn (told explicitly that its job is to find problems, not confirm the work). If this
+   phase finds nothing, it says so plainly rather than padding the file to look thorough.
 
 6. **Archive** — moves the change to `readyset/changes/archive/<id>/` and merges its delta
    specs into `readyset/specs/` (append-only — never a real ADDED/MODIFIED/REMOVED diff-merge;

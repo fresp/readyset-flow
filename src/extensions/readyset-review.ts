@@ -13,12 +13,12 @@ import {
 	recommendLane,
 	validateBrainstormContent,
 } from "../lib/readyset-brainstorm.ts";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { existsSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import {
 	appendContext,
 	appendPhaseEvent,
@@ -977,8 +977,8 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +
 			"Under `## Assumed`, list each decision you made yourself without asking — one per line as " +
 			"`- <the decision> — because all answers led to the same plan` — or `- none` if there were none. " +
-			"Once the file is written, tell the user its path and that running /readyset again picks it up " +
-			"from here (Explore, then Propose) — do not fire off Explore or Propose yourself in this turn."
+			"Once the file is written, tell the user its path and summarize the decisions made — do not " +
+			"fire off Explore or Propose yourself in this turn."
 	);
 }
 
@@ -1288,25 +1288,176 @@ async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string)
 	await ctx.waitForIdle();
 }
 
+export interface BrainstormExecutionOptions {
+	laneOverride?: "fast" | "full";
+	laneDefault: LaneDefault;
+	parsedArgs: ReadysetArgs;
+	compactMode: "auto" | "always" | "never";
+	effectiveReviewMode: ReviewMode;
+	reviewFullLane: ReviewFullLane;
+	reviewThresholds: ParsedReviewThresholds;
+	scopeProtected: { paths: string[] };
+	testPathsResult: { paths: string[] };
+}
+
+export interface ActiveGrillSession {
+	active: boolean;
+	startedAt: number;
+	ideaText: string;
+	laneDefault: LaneDefault;
+	preferredLanguage?: string;
+	writtenBrainstormFile?: string;
+	existingFiles: Set<string>;
+	execOptions: BrainstormExecutionOptions;
+}
+
+export let activeGrillSession: ActiveGrillSession | undefined;
+
+export function resetActiveGrillSession(): void {
+	activeGrillSession = undefined;
+}
+
 /**
  * Kicks off grilling for a raw, directly-typed idea and returns immediately — deliberately not
  * awaited against `ctx.waitForIdle()` the way `spendTurn`/`fireTurnAndWait` are, because the
  * turns that follow are ordinary chat turns the user answers directly (see `grillTurnPrompt`'s
  * doc comment). Handler call sites `return` right after this.
  */
-function startGrilling(pi: ExtensionAPI, ctx: ReviewCtx, ideaText: string, laneDefault: LaneDefault, preferredLanguage?: string): void {
+export function startGrilling(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	ideaText: string,
+	laneDefault: LaneDefault,
+	preferredLanguage?: string,
+	execOptions?: BrainstormExecutionOptions,
+): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
 	grillRoundState.rounds = 0;
 	grillRoundState.active = true; // consumed by the command handler's zero-rounds check -- see grillRoundState's doc comment
+
+	const files = new Set<string>();
+	const brainstormDir = join(ctx.cwd, BRAINSTORM_DIR);
+	if (existsSync(brainstormDir)) {
+		try {
+			for (const entry of readdirSync(brainstormDir)) {
+				if (entry.endsWith(".md")) {
+					files.add(join(brainstormDir, entry));
+				}
+			}
+		} catch {}
+	}
+
+	if (execOptions) {
+		activeGrillSession = {
+			active: true,
+			startedAt: Date.now(),
+			ideaText,
+			laneDefault,
+			preferredLanguage,
+			existingFiles: files,
+			execOptions,
+		};
+	}
+
 	ctx.ui.notify(
 		`Grilling started for: "${preview}"${preferredLanguage ? ` in ${preferredLanguage}` : ""} — Readyset will ask questions ` +
 			"right here in the chat (a structured picker where available); answer them, and it'll write the " +
-			"brainstorm file once the design is genuinely resolved. Run /readyset again afterward to pick it up " +
-			"from there.",
+			"brainstorm file once the design is genuinely resolved.",
 		"info",
 	);
 	pi.sendUserMessage(grillTurnPrompt(ideaText, today, laneDefault, preferredLanguage));
+}
+
+export async function findNewlyWrittenBrainstorm(cwd: string, session: ActiveGrillSession): Promise<string | undefined> {
+	if (session.writtenBrainstormFile && existsSync(session.writtenBrainstormFile)) {
+		return session.writtenBrainstormFile;
+	}
+	const brainstormDir = join(cwd, BRAINSTORM_DIR);
+	if (!existsSync(brainstormDir)) return undefined;
+	try {
+		const entries = await readdir(brainstormDir);
+		let latestFile: string | undefined;
+		let latestMtime = session.startedAt;
+		for (const entry of entries) {
+			if (!entry.endsWith(".md")) continue;
+			const fullPath = join(brainstormDir, entry);
+			if (!session.existingFiles.has(fullPath)) {
+				return fullPath;
+			}
+			try {
+				const st = await stat(fullPath);
+				if (st.mtimeMs >= latestMtime) {
+					latestMtime = st.mtimeMs;
+					latestFile = fullPath;
+				}
+			} catch {}
+		}
+		return latestFile;
+	} catch {
+		return undefined;
+	}
+}
+
+export async function handleGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
+	if (!activeGrillSession?.active) return;
+	const session = activeGrillSession;
+	const newlyWritten = await findNewlyWrittenBrainstorm(ctx.cwd, session);
+	if (!newlyWritten) {
+		// Grilling still in progress (intermediate question round)
+		return;
+	}
+
+	// Brainstorm file is written! Mark grilling complete.
+	activeGrillSession = undefined;
+	grillRoundState.active = false;
+
+	const relativePath = relative(ctx.cwd, newlyWritten);
+	ctx.ui.notify(`Brainstorm file created: ${relativePath}`, "info");
+
+	const isIndonesian =
+		session.preferredLanguage === "id" ||
+		session.preferredLanguage === "indonesian" ||
+		/indonesia/i.test(session.preferredLanguage ?? "");
+
+	const promptText = isIndonesian
+		? `Brainstorm selesai (${basename(newlyWritten)}). Lanjut ke tahap berikutnya?`
+		: `Brainstorm complete (${basename(newlyWritten)}). Continue to next phase?`;
+
+	const continueLabel = isIndonesian
+		? "Lanjut ke Propose (Explore & Propose)"
+		: "Continue to Explore & Propose (Recommended)";
+	const finishLabel = isIndonesian
+		? "Selesai di sini (Review file dulu)"
+		: "Finish here (review brainstorm first)";
+
+	const choice = await ctx.ui.select(promptText, [
+		{
+			label: continueLabel,
+			description: isIndonesian
+				? "Lanjutkan eksplorasi repo dan pembuatan proposal/spesifikasi secara otomatis"
+				: "Grounded repo checks + proposal, design, specs, and tasks",
+		},
+		{
+			label: finishLabel,
+			description: isIndonesian
+				? "Berhenti di sini untuk membaca atau mengedit file brainstorm sebelum propose"
+				: "Stop here to inspect or edit the brainstorm file before proposing",
+		},
+	]);
+
+	if (choice === continueLabel) {
+		const all = await loadBrainstorms(ctx.cwd);
+		await reconcileStatuses(ctx.cwd, all);
+		const chosen = all.find((b) => b.file === newlyWritten || b.slug === basename(newlyWritten, ".md"));
+		if (!chosen) {
+			ctx.ui.notify(`Could not load brainstorm metadata for ${relativePath}`, "warning");
+			return;
+		}
+		await executeBrainstorm(pi, ctx, chosen, session.execOptions);
+	} else {
+		ctx.ui.notify(`Brainstorm saved at ${relativePath}. Run /readyset when you're ready to proceed.`, "info");
+	}
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -2712,262 +2863,32 @@ async function reviewAndMaybeExecute(
 			continue; // loop back: re-validate and show the panel/gate again
 		}
 
-		// "approve". Runs its own inner loop around Apply so a missing-verification
-		// re-run just fires Apply again — it does not send the user back through the main gate
-		// (Approve & Execute / Refine / Discard) to re-approve something already approved.
+		// "approve". Readyset scopes strictly up to the Review Gate. Once approved, the change
+		// is marked approved, recorded in CONTEXT.md and phase events, UI is cleared, and execution
+		// is handed off directly to core omp via pi.sendUserMessage(applyTurnPrompt(...)).
 		await markApproved(chosen);
-		ctx.ui.notify(`Approved. Implementing "${chosen.changeId}"...`, "info");
-
-		let verification: Awaited<ReturnType<typeof checkTaskVerification>>;
-		// Set when the previous iteration ended in a verification send-back, so the next pass fires the
-		// narrow verification-fix prompt instead of the full apply prompt. `undefined` means "full apply".
-		let verificationFix: { missing: number; total: number } | undefined;
-		applyLoop: for (;;) {
-			activeVerifyChangeId = chosen.changeId;
-			let applyFired: boolean;
-			let applyOutcome = "aborted";
-			await recordPhase(chosen.changeId, "apply", "start", { model: phaseModels.get("apply")?.model });
-			try {
-				try {
-					const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId);
-					applyFired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
-						spendTurn(
-							pi, ctx, budget, "Apply",
-							verificationFix
-								? verificationFixTurnPrompt(chosen.changeId, verificationFix.missing, verificationFix.total)
-								: applyTurnPrompt(chosen.changeId, applyOpenDecisions),
-						),
-					);
-				} finally {
-					activeVerifyChangeId = undefined;
-				}
-				if (!applyFired) return;
-
-				const status = await getProgress(ctx.cwd, chosen.changeId);
-				if (!status) {
-					applyOutcome = "no-tasks";
-					ctx.ui.notify(`Implementation ran, but couldn't read tasks.md for "${chosen.changeId}" afterward.`, "warning");
-					return;
-				}
-				if (status.state !== "all_done") {
-					applyOutcome = "paused";
-					ctx.ui.notify(
-						`Paused at ${status.done}/${status.total} tasks (state: ${status.state}) — check the transcript above for why.`,
-						"warning",
-					);
-					return;
-				}
-
-				verification = await checkTaskVerification(ctx.cwd, chosen.changeId);
-				await appendContext(
-					ctx.cwd,
-					chosen.changeId,
-					"Apply",
-					`Implementation reported ${status.done}/${status.total} tasks done. ` +
-						(verification
-							? `${verification.withVerificationNote}/${verification.checkedTasks} carry a _Verified: note (${verification.missing} missing).`
-							: "tasks.md unreadable for verification check."),
-				);
-
-				if (verification && verification.missing > 0) {
-					const canSendBack = verificationSendbacks < MAX_VERIFICATION_SENDBACKS;
-					const options = canSendBack
-						? [
-								{ label: "Send back for verification", description: "fires another apply turn asking it to verify + note the missing tasks" },
-								{ label: "Continue to code review anyway", description: "proceed without full verification coverage" },
-							]
-						: [{ label: "Continue to code review anyway", description: "proceed without full verification coverage" }];
-					const proceedAnyway = await ctx.ui.select(
-						`Implementation complete, but ${verification.missing}/${verification.checkedTasks} checked tasks have no _Verified: note — ` +
-							"the apply turn marked them done without something that actually checked the behavior." +
-							(canSendBack ? "" : ` (already sent back ${verificationSendbacks}x — proceeding without full coverage this time.)`),
-						options,
-					);
-					if (proceedAnyway === "Send back for verification") {
-						verificationFix = { missing: verification.missing, total: verification.checkedTasks };
-						verificationSendbacks++;
-						ctx.ui.notify(`Asking "${chosen.changeId}" to verify the remaining tasks...`, "info");
-						applyOutcome = "sent-back";
-						continue applyLoop;
-					}
-				}
-				applyOutcome = "applied";
-				break;
-			} finally {
-				const diff = applyOutcome === "applied"
-					? await applyDiffStats(ctx.cwd, await pathsChangedThisRun(ctx.cwd, chosen.changeId))
-					: undefined;
-				await recordPhase(chosen.changeId, "apply", "end", { model: phaseModels.get("apply")?.model, outcome: applyOutcome, diff });
-			}
-		}
-
-		// Scope, checked again against the working tree after Apply — the gate's `checkScope`
-		// runs before Apply, so it only sees what Propose changed, and Apply is where most of a
-		// change's file touches actually happen. Advisory, not fail-closed: implementation
-		// legitimately touches more files than planning discussion did, so this flags the drift
-		// at the archive prompt rather than refusing to offer archive.
-		const changedThisRun = await pathsChangedThisRun(ctx.cwd, chosen.changeId);
-		const protectedHits = changedThisRun.filter((p) => matchesAnyGlob(p, protectedPaths));
-		if (protectedHits.length > 0) {
-			await appendContext(ctx.cwd, chosen.changeId, "Apply",
-				`Protected path(s) changed: ${protectedHits.join(", ")} — see readyset.scope.protectedPaths.`);
-			ctx.ui.notify(`"${chosen.changeId}" changed protected path(s) (${protectedHits.join(", ")}). A protected path may only be changed when the request asks for it, and then the contract must list it with a reason.`, "warning");
-		}
-		const before = await checkScope(ctx.cwd, chosen.changeId, changedThisRun);
-		const deviations = await readScopeDeviations(ctx.cwd, chosen.changeId);
-		const justifiedPaths = new Set(deviations.map((d) => d.path));
-		const outsideBefore = before.noContract ? [] : before.outside;
-		const unjustified = outsideBefore.filter((p) => !justifiedPaths.has(p));
-
-		const reconcileResult = await runScopeReconciliation(
-			pi, ctx, budget, chosen.changeId, phaseModels, recordReconcile, outsideBefore, unjustified,
+		await appendContext(
+			ctx.cwd,
+			chosen.changeId,
+			"Apply",
+			"Change approved at the Review Gate. Handing off execution to core omp.",
 		);
+		await recordPhase(chosen.changeId, "apply", "start", {
+			model: phaseModels.get("apply")?.model,
+			outcome: "handoff-omp",
+		});
 
-		// Recover the actual *paths* of whatever is still unjustified (the helper returns counts),
-		// from one final scope read after the reconciliation turn returned.
-		const finalScope = await checkScope(ctx.cwd, chosen.changeId, await pathsChangedThisRun(ctx.cwd, chosen.changeId));
-		const finalJustified = new Set((await readScopeDeviations(ctx.cwd, chosen.changeId)).map((d) => d.path));
-		const finalOutside = finalScope.noContract ? [] : finalScope.outside;
-		const archiveDriftPaths = finalOutside.filter((p) => !finalJustified.has(p));
-		if (archiveDriftPaths.length > 0) {
-			await appendContext(ctx.cwd, chosen.changeId, "Apply",
-				`Post-Apply scope drift — touched outside the contract with no deviation entry: ${archiveDriftPaths.join(", ")}.`);
-			ctx.ui.notify(
-				`"${chosen.changeId}" touched file(s) outside its scope contract during Apply: ${archiveDriftPaths.join(", ")}. ` +
-					"Archiving is still offered — this is a warning, not a block.",
-				"warning",
-			);
+		if (typeof ctx.ui.setEditorText === "function") {
+			ctx.ui.setEditorText("");
+		}
+		if (typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget(undefined);
 		}
 
-		const finalStatus = await getProgress(ctx.cwd, chosen.changeId);
-		ctx.ui.notify(
-			`Implementation complete: ${finalStatus?.done ?? "?"}/${finalStatus?.total ?? "?"} tasks.`,
-			"info",
-		);
+		ctx.ui.notify(`Approved "${chosen.changeId}". Handing off execution to core omp...`, "info");
 
-		// Risk-based review policy (readyset.review.mode). `auto` evaluates the triggers below
-		// and reviews only when one fires; `always` keeps the pre-0.14 unconditional turn;
-		// `never` skips it outright. Triggers are evaluated even when `fullLane: always` makes
-		// them moot, so the recorded audit trail says what was actually observed.
-		let reviewContent: string | undefined;
-		let reviewOutcome = "aborted";
-		let triggerResult: ReviewTriggerResult | undefined;
-		let skipReason: "skipped-flag" | "skipped-no-trigger" | undefined;
-		const fullLaneExempt = reviewMode === "auto" && reviewLane === "full" && reviewFullLane === "always";
-		if (reviewMode === "never") {
-			skipReason = "skipped-flag";
-		} else if (reviewMode === "auto") {
-			triggerResult = evaluateReviewTriggers(
-				await buildReviewTriggerInput(
-					ctx.cwd, chosen.changeId, archiveDriftPaths, changedThisRun, chosen.clarity, reviewThresholds, snapshot.openDecisions.length, protectedPaths, testPaths,
-				),
-			);
-			if (!fullLaneExempt && triggerResult.fired.length === 0) skipReason = "skipped-no-trigger";
-		}
-
-		if (skipReason) {
-			await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
-			await writeReviewSkipStub(ctx.cwd, chosen.changeId, triggerResult ?? { evaluated: [], fired: [], firedSensitivePaths: [] }, reviewMode);
-			reviewOutcome = skipReason;
-			await appendContext(ctx.cwd, chosen.changeId, "Code review", `Skipped by readyset.review.mode — ${skipReason}.`);
-			await recordPhase(chosen.changeId, "review", "end", {
-				model: phaseModels.get("review")?.model,
-				outcome: reviewOutcome,
-				review: {
-					mode: reviewMode,
-					triggersEvaluated: triggerResult?.evaluated ?? [],
-					triggersFired: [],
-					outcome: skipReason,
-				},
-			});
-			ctx.ui.notify(
-				reviewMode === "never"
-					? `Code review skipped (never): readyset.review.mode = never.`
-					: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`,
-				"info",
-			);
-		} else {
-			ctx.ui.notify(`Running code review for "${chosen.changeId}"...`, "info");
-			await recordPhase(chosen.changeId, "review", "start", { model: phaseModels.get("review")?.model });
-			try {
-				const deviationsForReview = await readScopeDeviations(ctx.cwd, chosen.changeId);
-				const reviewFired = await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-					spendTurn(pi, ctx, budget, "Code review", codeReviewTurnPrompt(chosen.changeId, reviewLane, deviationsForReview, triggerResult, changedThisRun)),
-				);
-				if (!reviewFired) return;
-				reviewContent = await readReview(ctx.cwd, chosen.changeId);
-				reviewOutcome = reviewContent ? "review-written" : "no-review";
-				await appendContext(
-					ctx.cwd,
-					chosen.changeId,
-					"Code review",
-					reviewContent ? "REVIEW.md written — see file for findings." : "Code review turn ran but REVIEW.md is empty or missing.",
-				);
-			} finally {
-				await recordPhase(chosen.changeId, "review", "end", {
-					model: phaseModels.get("review")?.model,
-					outcome: reviewOutcome,
-					review: {
-						mode: reviewMode,
-						triggersEvaluated: triggerResult?.evaluated ?? [],
-						triggersFired: triggerResult?.fired ?? [],
-						outcome: "ran",
-					},
-				});
-			}
-		}
-
-		if (reviewContent) {
-			ctx.ui.setWidget?.("readyset", [`Change: ${chosen.changeId}`, "REVIEW.md:", ...reviewContent.split("\n").slice(0, 8)]);
-		}
-
-		// Exactly one bounded "Review fix" turn when the review wrote blocking findings, then
-		// straight to the archive offer — no second review, no loop. Only on the review-ran path:
-		// a skipped review never reaches here.
-		let findings: { found: number; fixed: number } | undefined;
-		if (!skipReason) {
-			const blocking = reviewContent ? await readBlockingFindings(ctx.cwd, chosen.changeId) : [];
-			let fixOutcome: "fixed" | "partial" | "skipped-budget" | "not-needed";
-			if (blocking.length === 0) {
-				fixOutcome = "not-needed";
-				await recordPhase(chosen.changeId, "review-fix", "end", { outcome: "not-needed", counts: { outsideBefore: 0, reverted: 0, justified: 0, unjustifiedAfter: 0, blockingBefore: 0, blockingAfter: 0 } });
-			} else if (!turnsAvailableFor(budget, 0)) {
-				// Reserve 0 after review: the turn may spend the very last unit if one is left; the
-				// budget is never exceeded.
-				fixOutcome = "skipped-budget";
-				await recordPhase(chosen.changeId, "review-fix", "end", { outcome: "skipped-budget", counts: { outsideBefore: 0, reverted: 0, justified: 0, unjustifiedAfter: 0, blockingBefore: blocking.length, blockingAfter: blocking.length } });
-				ctx.ui.notify(`"${chosen.changeId}" has ${blocking.length} blocking review finding(s) but no turn budget left to fix them — see ${changePaths(ctx.cwd, chosen.changeId).review}.`, "warning");
-			} else {
-				ctx.ui.notify(`Fixing ${blocking.length} blocking review finding(s) for "${chosen.changeId}"...`, "info");
-				await recordPhase(chosen.changeId, "review-fix", "start", { model: phaseModels.get("apply")?.model });
-				const fired = await withPhaseModel(pi, ctx, "apply", phaseModels, () =>
-					spendTurn(pi, ctx, budget, "Review fix", reviewFixTurnPrompt(chosen.changeId, blocking)),
-				);
-				const after = await readBlockingFindings(ctx.cwd, chosen.changeId);
-				fixOutcome = !fired ? "skipped-budget" : after.length === 0 ? "fixed" : "partial";
-				// Same post-Apply scope logic the Apply turn gets, minus the second reconciliation
-				// turn: re-run the check and warn on drift only.
-				const fixChanged = await pathsChangedThisRun(ctx.cwd, chosen.changeId);
-				const fixScope = await checkScope(ctx.cwd, chosen.changeId, fixChanged);
-				const fixJustified = new Set((await readScopeDeviations(ctx.cwd, chosen.changeId)).map((d) => d.path));
-				const fixDrift = (fixScope.noContract ? [] : fixScope.outside).filter((p) => !fixJustified.has(p));
-				if (fixDrift.length > 0) {
-					await appendContext(ctx.cwd, chosen.changeId, "Review fix",
-						`Fix turn touched file(s) outside the contract with no deviation entry: ${fixDrift.join(", ")}.`);
-					ctx.ui.notify(`The review-fix turn for "${chosen.changeId}" drifted outside the scope contract: ${fixDrift.join(", ")}. Warning only — no second reconciliation turn.`, "warning");
-				}
-				await appendContext(ctx.cwd, chosen.changeId, "Review fix",
-					`${blocking.length} blocking finding(s); ${after.length} still open after the fix turn.`);
-				await recordPhase(chosen.changeId, "review-fix", "end", {
-					model: phaseModels.get("apply")?.model, outcome: fixOutcome,
-					counts: { outsideBefore: 0, reverted: 0, justified: 0, unjustifiedAfter: 0, blockingBefore: blocking.length, blockingAfter: after.length },
-				});
-				findings = { found: blocking.length, fixed: blocking.length - after.length };
-			}
-			if (!findings) findings = { found: blocking.length, fixed: 0 };
-		}
-
-		await offerArchive(ctx, chosen, reviewContent, archiveDriftPaths, recordPhase, skipReason, reconcileResult.restored, findings);
+		const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId).catch(() => []);
+		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions));
 		return;
 	}
 }
@@ -3135,6 +3056,7 @@ async function runOnDemandReview(
 	let reviewContent: string | undefined;
 	let reviewOutcome = "aborted";
 	await recordPhase(changeId, "review", "start", { model: phaseModels.get("review")?.model });
+	ctx.ui.notify(`Running code review for "${changeId}"...`, "info");
 	try {
 		const deviationsForReview = await readScopeDeviations(ctx.cwd, changeId);
 		await withPhaseModel(pi, ctx, "review", phaseModels, () =>
@@ -3617,7 +3539,7 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 			if (mode === "auto" || mode === "always" || mode === "never") {
 				parsed.review = mode;
 				i++;
-			} else if (value !== "") {
+			} else if (value !== "" && !value.startsWith("-")) {
 				parsed.reviewTarget = value;
 				i++;
 			}
@@ -3645,6 +3567,404 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 	return parsed;
 }
 
+export async function executeBrainstorm(
+	pi: ExtensionAPI,
+	ctx: ReviewCtx,
+	chosen: BrainstormMeta,
+	options: BrainstormExecutionOptions,
+): Promise<void> {
+	const {
+		laneOverride,
+		laneDefault,
+		parsedArgs,
+		compactMode,
+		effectiveReviewMode,
+		reviewFullLane,
+		reviewThresholds,
+		scopeProtected,
+		testPathsResult,
+	} = options;
+
+	// resolveLane() in readyset-brainstorm.ts answers "what did the file say"; the run's
+	// lane additionally honors --lane (set above) and readyset.lane.default (a configured
+	// `fast`/`full` forces it; `auto` accepts code's clarity→lane recommendation recomputed
+	// fresh from the file's frontmatter). From here on, effectiveLane is the only lane
+	// value this run may act on — read b.lane directly and you silently drop the operator's
+	// override or the config default.
+	const claritySignal = readClaritySignal(parseFrontmatter(chosen.raw).meta);
+	const recommendation = recommendLane(claritySignal);
+	const configLane: Lane | undefined =
+		laneDefault === "fast" || laneDefault === "full"
+			? laneDefault
+			: laneDefault === "auto"
+				? recommendation.lane
+				: undefined;
+	const effectiveLane = laneOverride ?? configLane ?? chosen.lane;
+	if (laneOverride && laneOverride !== chosen.lane) {
+		ctx.ui.notify(
+			`Running "${chosen.changeId}" on the ${effectiveLane} lane (--lane override; the brainstorm records ${chosen.lane}). ` +
+				(effectiveLane === "fast"
+					? "Fast lane: lighter Explore folded into Propose, at most ~8 tasks, no mutation-testing review. Behavior questions are still asked."
+					: "Full lane: the complete Grill → Explore → Propose → Review → Execute pipeline."),
+			"info",
+		);
+	} else if (laneDefault === "auto" && recommendation.lane !== chosen.lane) {
+		ctx.ui.notify(
+			`Auto lane: clarity ${recommendation.clarity}` +
+				`${recommendation.escalatedBy ? ` (risk flag: ${recommendation.escalatedBy})` : ""} recommends the ` +
+				`${recommendation.lane} lane; the brainstorm records ${chosen.lane}. Running ${effectiveLane}.`,
+			"warning",
+		);
+	}
+
+	// Lane context every `recordPhase` below reads. `--lane` is the operator's explicit,
+	// per-run answer to the lane question, so its source is "flag"; a configured
+	// readyset.lane.default decides the lane, so its source is "config-auto"; under `ask`,
+	// a brainstorm that carries the new clarity signal came from grilling just asking the
+	// user, so its source is "user-pick"; an older/pre-existing file with no clarity signal
+	// falls back to "brainstorm" (today's meaning, unchanged).
+	const phaseLane: "fast" | "full" = effectiveLane;
+	const phaseLaneSource: PhaseEvent["laneSource"] = laneOverride
+		? "flag"
+		: laneDefault === "auto" || laneDefault === "fast" || laneDefault === "full"
+			? "config-auto"
+			: chosen.clarity !== undefined
+				? "user-pick"
+				: "brainstorm";
+
+	if (chosen.status === "archived") {
+		ctx.ui.notify(`Change "${chosen.changeId}" is already archived. Start a new brainstorm for follow-up work.`, "warning");
+		return;
+	}
+
+	const reviewCtx = ctx;
+	const budget = createTurnBudget();
+
+	// --model <spec> (or, if no flag is given, a configured default from
+	// ~/.omp/agent/config.yml: readyset.model if set, else omp's own modelRoles.default) pins
+	// a specific model for every turn this run fires (Explore through Code-review), so a run
+	// is reproducible regardless of whatever model happened to be active in the chat session
+	// that invoked it. The original model is restored once this run finishes, whether it
+	// completes, stops early (Discard, budget exhausted), or throws. Flag wins over config.
+	//
+	// --phase-model <phase>=<spec> (repeatable) or readyset.model.phases.<phase> in config
+	// overrides the pinned model for one phase only (grill|explore|propose|apply|review).
+	// The run's pinned model is restored between phases. An override that fails to pin
+	// warns and falls back to the run default — a phase model is a cost optimization, not
+	// a correctness requirement, so it must never stop the run.
+	//
+	// --fallback-model <spec> (a single spec, not a chain) or readyset.model.fallbackChains
+	// (an ordered list, tried in turn until one pins — legacy readyset.fallbackModel still
+	// works too, as a one-element chain) is tried if pinning the resolved model above fails
+	// outright (a bad/retired spec) — see withPinnedModel's doc comment for why this is
+	// narrower than, and doesn't replace, omp's own retry.fallbackChains.
+	const modelFromFlag = parsedArgs.model;
+	const resolvedConfigModel = modelFromFlag ? undefined : await readPinnedModel();
+	const pinnedModel = modelFromFlag ?? resolvedConfigModel?.model;
+	const pinnedModelSource = modelFromFlag ? "--model flag" : (resolvedConfigModel?.source ?? "");
+
+	const resolvedConfigPhases = await readPhaseModels();
+	const phaseModelOverrides = new Map<string, { model: string; source: string }>();
+	for (const e of resolvedConfigPhases.entries) {
+		if (!phaseModelOverrides.has(e.phase)) phaseModelOverrides.set(e.phase, { model: e.model, source: e.source });
+	}
+	for (const e of parsedArgs.phaseModels ?? []) {
+		phaseModelOverrides.set(e.phase, { model: e.model, source: "--phase-model flag" });
+	}
+
+	// A phase's effective model, mirroring withPhaseModel's own precedence
+	// (phaseModelOverrides wins, else the run's pinned model). withPhaseModel cannot report
+	// back whether the override actually pinned, so the phase log records the spec that
+	// *would* have been used: the override when one exists, else pinnedModel.
+	const phaseModelFor = (phase: string): string | undefined =>
+		phaseModelOverrides.get(phase)?.model ?? pinnedModel;
+
+	// The `auto` threshold: a boundary compacts only when the host reports context usage
+	// at or above this share of the window (see compactForPhase). A warning about an
+	// invalid stored value is surfaced once, here, rather than per boundary.
+	const resolvedCompactMin = await readCompactMinContextPercent();
+	if (resolvedCompactMin.warning) ctx.ui.notify(resolvedCompactMin.warning, "warning");
+	const minContextPercent = resolvedCompactMin.percent;
+
+	// Per-artifact character budgets, resolved once for the run. The lane's own set is
+	// picked once `effectiveLane` is known (it is by this point): the fast lane only
+	// budgets proposal.md and tasks.md.
+	const artifactBudgetsByLane = await readArtifactBudgets();
+	const artifactBudgets = artifactBudgetsByLane[effectiveLane];
+
+	// Writes one phase boundary event. Never throws: a phase log is diagnostics, not control
+	// flow -- a write failure must not abort the run (mirrors appendContext's callers, which
+	// also never guard). Notably the archive `end` event lands *after* archiveChange moved
+	// the change directory away, so its write legitimately fails; that must not fail the run.
+	const recordPhase = async (
+		changeId: string,
+		phase: PhaseName,
+		edge: "start" | "end",
+		lane: "fast" | "full",
+		laneSource: PhaseEvent["laneSource"],
+		extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"] } = {},
+	): Promise<void> => {
+		await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
+	};
+
+	const recordPhaseFor = async (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; artifactChars?: PhaseEvent["artifactChars"] } = {}) =>
+		recordPhase(chosen.changeId, phase, edge, phaseLane, phaseLaneSource, extra);
+
+	const fallbackFromFlag = parsedArgs.fallbackModel;
+	const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
+	const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
+	const fallbackChainSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");
+
+	await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
+		if (isProposed(chosen.status)) {
+			// Defensive: a change that predates the baseline mechanism has no capture
+			// yet. This never overwrites an existing baseline (first capture wins).
+			await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
+			await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
+			return;
+		}
+
+		// Structural gate on the brainstorm itself, before Explore/Propose spend any turns on
+		// it — catches a brainstorm (from grilling or otherwise) whose Decision/Seam/Scope/
+		// Acceptance Criteria were never actually resolved. See validateBrainstormContent's doc
+		// comment for why this exists specifically for the grilling path: a fired turn working
+		// from a prose instruction alone can accept a passive answer despite being told not to,
+		// and there is no other structural check between grilling writing the file and Explore
+		// spending real turns on it.
+		const contentCheck = validateBrainstormContent(chosen.raw);
+
+		// Consumed here, one-shot -- see grillRoundState's doc comment for exactly what this
+		// does and doesn't attest to.
+		const grillingSkippedAsking = grillRoundState.active && grillRoundState.rounds === 0;
+		grillRoundState.active = false;
+
+		if (!contentCheck.ok || grillingSkippedAsking) {
+			const issues: string[] = [];
+			if (!contentCheck.ok) {
+				// contentCheck.summary carries the "(structural check)" label deliberately -- same
+				// wording validateChange uses below in the review gate, so neither reads as a
+				// stronger guarantee than it actually is just because of how it's phrased here.
+				const gapList = contentCheck.issues.map((i) => `${i.section} (${i.problem})`).join("; ");
+				issues.push(`${contentCheck.summary}: ${gapList}`);
+			}
+			if (grillingSkippedAsking) {
+				issues.push(
+					"grilling was started this session but readyset_ask was never called before the brainstorm " +
+						"was written -- the model may have answered every question itself instead of asking you",
+				);
+			}
+			const proceed = await reviewCtx.ui.select(
+				`${issues.join(". ")}.`,
+				[
+					{ label: "Continue anyway", description: "proceed to Explore/Propose despite the gaps above" },
+					{ label: "Go back", description: "cancel -- fill in (or keep grilling) the brainstorm first, then run /readyset again" },
+				],
+			);
+			if (proceed !== "Continue anyway") {
+				ctx.ui.notify(`Stopped before Explore -- resolve the gaps in "${chosen.title}" and run /readyset again.`, "info");
+				return;
+			}
+		}
+
+		await scaffoldChange(ctx.cwd, chosen.changeId);
+		// Capture what was already dirty before this change's own planning turns ever
+		// run, so the gate invariant and scope check subtract it rather than blaming
+		// this change for unrelated repo state. First capture wins; later, dirtier
+		// trees must not widen it.
+		await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
+
+		// Grill boundary, recorded at the first opportunity: the change directory does not
+		// exist during grilling (scaffoldChange above just created it), so a grill `start`
+		// timestamp is not recoverable from CONTEXT.md. Only the boundary at which grilling
+		// completed is written -- never synthesized from the brainstorm's date-only `created`
+		// frontmatter, which would be a fabricated time.
+		await recordPhase(chosen.changeId, "grill", "end", phaseLane, phaseLaneSource, {
+			model: phaseModelFor("grill"),
+			outcome: "grilled",
+			grill: {
+				clarity: recommendation.clarity,
+				openDecisions: claritySignal.openDecisions,
+				questionsAsked: chosen.questionsAsked,
+				recommendedLane: recommendation.lane,
+				laneReason: chosen.laneReason,
+				riskFlag: claritySignal.riskFlag,
+			},
+		});
+
+		// Fast lane folds Explore into Propose: no separate turn, no EXPLORATION.md turn.
+		// The full-lane path (separate grounding turn that must produce EXPLORATION.md)
+		// is unchanged below.
+		const isFastLane = effectiveLane === "fast";
+		let explored = false;
+		const exploreBudget = startPhaseBudget();
+		if (isFastLane) {
+			await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
+			await appendContext(
+				ctx.cwd,
+				chosen.changeId,
+				"Explore",
+				"Skipped as a separate turn — fast lane folds grounding into Propose (a few targeted reads, noted inline).",
+			);
+			await recordPhase(chosen.changeId, "explore", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("explore"), outcome: "skipped-fast-lane" });
+		} else {
+			const submodules = await listSubmodules(ctx.cwd);
+			ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
+			const exploreCompact = await compactForPhase(
+				pi,
+				reviewCtx,
+				phaseModelOverrides,
+				"explore",
+				chosen.changeId,
+				"Explore",
+				compactBeforeExploreGuidance(chosen.changeId, chosen.file),
+				compactMode,
+				minContextPercent,
+			);
+			await recordPhase(chosen.changeId, "compact", "end", phaseLane, phaseLaneSource, {
+				model: phaseModelFor("explore"),
+				outcome: exploreCompact.outcome,
+				boundary: "explore",
+				context: { beforePercent: exploreCompact.beforePercent, afterPercent: exploreCompact.afterPercent },
+			});
+			let exploreOutcome = "aborted";
+			await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
+			try {
+				const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
+					spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
+				);
+				if (!exploreFired) return;
+
+				explored = await hasExploration(ctx.cwd, chosen.changeId);
+				exploreOutcome = explored ? "exploration-written" : "no-exploration";
+				await appendContext(
+					ctx.cwd,
+					chosen.changeId,
+					"Explore",
+					(explored
+						? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
+						: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
+						` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
+				);
+				if (phaseBudgetExceeded(exploreBudget)) {
+					ctx.ui.notify(
+						`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
+							`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
+						"warning",
+					);
+				}
+				if (!explored) {
+					ctx.ui.notify(
+						`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
+							"grounding will be weaker than usual. Check the transcript above.",
+						"warning",
+					);
+				}
+			} finally {
+				await recordPhase(chosen.changeId, "explore", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("explore"), outcome: exploreOutcome });
+			}
+		}
+
+		ctx.ui.notify(`Proposing change "${chosen.changeId}"${isFastLane ? " (fast lane — grounding folded in)" : ""} — this can take a while...`, "info");
+		const proposeCompact = await compactForPhase(
+			pi,
+			reviewCtx,
+			phaseModelOverrides,
+			"propose",
+			chosen.changeId,
+			"Propose",
+			compactBeforeProposeGuidance(chosen.changeId, chosen.file, !isFastLane),
+			compactMode,
+			minContextPercent,
+		);
+		await recordPhase(chosen.changeId, "compact", "end", phaseLane, phaseLaneSource, {
+			model: phaseModelFor("propose"),
+			outcome: proposeCompact.outcome,
+			boundary: "propose",
+			context: { beforePercent: proposeCompact.beforePercent, afterPercent: proposeCompact.afterPercent },
+		});
+		const proposeBudget = startPhaseBudget();
+		let proposeOutcome = "aborted";
+		let proposeSizes: ArtifactSizes | undefined;
+		await recordPhase(chosen.changeId, "propose", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("propose") });
+		try {
+			const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
+				spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane, artifactBudgets)),
+			);
+			if (!proposeFired) return;
+			proposeSizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
+			const violations = await checkPhaseViolations(
+				ctx.cwd,
+				chosen.changeId,
+				await pathsChangedThisRun(ctx.cwd, chosen.changeId),
+			);
+			if (violations.length > 0) {
+				proposeOutcome = "stopped-violation";
+				await appendContext(
+					ctx.cwd,
+					chosen.changeId,
+					"Propose",
+					`STOPPED — planning turn wrote outside its boundary: ${violations
+						.map((v) => `${v.path} (${v.detail})`)
+						.join("; ")}. No review gate is offered for this state.`,
+				);
+				ctx.ui.notify(
+					`Stopped: the Propose turn for "${chosen.changeId}" changed files outside the change ` +
+						`directory (${violations.map((v) => v.path).join(", ")}). Readyset never implements without approval, ` +
+						"so no review gate is offered — revert those files (or move them into the change dir) and run /readyset again.",
+					"error",
+				);
+				return;
+			}
+			proposeOutcome = "proposed";
+			await appendContext(
+				ctx.cwd,
+				chosen.changeId,
+				"Propose",
+				`Propose turn ran; see proposal.md/design.md/specs/tasks.md.` +
+					(proposeSizes ? ` Planning size: proposal ${proposeSizes.proposal ?? 0}, design ${proposeSizes.design ?? 0}, specs ${proposeSizes.specs}, tasks ${proposeSizes.tasks ?? 0} chars (lane ${phaseLane}).` : "") +
+					` (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
+			);
+		} finally {
+			await recordPhase(chosen.changeId, "propose", "end", phaseLane, phaseLaneSource, {
+				model: phaseModelFor("propose"),
+				outcome: proposeOutcome,
+				artifactChars: proposeSizes ? { before: proposeSizes, after: proposeSizes } : undefined,
+			});
+		}
+		if (phaseBudgetExceeded(proposeBudget)) {
+			ctx.ui.notify(
+				`Propose for "${chosen.changeId}" hit its phase budget (${Math.round(proposeBudget.maxMs / 60000)} min) — the artifacts exist but the turn ran long. ` +
+					"Continuing to the gate; runaway cost like this is recorded in CONTEXT.md so you can see it.",
+				"warning",
+			);
+		}
+
+		await runContractRepair(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, recordPhaseFor, chosen.raw);
+		await runTrim(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, artifactBudgets, effectiveLane, recordPhaseFor);
+
+		const reloaded = await loadBrainstorms(ctx.cwd);
+		await reconcileStatuses(ctx.cwd, reloaded);
+		const after = reloaded.find((b) => b.changeId === chosen.changeId);
+
+		const wroteProposal = after ? (await validateChange(ctx.cwd, after.changeId)).issues.every((i) => !(i.file === "proposal.md" && i.problem === "missing")) : false;
+
+		if (!after || !isProposed(after.status) || !wroteProposal) {
+			const why = !after
+				? `no brainstorm matches the change id "${chosen.changeId}"`
+				: !isProposed(after.status)
+					? `its brainstorm status is "${after.status}", not proposed`
+					: "proposal.md is missing or empty";
+			ctx.ui.notify(
+				`Propose for "${chosen.changeId}" doesn't look finished (${why}) — check the transcript above for errors, then run /readyset again.`,
+				"warning",
+			);
+			return;
+		}
+
+		await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
+	});
+}
+
 export default function (pi: ExtensionAPI) {
 	// Outside-repo tripwire (advisory). omp fires `tool_call` before every tool executes; older
 	// builds and the test fakes have no `on`, so registration is feature-detected and no-ops.
@@ -3652,14 +3972,31 @@ export default function (pi: ExtensionAPI) {
 	// above): this file takes zero type dependency on host internals, so the hook shape is cast
 	// rather than imported.
 	const toolCallHost = pi as unknown as {
-		on?: (event: string, handler: (event: unknown, ctx: { cwd?: string }) => void) => void;
+		on?: (event: string, handler: (event: unknown, ctx: { cwd?: string; ui?: unknown; mode?: string; waitForIdle?: () => Promise<void> }) => void) => void;
 	};
 	if (typeof toolCallHost.on === "function") {
 		toolCallHost.on("tool_call", (event, ctx) => {
-			if (outsideRepoState.cwd === undefined || ctx?.cwd !== outsideRepoState.cwd) return;
-			const call = event as { toolName?: string; input?: Record<string, unknown> };
-			const kind = classifyOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, outsideRepoState.cwd);
-			if (kind) noteOutsideRepoCall(call.toolName ?? "", call.input ?? {}, kind);
+			if (outsideRepoState.cwd !== undefined && ctx?.cwd === outsideRepoState.cwd) {
+				const call = event as { toolName?: string; input?: Record<string, unknown> };
+				const kind = classifyOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, outsideRepoState.cwd);
+				if (kind) noteOutsideRepoCall(call.toolName ?? "", call.input ?? {}, kind);
+			}
+			if (activeGrillSession?.active) {
+				const call = event as { toolName?: string; input?: Record<string, unknown> };
+				if ((call.toolName === "write" || call.toolName === "write_file") && typeof call.input?.path === "string") {
+					const p = call.input.path;
+					if (p.includes(".ai/brainstorms") && p.endsWith(".md")) {
+						activeGrillSession.writtenBrainstormFile = p;
+					}
+				}
+			}
+		});
+		toolCallHost.on("agent_end", async (event, ctx) => {
+			const endEv = event as { willContinue?: boolean } | undefined;
+			if (endEv?.willContinue) return;
+			if (activeGrillSession?.active) {
+				await handleGrillEndTransition(pi, ctx as unknown as ReviewCtx);
+			}
 		});
 	}
 	registerAskTool(pi);
@@ -3763,6 +4100,18 @@ export default function (pi: ExtensionAPI) {
 			if (resolvedLaneDefault.warning) ctx.ui.notify(resolvedLaneDefault.warning, "warning");
 			const laneDefault = resolvedLaneDefault.laneDefault;
 
+			const execOptions: BrainstormExecutionOptions = {
+				laneOverride,
+				laneDefault,
+				parsedArgs,
+				compactMode,
+				effectiveReviewMode,
+				reviewFullLane,
+				reviewThresholds,
+				scopeProtected,
+				testPathsResult,
+			};
+
 			// --lang <language> (or, if no flag, readyset.language in ~/.omp/agent/config.yml) sets
 			// the language grilling's discussion (questions and replies) opens in from round 1,
 			// rather than grillTurnPrompt's reactive default of matching whatever language the
@@ -3781,7 +4130,7 @@ export default function (pi: ExtensionAPI) {
 			// come last among flags on the command line.
 			const ideaFromFlag = parsedArgs.idea ?? "";
 			if (ideaFromFlag) {
-				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, laneDefault, preferredLanguage);
+				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, laneDefault, preferredLanguage, execOptions);
 				return;
 			}
 
@@ -3843,406 +4192,14 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("No idea given -- nothing started.", "info");
 					return;
 				}
-				startGrilling(pi, reviewCtxForInput, idea, laneDefault, preferredLanguage);
+				startGrilling(pi, reviewCtxForInput, idea, laneDefault, preferredLanguage, execOptions);
 				return;
 			}
 
 			const chosen = byLabel.get(picked);
 			if (!chosen) return;
 
-			// resolveLane() in readyset-brainstorm.ts answers "what did the file say"; the run's
-			// lane additionally honors --lane (set above) and readyset.lane.default (a configured
-			// `fast`/`full` forces it; `auto` accepts code's clarity→lane recommendation recomputed
-			// fresh from the file's frontmatter). From here on, effectiveLane is the only lane
-			// value this run may act on — read b.lane directly and you silently drop the operator's
-			// override or the config default.
-			const claritySignal = readClaritySignal(parseFrontmatter(chosen.raw).meta);
-			const recommendation = recommendLane(claritySignal);
-			const configLane: Lane | undefined =
-				laneDefault === "fast" || laneDefault === "full"
-					? laneDefault
-					: laneDefault === "auto"
-						? recommendation.lane
-						: undefined;
-			const effectiveLane = laneOverride ?? configLane ?? chosen.lane;
-			if (laneOverride && laneOverride !== chosen.lane) {
-				ctx.ui.notify(
-					`Running "${chosen.changeId}" on the ${effectiveLane} lane (--lane override; the brainstorm records ${chosen.lane}). ` +
-						(effectiveLane === "fast"
-							? "Fast lane: lighter Explore folded into Propose, at most ~8 tasks, no mutation-testing review. Behavior questions are still asked."
-							: "Full lane: the complete Grill → Explore → Propose → Review → Execute pipeline."),
-					"info",
-				);
-			} else if (laneDefault === "auto" && recommendation.lane !== chosen.lane) {
-				ctx.ui.notify(
-					`Auto lane: clarity ${recommendation.clarity}` +
-						`${recommendation.escalatedBy ? ` (risk flag: ${recommendation.escalatedBy})` : ""} recommends the ` +
-						`${recommendation.lane} lane; the brainstorm records ${chosen.lane}. Running ${effectiveLane}.`,
-					"warning",
-				);
-			}
-
-			// Lane context every `recordPhase` below reads. `--lane` is the operator's explicit,
-			// per-run answer to the lane question, so its source is "flag"; a configured
-			// readyset.lane.default decides the lane, so its source is "config-auto"; under `ask`,
-			// a brainstorm that carries the new clarity signal came from grilling just asking the
-			// user, so its source is "user-pick"; an older/pre-existing file with no clarity signal
-			// falls back to "brainstorm" (today's meaning, unchanged).
-			const phaseLane: "fast" | "full" = effectiveLane;
-			const phaseLaneSource: PhaseEvent["laneSource"] = laneOverride
-				? "flag"
-				: laneDefault === "auto" || laneDefault === "fast" || laneDefault === "full"
-					? "config-auto"
-					: chosen.clarity !== undefined
-						? "user-pick"
-						: "brainstorm";
-
-			if (chosen.status === "archived") {
-				ctx.ui.notify(`Change "${chosen.changeId}" is already archived. Start a new brainstorm for follow-up work.`, "warning");
-				return;
-			}
-
-			const reviewCtx = ctx as unknown as ReviewCtx;
-			const budget = createTurnBudget();
-
-			// --model <spec> (or, if no flag is given, a configured default from
-			// ~/.omp/agent/config.yml: readyset.model if set, else omp's own modelRoles.default) pins
-			// a specific model for every turn this run fires (Explore through Code-review), so a run
-			// is reproducible regardless of whatever model happened to be active in the chat session
-			// that invoked it. The original model is restored once this run finishes, whether it
-			// completes, stops early (Discard, budget exhausted), or throws. Flag wins over config.
-			//
-			// --phase-model <phase>=<spec> (repeatable) or readyset.model.phases.<phase> in config
-			// overrides the pinned model for one phase only (grill|explore|propose|apply|review).
-			// The run's pinned model is restored between phases. An override that fails to pin
-			// warns and falls back to the run default — a phase model is a cost optimization, not
-			// a correctness requirement, so it must never stop the run.
-			//
-			// --fallback-model <spec> (a single spec, not a chain) or readyset.model.fallbackChains
-			// (an ordered list, tried in turn until one pins — legacy readyset.fallbackModel still
-			// works too, as a one-element chain) is tried if pinning the resolved model above fails
-			// outright (a bad/retired spec) — see withPinnedModel's doc comment for why this is
-			// narrower than, and doesn't replace, omp's own retry.fallbackChains.
-			const modelFromFlag = parsedArgs.model;
-			const resolvedConfigModel = modelFromFlag ? undefined : await readPinnedModel();
-			const pinnedModel = modelFromFlag ?? resolvedConfigModel?.model;
-			const pinnedModelSource = modelFromFlag ? "--model flag" : (resolvedConfigModel?.source ?? "");
-
-			const resolvedConfigPhases = await readPhaseModels();
-			const phaseModelOverrides = new Map<string, { model: string; source: string }>();
-			for (const e of resolvedConfigPhases.entries) {
-				if (!phaseModelOverrides.has(e.phase)) phaseModelOverrides.set(e.phase, { model: e.model, source: e.source });
-			}
-			for (const e of parsedArgs.phaseModels ?? []) {
-				phaseModelOverrides.set(e.phase, { model: e.model, source: "--phase-model flag" });
-			}
-
-			// A phase's effective model, mirroring withPhaseModel's own precedence
-			// (phaseModelOverrides wins, else the run's pinned model). withPhaseModel cannot report
-			// back whether the override actually pinned, so the phase log records the spec that
-			// *would* have been used: the override when one exists, else pinnedModel.
-			const phaseModelFor = (phase: string): string | undefined =>
-				phaseModelOverrides.get(phase)?.model ?? pinnedModel;
-
-			// The `auto` threshold: a boundary compacts only when the host reports context usage
-			// at or above this share of the window (see compactForPhase). A warning about an
-			// invalid stored value is surfaced once, here, rather than per boundary.
-			const resolvedCompactMin = await readCompactMinContextPercent();
-			if (resolvedCompactMin.warning) ctx.ui.notify(resolvedCompactMin.warning, "warning");
-			const minContextPercent = resolvedCompactMin.percent;
-
-			// Per-artifact character budgets, resolved once for the run. The lane's own set is
-			// picked once `effectiveLane` is known (it is by this point): the fast lane only
-			// budgets proposal.md and tasks.md.
-			const artifactBudgetsByLane = await readArtifactBudgets();
-			const artifactBudgets = artifactBudgetsByLane[effectiveLane];
-
-			// Writes one phase boundary event. Never throws: a phase log is diagnostics, not control
-			// flow -- a write failure must not abort the run (mirrors appendContext's callers, which
-			// also never guard). Notably the archive `end` event lands *after* archiveChange moved
-			// the change directory away, so its write legitimately fails; that must not fail the run.
-			const recordPhase = async (
-				changeId: string,
-				phase: PhaseName,
-				edge: "start" | "end",
-				lane: "fast" | "full",
-				laneSource: PhaseEvent["laneSource"],
-				extra: { model?: string; outcome?: string; diff?: PhaseEvent["diff"]; boundary?: PhaseEvent["boundary"]; context?: PhaseEvent["context"]; grill?: PhaseEvent["grill"]; artifactChars?: PhaseEvent["artifactChars"]; review?: PhaseEvent["review"] } = {},
-			): Promise<void> => {
-				await appendPhaseEvent(ctx.cwd, changeId, { phase, edge, at: new Date().toISOString(), lane, laneSource, ...extra }).catch(() => {});
-			};
-
-			const recordPhaseFor = async (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; artifactChars?: PhaseEvent["artifactChars"] } = {}) =>
-				recordPhase(chosen.changeId, phase, edge, phaseLane, phaseLaneSource, extra);
-
-			const fallbackFromFlag = parsedArgs.fallbackModel;
-			const resolvedConfigFallback = fallbackFromFlag ? undefined : await readFallbackChain();
-			const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
-			const fallbackChainSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");
-
-			await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
-				if (isProposed(chosen.status)) {
-					// Defensive: a change that predates the baseline mechanism has no capture
-					// yet. This never overwrites an existing baseline (first capture wins).
-					await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-					await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
-					return;
-				}
-
-				// Structural gate on the brainstorm itself, before Explore/Propose spend any turns on
-				// it — catches a brainstorm (from grilling or otherwise) whose Decision/Seam/Scope/
-				// Acceptance Criteria were never actually resolved. See validateBrainstormContent's doc
-				// comment for why this exists specifically for the grilling path: a fired turn working
-				// from a prose instruction alone can accept a passive answer despite being told not to,
-				// and there is no other structural check between grilling writing the file and Explore
-				// spending real turns on it.
-				const contentCheck = validateBrainstormContent(chosen.raw);
-
-				// Consumed here, one-shot -- see grillRoundState's doc comment for exactly what this
-				// does and doesn't attest to.
-				const grillingSkippedAsking = grillRoundState.active && grillRoundState.rounds === 0;
-				grillRoundState.active = false;
-
-				if (!contentCheck.ok || grillingSkippedAsking) {
-					const issues: string[] = [];
-					if (!contentCheck.ok) {
-						// contentCheck.summary carries the "(structural check)" label deliberately -- same
-						// wording validateChange uses below in the review gate, so neither reads as a
-						// stronger guarantee than it actually is just because of how it's phrased here.
-						const gapList = contentCheck.issues.map((i) => `${i.section} (${i.problem})`).join("; ");
-						issues.push(`${contentCheck.summary}: ${gapList}`);
-					}
-					if (grillingSkippedAsking) {
-						issues.push(
-							"grilling was started this session but readyset_ask was never called before the brainstorm " +
-								"was written -- the model may have answered every question itself instead of asking you",
-						);
-					}
-					const proceed = await reviewCtx.ui.select(
-						`${issues.join(". ")}.`,
-						[
-							{ label: "Continue anyway", description: "proceed to Explore/Propose despite the gaps above" },
-							{ label: "Go back", description: "cancel -- fill in (or keep grilling) the brainstorm first, then run /readyset again" },
-						],
-					);
-					if (proceed !== "Continue anyway") {
-						ctx.ui.notify(`Stopped before Explore -- resolve the gaps in "${chosen.title}" and run /readyset again.`, "info");
-						return;
-					}
-				}
-
-				await scaffoldChange(ctx.cwd, chosen.changeId);
-				// Capture what was already dirty before this change's own planning turns ever
-				// run, so the gate invariant and scope check subtract it rather than blaming
-				// this change for unrelated repo state. First capture wins; later, dirtier
-				// trees must not widen it.
-				await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-
-				// Grill boundary, recorded at the first opportunity: the change directory does not
-				// exist during grilling (scaffoldChange above just created it), so a grill `start`
-				// timestamp is not recoverable from CONTEXT.md. Only the boundary at which grilling
-				// completed is written -- never synthesized from the brainstorm's date-only `created`
-				// frontmatter, which would be a fabricated time.
-				await recordPhase(chosen.changeId, "grill", "end", phaseLane, phaseLaneSource, {
-					model: phaseModelFor("grill"),
-					outcome: "grilled",
-					grill: {
-						clarity: recommendation.clarity,
-						openDecisions: claritySignal.openDecisions,
-						questionsAsked: chosen.questionsAsked,
-						recommendedLane: recommendation.lane,
-						laneReason: chosen.laneReason,
-						riskFlag: claritySignal.riskFlag,
-					},
-				});
-
-				// Fast lane folds Explore into Propose: no separate turn, no EXPLORATION.md turn.
-				// The full-lane path (separate grounding turn that must produce EXPLORATION.md)
-				// is unchanged below.
-				const isFastLane = effectiveLane === "fast";
-				let explored = false;
-				const exploreBudget = startPhaseBudget();
-				if (isFastLane) {
-					await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
-					await appendContext(
-						ctx.cwd,
-						chosen.changeId,
-						"Explore",
-						"Skipped as a separate turn — fast lane folds grounding into Propose (a few targeted reads, noted inline).",
-					);
-					await recordPhase(chosen.changeId, "explore", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("explore"), outcome: "skipped-fast-lane" });
-				} else {
-					const submodules = await listSubmodules(ctx.cwd);
-					ctx.ui.notify(`Exploring ground truth for "${chosen.changeId}" — this can take a while...`, "info");
-					const exploreCompact = await compactForPhase(
-						pi,
-						reviewCtx,
-						phaseModelOverrides,
-						"explore",
-						chosen.changeId,
-						"Explore",
-						compactBeforeExploreGuidance(chosen.changeId, chosen.file),
-						compactMode,
-						minContextPercent,
-					);
-					await recordPhase(chosen.changeId, "compact", "end", phaseLane, phaseLaneSource, {
-						model: phaseModelFor("explore"),
-						outcome: exploreCompact.outcome,
-						boundary: "explore",
-						context: { beforePercent: exploreCompact.beforePercent, afterPercent: exploreCompact.afterPercent },
-					});
-					let exploreOutcome = "aborted";
-					await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
-					try {
-						const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
-							spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
-						);
-						if (!exploreFired) return;
-
-						explored = await hasExploration(ctx.cwd, chosen.changeId);
-						exploreOutcome = explored ? "exploration-written" : "no-exploration";
-						await appendContext(
-							ctx.cwd,
-							chosen.changeId,
-							"Explore",
-							(explored
-								? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
-								: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
-								` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
-						);
-						if (phaseBudgetExceeded(exploreBudget)) {
-							ctx.ui.notify(
-								`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
-									`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
-								"warning",
-							);
-						}
-						if (!explored) {
-							ctx.ui.notify(
-								`Exploration for "${chosen.changeId}" didn't produce EXPLORATION.md — continuing to Propose anyway, but its ` +
-									"grounding will be weaker than usual. Check the transcript above.",
-								"warning",
-							);
-						}
-					} finally {
-						await recordPhase(chosen.changeId, "explore", "end", phaseLane, phaseLaneSource, { model: phaseModelFor("explore"), outcome: exploreOutcome });
-					}
-				}
-
-				ctx.ui.notify(`Proposing change "${chosen.changeId}"${isFastLane ? " (fast lane — grounding folded in)" : ""} — this can take a while...`, "info");
-				const proposeCompact = await compactForPhase(
-					pi,
-					reviewCtx,
-					phaseModelOverrides,
-					"propose",
-					chosen.changeId,
-					"Propose",
-					compactBeforeProposeGuidance(chosen.changeId, chosen.file, !isFastLane),
-					compactMode,
-					minContextPercent,
-				);
-				await recordPhase(chosen.changeId, "compact", "end", phaseLane, phaseLaneSource, {
-					model: phaseModelFor("propose"),
-					outcome: proposeCompact.outcome,
-					boundary: "propose",
-					context: { beforePercent: proposeCompact.beforePercent, afterPercent: proposeCompact.afterPercent },
-				});
-				const proposeBudget = startPhaseBudget();
-				let proposeOutcome = "aborted";
-				let proposeSizes: ArtifactSizes | undefined;
-				await recordPhase(chosen.changeId, "propose", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("propose") });
-				try {
-					const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
-						spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane, artifactBudgets)),
-					);
-					if (!proposeFired) return;
-					// Measure the Propose turn's output for the bench's planning-size report and the
-					// gate's budget line. Taken on both outcome paths (proposed and stopped-violation):
-					// the sizes are still useful even when the turn leaked outside its boundary.
-					proposeSizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
-					// Gate invariant (R2): a planning turn may only leave planning artifacts. The
-					// T11/T12 benchmark runs implemented the change out of the Propose turn and
-					// archived it themselves, shipping with no approval. That is checked here —
-					// structurally, from the working tree — before the gate is ever offered.
-					const violations = await checkPhaseViolations(
-						ctx.cwd,
-						chosen.changeId,
-						await pathsChangedThisRun(ctx.cwd, chosen.changeId),
-					);
-					if (violations.length > 0) {
-						proposeOutcome = "stopped-violation";
-						await appendContext(
-							ctx.cwd,
-							chosen.changeId,
-							"Propose",
-							`STOPPED — planning turn wrote outside its boundary: ${violations
-								.map((v) => `${v.path} (${v.detail})`)
-								.join("; ")}. No review gate is offered for this state.`,
-						);
-						ctx.ui.notify(
-							`Stopped: the Propose turn for "${chosen.changeId}" changed files outside the change ` +
-								`directory (${violations.map((v) => v.path).join(", ")}). Readyset never implements without approval, ` +
-								"so no review gate is offered — revert those files (or move them into the change dir) and run /readyset again.",
-							"error",
-						);
-						return;
-					}
-					proposeOutcome = "proposed";
-					await appendContext(
-						ctx.cwd,
-						chosen.changeId,
-						"Propose",
-						`Propose turn ran; see proposal.md/design.md/specs/tasks.md.` +
-							(proposeSizes ? ` Planning size: proposal ${proposeSizes.proposal ?? 0}, design ${proposeSizes.design ?? 0}, specs ${proposeSizes.specs}, tasks ${proposeSizes.tasks ?? 0} chars (lane ${phaseLane}).` : "") +
-							` (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
-					);
-				} finally {
-					await recordPhase(chosen.changeId, "propose", "end", phaseLane, phaseLaneSource, {
-						model: phaseModelFor("propose"),
-						outcome: proposeOutcome,
-						artifactChars: proposeSizes ? { before: proposeSizes, after: proposeSizes } : undefined,
-					});
-				}
-			if (phaseBudgetExceeded(proposeBudget)) {
-				ctx.ui.notify(
-					`Propose for "${chosen.changeId}" hit its phase budget (${Math.round(proposeBudget.maxMs / 60000)} min) — the artifacts exist but the turn ran long. ` +
-						"Continuing to the gate; runaway cost like this is recorded in CONTEXT.md so you can see it.",
-					"warning",
-				);
-			}
-
-			await runContractRepair(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, recordPhaseFor, chosen.raw);
-			await runTrim(pi, reviewCtx, budget, chosen.changeId, phaseModelOverrides, artifactBudgets, effectiveLane, recordPhaseFor);
-
-			const reloaded = await loadBrainstorms(ctx.cwd);
-			await reconcileStatuses(ctx.cwd, reloaded);
-			const after = reloaded.find((b) => b.changeId === chosen.changeId);
-
-			// reconcileStatuses/changeState only checks whether readyset/changes/<id>/ exists as a
-			// directory — and scaffoldChange above already created it before the turn ran. So a
-			// turn that wrote nothing at all still leaves a dir behind and isProposed() alone
-			// would wrongly look "finished". Check proposal.md actually has content too.
-			const wroteProposal = after ? (await validateChange(ctx.cwd, after.changeId)).issues.every((i) => !(i.file === "proposal.md" && i.problem === "missing")) : false;
-
-			if (!after || !isProposed(after.status) || !wroteProposal) {
-				// Name the actual failing condition. The old message said "proposal.md not
-				// found or empty" for all three, which sent a live investigation (b1-subset-0.12
-				// T12) hunting for a file that was on disk the whole time — the real cause was
-				// a fast-lane brainstorm whose status never got reconciled to "proposed".
-				const why = !after
-					? `no brainstorm matches the change id "${chosen.changeId}"`
-					: !isProposed(after.status)
-						? `its brainstorm status is "${after.status}", not proposed`
-						: "proposal.md is missing or empty";
-				ctx.ui.notify(
-					`Propose for "${chosen.changeId}" doesn't look finished (${why}) — check the transcript above for errors, then run /readyset again.`,
-					"warning",
-				);
-				return;
-			}
-
-			await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
-		});
+			await executeBrainstorm(pi, ctx as unknown as ReviewCtx, chosen, execOptions);
 		},
 	});
 }

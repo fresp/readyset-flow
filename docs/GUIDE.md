@@ -87,14 +87,15 @@ A `/readyset` change moves through five stages — you only see the ones that st
 
 | Stage | What happens | Who can skip it |
 |---|---|---|
-| **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity until Decision/Seam/Scope/Acceptance Criteria resolve. | Skipped if a brainstorm already exists in `.ai/brainstorms/`. |
+| **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity until Decision/Seam/Scope/Acceptance Criteria resolve. Immediately offers to proceed with Explore & Propose upon completion. | Skipped if a brainstorm already exists in `.ai/brainstorms/`. |
 | **2. Explore** | Reads the real repo and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm — **except on the fast lane**, which folds it into Propose. |
 | **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in Explore's findings, plus the `## Files This Change Will Touch` scope contract. | Never skipped. |
-| **4. Review gate** | Approve, **Refine**, or **Discard** — Discard is the default. Nothing executes without a deliberate approval first. | Never skipped — the gate Readyset exists to enforce. |
-| **5. Execute** | Implements `tasks.md`. Every finished task needs a `_Verified:` note, optionally backed by `readyset_verify` evidence. A separate **code-review** turn runs before archiving. | Never skipped. |
+| **4. Review gate** | Approve, **Refine**, or **Discard** — Discard is the default. Approving hands off execution directly to native core omp. | Never skipped — the gate Readyset exists to enforce. |
+| **5. Execute** | Implemented directly by core omp with native runtime support (subagents, parallel execution). Once complete, run `/readyset --review <change-id>` for on-demand review and archiving. | Never skipped. |
 
-**Refine** sends you back to Propose; a failed verification at Execute sends you back to the
-review gate — either way you land on a stage above, never off into an unrecoverable branch.
+**Refine** sends you back to Propose; **Approve & Execute** hands off the change to core omp for
+implementation. Once execution completes, run `/readyset --review <change-id>` to evaluate risk triggers,
+run code review, and archive.
 
 Phase discipline is enforced, not just requested. After the Propose turn fires, Readyset snapshots
 the working tree and **stops the run with no gate offered** if anything outside
@@ -188,8 +189,10 @@ modes, or an omp build without it, grilling falls back to a plain-chat back-and-
 When `readyset_ask` is absent from the model's available tools, grilling falls back immediately to
 asking structured questions directly in chat with explicit options and recommended picks — the prompt
 expressly forbids searching the filesystem, process table, or network for the missing tool.
-Either way it ends once the model writes the brainstorm file and tells you to run `/readyset`
-again to pick it up.
+Once the model writes the brainstorm file, Readyset immediately prompts you with a confirmation
+dialog asking whether to proceed with Explore & Propose in the active session. Choosing to proceed
+continues without re-invoking `/readyset` or manually re-selecting the file, preserving prompt cache
+prefixes and context continuity.
 
 Alongside `lane`, grilling writes the clarity signal into the frontmatter: `clarity`
 (`clear` = 0 open decisions after fact-finding, `partial` = 1–2, `ambiguous` = 3+ or an undefined
@@ -501,16 +504,15 @@ Picks a brainstorm, then depending on its status:
     block**. If the reconciliation turn itself touches a new out-of-contract file, that is surfaced
     too. The code-review turn also gets the deviation list and writes a `## Scope` section of
     `REVIEW.md` judging each deviation necessary-or-gold-plating.
-- **Approve & Execute** implements the tasks. Each completed task needs an indented `_Verified:`
-  note, or the gate sends it back. It can optionally call `readyset_verify({taskId, command})` to
-  back that note with more than a self-report — the command runs for real, and an immutable record
-  of its exit code, stdout/stderr, and duration is persisted to `readyset/changes/<id>/evidence/`.
-  The panel's **Runtime evidence** section lists those records and flags a **conflict** when a
-  task is checked `[x]` but its latest evidence exited non-zero — surfaced passively, never
-  auto-blocking. Once every task is verifiably done, a separate **code review** turn runs (told
-  to find problems, not confirm the work) and writes `REVIEW.md`. Only then does Readyset offer to
-  archive — merging delta specs into `readyset/specs/` append-only, now warning explicitly if a
-  delta held a MODIFIED/REMOVED requirement the merge couldn't apply.
+- **Approve & Execute** hands off implementation of the change directly to core omp's native runtime.
+  Readyset marks the change approved, logs the handoff in `CONTEXT.md` and phase events (`outcome: "handoff-omp"`),
+  clears editor and widget state, sends the execution prompt (`applyTurnPrompt`) to omp via `pi.sendUserMessage`,
+  and exits immediately. Core omp executes the tasks natively, with full support for subagents, parallel tool
+  calls, and real-time task checklist updates.
+- **On-demand Code Review & Archiving**. After omp finishes implementing the tasks, run
+  `/readyset --review <change-id>` on demand. Readyset evaluates risk triggers against working tree changes,
+  fires an adversarial code-review turn, writes `REVIEW.md`, and prompts to archive the change (merging delta
+  specs into `readyset/specs/` append-only, with warnings if MODIFIED/REMOVED requirements cannot be merged).
   - **Risk-based code review.** The code-review turn is not unconditional: it is gated by
     `readyset.review.mode` (default `auto`) and the `--review auto|always|never` flag (the flag
     wins over config for that run). `always` keeps the pre-0.14 behavior — review every run;
