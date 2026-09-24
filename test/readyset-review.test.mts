@@ -367,6 +367,41 @@ async function loadHandlerAgentEndAndVerify(fakePi: { sendUserMessage: (prompt: 
   };
 }
 
+// Same as loadHandlerAndAgentEnd, plus the session_stop verification-gate handler from the SAME
+// module instance, so activeVerifyChangeId/sessionStopBlockCounts (module-level) are shared.
+async function loadHandlerAgentEndAndSessionStop(fakePi: { sendUserMessage: (prompt: string, opts: unknown) => void }): Promise<{
+  handler: (args: string, ctx: unknown) => Promise<void>;
+  agentEnd: (event: unknown, ctx: unknown) => Promise<void>;
+  sessionStop: (event: unknown, ctx: unknown) => Promise<{ decision?: string; reason?: string } | undefined>;
+}> {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    default: (pi: unknown) => void;
+  };
+  let capturedHandler: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  let capturedAgentEnd: ((event: unknown, ctx: unknown) => Promise<void> | void) | undefined;
+  let capturedSessionStop: ((event: unknown, ctx: unknown) => Promise<{ decision?: string; reason?: string } | undefined> | { decision?: string; reason?: string } | undefined) | undefined;
+  mod.default({
+    ...fakePi,
+    registerCommand(_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      capturedHandler = def;
+    },
+    on(event: string, handler: (event: unknown, ctx: unknown) => unknown) {
+      if (event === "agent_end") capturedAgentEnd = handler as any;
+      if (event === "session_stop") capturedSessionStop = handler as any;
+    },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
+  } as any);
+  if (!capturedHandler) throw new Error("registerCommand was never called");
+  if (!capturedAgentEnd) throw new Error("the agent_end handler was never registered");
+  if (!capturedSessionStop) throw new Error("the session_stop handler was never registered");
+  return {
+    handler: capturedHandler.handler,
+    agentEnd: async (event, ctx) => void (await capturedAgentEnd!(event, ctx)),
+    sessionStop: async (event, ctx) => await capturedSessionStop!(event, ctx),
+  };
+}
+
 await test("full happy path: open -> explore -> propose -> approve & execute -> code review -> archive", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-01-my-feature.md", {
@@ -1502,6 +1537,73 @@ await test("readyset_verify: attached while the handoff is armed, detached again
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   const after = await verifyExecute("t3", { taskId: "1.1", command: "true" }, undefined, undefined, ctx);
   assert.match(after.content[0].text, /isn't attached to an active Apply turn/);
+});
+
+await test("session_stop verification gate: blocks while a checked task lacks a _Verified: note, capped at MAX_VERIFICATION_SENDBACKS, only for the armed change", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-14-sessionstop.md", {
+    title: "Session Stop", status: "proposed", created: "2026-07-14", change_id: "session-stop",
+  });
+  await writeProposedChange(cwd, "session-stop", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const sessionId = "sessionstop-session";
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+
+  // Before any handoff is armed: nothing to check, never blocks.
+  assert.equal(await sessionStop({ session_id: sessionId }, { cwd }), undefined);
+
+  fakeUiWrap.selectQueue.push("2026-07-14 · Session Stop");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  // Armed, but no task checked yet -- nothing to flag.
+  assert.equal(await sessionStop({ session_id: sessionId }, { cwd }), undefined);
+
+  // A checked task with no _Verified: note -> blocks.
+  const dir = join(cwd, "readyset", "changes", "session-stop");
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 no note\n- [ ] 1.2 todo\n", "utf8");
+  const first = await sessionStop({ session_id: sessionId }, { cwd });
+  assert.equal(first?.decision, "block");
+  assert.match(first?.reason ?? "", /1 checked task\(s\)/);
+  assert.match(first?.reason ?? "", /1\/2/);
+
+  const second = await sessionStop({ session_id: sessionId }, { cwd });
+  assert.equal(second?.decision, "block");
+  assert.match(second?.reason ?? "", /2\/2/);
+
+  // Cap reached (MAX_VERIFICATION_SENDBACKS = 2): the third call lets the session stop.
+  const third = await sessionStop({ session_id: sessionId }, { cwd });
+  assert.equal(third, undefined);
+
+  // A DIFFERENT session id gets its own budget, not the exhausted one.
+  const otherSession = await sessionStop({ session_id: "another-session" }, { cwd });
+  assert.equal(otherSession?.decision, "block");
+});
+
+await test("session_stop verification gate: a verified task, or no cwd, never blocks", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-14-sessionstop-clean.md", {
+    title: "Session Stop Clean", status: "proposed", created: "2026-07-14", change_id: "session-stop-clean",
+  });
+  await writeProposedChange(cwd, "session-stop-clean", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const sessionId = "sessionstop-clean-session";
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+
+  fakeUiWrap.selectQueue.push("2026-07-14 · Session Stop Clean");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  const dir = join(cwd, "readyset", "changes", "session-stop-clean");
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 done\n  _Verified: ran it_\n", "utf8");
+  assert.equal(await sessionStop({ session_id: sessionId }, { cwd }), undefined, "every checked task carries a _Verified: note");
+  assert.equal(await sessionStop({ session_id: sessionId }, {}), undefined, "no cwd on the event ctx -- never blocks");
 });
 
 await test("review policy at settle: mode=never writes the skip stub", async () => {
