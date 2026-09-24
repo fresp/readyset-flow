@@ -69,7 +69,10 @@ Prose is a request; a gate is a requirement.
 - **Runtime evidence is not proof of correctness.** `readyset_verify` records what a command did
   — exit code, stdout/stderr, timeout — nothing more. `exitCode: 0` means the command ran clean,
   never that the requirement is satisfied; that judgment stays the code-review turn's. It never
-  marks a task done or touches `_Verified:`.
+  marks a task done or touches `_Verified:`. The apply prompt recommends it and asks the model to
+  cite the record as `evidence E00N` in the task's note. A citation is a checkable claim: one that
+  names a missing record, another task's record, or a failed run is an evidence conflict, and
+  `readyset_done` refuses "done" while any conflict remains.
 - **Implementer-facing artifacts describe the user's change, not Readyset.** Planning bodies stay
   about the repo and request; exploration-entry or `verified during planning` anchors go in a
   trailing `## Grounding` section. Workflow vocabulary outside that section is flagged
@@ -596,7 +599,8 @@ Picks a brainstorm, then depending on its status:
     `never` skips it and writes a stub; `auto` reviews only when at least one **trigger** fires:
     (1) **scope drift** — a post-Execute path outside the contract with no deviation entry;
     (2) **evidence conflict** — a checked `[x]` task whose latest `readyset_verify` record exited
-    non-zero; (3) **no evidence** — at least one task checked, but the change has *zero*
+    non-zero, or whose `_Verified:` note cites a record (`evidence E003` / `see E003`) that does not
+    exist, was recorded for another task, or failed; (3) **no evidence** — at least one task checked, but the change has *zero*
     `readyset_verify` records *and* no command-bearing `_Verified:` note (a note naming a runnable
     command, such as ``npm test``, also satisfies this); (4) **diff size** — more than
     `readyset.review.maxLines` (default 150) changed lines *or* more than

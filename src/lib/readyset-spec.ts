@@ -1524,6 +1524,29 @@ function noteNamesCommand(noteLine: string): boolean {
 	return /^(npm|pnpm|yarn|bun|node|npx|deno|go|cargo|make|python|python3|pytest|mvn|gradle|dotnet|ruby|php|curl|bash|sh|git|docker)\b/.test(firstToken);
 }
 
+/** For every checked task that carries a `_Verified:` note: the task's id (its leading token, the
+ *  same one `taskCheckedStates` reads) mapped to the note's text after the `_Verified:` prefix.
+ *  Used to cross-check evidence citations (`evidence E003`) against the records they name
+ *  (readyset-evidence.ts `findEvidenceConflicts`). */
+export async function taskVerificationNotes(cwd: string, changeId: string): Promise<Map<string, string>> {
+	const raw = await readFile(changePaths(cwd, changeId).tasks, "utf8").catch(() => undefined);
+	const notes = new Map<string, string>();
+	if (raw === undefined) return notes;
+	const lines = raw.split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		const m = TASK_LINE_RE.exec(lines[i]);
+		if (!m || !/[xX]/.test(m[1])) continue;
+		for (let j = i + 1; j < lines.length; j++) {
+			if (lines[j].trim() === "") continue;
+			if (/^\s*-\s*\[[ xX]\]/.test(lines[j])) break;
+			// The closing `_` of the italic note is markup, not text.
+			if (VERIFIED_NOTE_RE.test(lines[j])) notes.set(m[2], lines[j].replace(VERIFIED_NOTE_PREFIX_RE, "").replace(/_\s*$/, "").trim());
+			break;
+		}
+	}
+	return notes;
+}
+
 /** Reads REVIEW.md (the code-review phase's output), if it exists. */
 export async function readReview(cwd: string, changeId: string): Promise<string | undefined> {
 	const paths = changePaths(cwd, changeId);

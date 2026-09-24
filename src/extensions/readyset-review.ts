@@ -102,6 +102,7 @@ import {
 	checkTaskEvidence,
 	EVIDENCE_MAX_OUTPUT_BYTES,
 	EVIDENCE_TIMEOUT_MS,
+	describeEvidenceConflict,
 	findEvidenceConflicts,
 	persistEvidence,
 	runCommand,
@@ -475,6 +476,11 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 		"file — never strip, reword, reformat, or delete a stray comment or a hunk you did not write, and " +
 		"never delete or stage away an untracked file that was already there. Edit AROUND it." +
 		"\n\nKeep going until every task is complete or you are blocked, then report progress as N/M tasks." +
+		"\n\nPrefer verifying through the `readyset_verify` tool: give it the task id and the command, and it runs " +
+		"the command and stores the real exit code and output as an evidence record (E001, E002, ...). Cite that " +
+		"record in the task's note as `evidence E00N`, e.g. `_Verified: evidence E003 — \\`npm test\\`, 12/12 pass_`. " +
+		"A cited record is checked: one that does not exist, belongs to another task, or failed is flagged as a " +
+		"conflict, and readyset_done will not accept \"done\" while any conflict remains." +
 		"\n\nSignal the outcome with the `readyset_done` tool — it is how Readyset knows execution is over, " +
 		"instead of guessing from checkboxes. When every task is checked and has its `_Verified:` note, call " +
 		"`readyset_done` with status \"done\" and a one-line summary as your last action. If you cannot continue " +
@@ -2871,11 +2877,12 @@ async function buildReviewSections(ctx: ReviewCtx, chosen: BrainstormMeta, snaps
 						"_Verified: notes above -- their absence here doesn't mean verification wasn't done, only that " +
 						"it wasn't runtime-captured.)_";
 				}
-				const conflictTaskIds = new Set(snapshot.evidenceConflicts.map((c) => c.taskId));
+				const conflictsByTask = new Map<string, string[]>();
+				for (const c of snapshot.evidenceConflicts) conflictsByTask.set(c.taskId, [...(conflictsByTask.get(c.taskId) ?? []), describeEvidenceConflict(c)]);
 				const parts: string[] = [];
 				for (const [taskId, summary] of byTask) {
-					const flag = conflictTaskIds.has(taskId)
-						? " -- ⚠ CONFLICT: task is marked done, but the latest evidence below shows a non-zero/no exit code"
+					const flag = conflictsByTask.has(taskId)
+						? ` -- ⚠ CONFLICT: ${conflictsByTask.get(taskId)!.join("; ")}`
 						: "";
 					parts.push(`### Task ${taskId}${flag}`, "");
 					for (const rec of summary.records) {
@@ -3051,7 +3058,7 @@ function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: Revie
 				: `verification: ${snapshot.verification.withVerificationNote}/${snapshot.verification.checkedTasks} checked tasks verified`
 			: "verification: n/a",
 		snapshot.evidenceTotal > 0
-			? `runtime evidence: ${snapshot.evidenceTotal} record(s)${snapshot.evidenceConflicts.length > 0 ? ` -- ${snapshot.evidenceConflicts.length} conflict(s): task done but evidence shows failure` : ""}`
+			? `runtime evidence: ${snapshot.evidenceTotal} record(s)${snapshot.evidenceConflicts.length > 0 ? ` -- ${snapshot.evidenceConflicts.length} conflict(s): ${snapshot.evidenceConflicts.map(describeEvidenceConflict).join("; ")}` : ""}`
 			: "runtime evidence: none",
 		snapshot.reviewed ? "code review: done — see REVIEW.md" : "code review: not run yet",
 		snapshot.scope.noContract
@@ -3170,16 +3177,21 @@ async function buildReviewTriggerInput(
 		getProgress(cwd, changeId),
 		readPhaseEvents(cwd, changeId),
 	]);
-	// The Apply `end` event carries the run's diff stats. Take the LAST one with
-	// outcome "applied" so a send-back/re-apply cycle reports the final implementation.
-	const applyEnd = [...events].reverse().find((e) => e.phase === "apply" && e.edge === "end" && e.outcome === "applied" && e.diff !== undefined);
+	// The diff is measured live against the approve base, so an on-demand review sees the code as
+	// it is now (including fixes made after the handoff settled). The last `apply` `end` event's
+	// recorded diff is only the fallback for a tree git cannot measure. (This used to look only
+	// for outcome "applied", which the handed-off execution model never writes -- so the diff-size
+	// trigger of an on-demand review always saw an empty diff.)
+	const recordedDiff = [...events].reverse().find((e) => e.phase === "apply" && e.edge === "end" && e.diff !== undefined)?.diff;
+	const liveDiff = await applyDiffStats(cwd, changeId, changedPaths).catch(() => undefined);
+	const diff = liveDiff && liveDiff.files > 0 ? liveDiff : (recordedDiff ?? liveDiff ?? { files: 0, added: 0, deleted: 0 });
 	return {
 		unjustifiedDriftPaths,
 		evidenceConflicts: conflicts,
 		evidenceTotal: evidence.totalRecords,
 		verification,
 		checkedTasks: progress?.done ?? 0,
-		diff: applyEnd?.diff ?? { files: 0, added: 0, deleted: 0 },
+		diff,
 		changedPaths,
 		clarity,
 		openDecisions,
@@ -4020,9 +4032,11 @@ interface ReadysetVerifyParams {
  * latest evidence shows failure) is surfaced. v1 keeps that passive/observational only (a line
  * in the review panel), not a blocking gate — see the package README/doc comments for why.
  *
- * `applyTurnPrompt` is deliberately NOT changed to mention or encourage this tool in v1 — the
- * point of this iteration is to observe whether the model reaches for it naturally once it
- * exists, not to force it via prompt instruction.
+ * `applyTurnPrompt` recommends this tool and asks the model to cite the record it returns as
+ * `evidence E00N` in the task's `_Verified:` note (0.18; v1 deliberately left it unmentioned to
+ * observe whether the model reached for it unprompted -- it mostly did not). A citation is a
+ * checkable claim: `findEvidenceConflicts` flags one that names a missing record, another task's
+ * record, or a failed run, and readyset_done refuses "done" while any conflict remains.
  */
 function registerVerifyTool(pi: ExtensionAPI): void {
 	pi.registerTool({
@@ -4182,6 +4196,13 @@ function registerDoneTool(pi: ExtensionAPI): void {
 				return reply(
 					`Not recorded: ${verification.missing} checked task(s) in tasks.md have no _Verified: note. Add one under each ` +
 						"(what you ran or checked, and the actual result), then call readyset_done again.",
+				);
+			}
+			const conflicts = await findEvidenceConflicts(cwd, handoff.changeId).catch(() => []);
+			if (conflicts.length > 0) {
+				return reply(
+					`Not recorded: the notes disagree with the runtime evidence — ${conflicts.map(describeEvidenceConflict).join("; ")}. ` +
+						"Fix the task (and re-run readyset_verify) or correct the citation, then call readyset_done again.",
 				);
 			}
 			pendingHandoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at } };

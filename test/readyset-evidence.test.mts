@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   checkTaskEvidence,
   EVIDENCE_MAX_OUTPUT_BYTES,
+  describeEvidenceConflict,
   findEvidenceConflicts,
   persistEvidence,
   readAllEvidence,
@@ -324,6 +325,40 @@ await test("findEvidenceConflicts: task NOT marked done with failing evidence ->
   });
   const conflicts = await findEvidenceConflicts(cwd, "evid-not-done-yet");
   assert.deepEqual(conflicts, []);
+});
+
+await test("findEvidenceConflicts: a _Verified: citation must name an existing, passing record of the same task", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "evid-cite");
+  const rec = (taskId: string, exitCode: number) => persistEvidence(cwd, "evid-cite", {
+    taskId, command: "npm test", cwd, startedAt: new Date().toISOString(), durationMs: 1, exitCode,
+    timedOut: false, signal: null, stdout: "", stderr: "", stdoutTruncated: false, stderrTruncated: false,
+  });
+  await rec("1.1", 0); // E001 passes for 1.1
+  await rec("1.2", 1); // E002 fails for 1.2 -- but 1.2's LATEST is E004 (passing), so no latest-failed
+  await rec("1.3", 0); // E003 passes for 1.3
+  await rec("1.2", 0); // E004 passes for 1.2
+  await writeFile(
+    paths.tasks,
+    [
+      "- [x] 1.1 ok",
+      "  _Verified: evidence E001 — `npm test`, pass_",
+      "- [x] 1.2 cites its own failed run",
+      "  - _Verified: see E002_",
+      "- [x] 1.4 cites another task's record",
+      "  _Verified: evidence E003_",
+      "- [x] 1.5 cites a record that doesn't exist",
+      "  _Verified: evidence E099_",
+      "- [x] 1.6 quotes an error code, not a citation",
+      "  _Verified: curl got E500 before the fix, 200 after_",
+    ].join("\n"),
+    "utf8",
+  );
+  const conflicts = await findEvidenceConflicts(cwd, "evid-cite");
+  const byKind = Object.fromEntries(conflicts.map((c) => [c.kind, `${c.taskId}:${c.evidenceId}`]));
+  assert.deepEqual(byKind, { "cited-failed": "1.2:E002", "cited-other-task": "1.4:E003", "cited-missing": "1.5:E099" });
+  assert.equal(conflicts.length, 3, "a quoted error code (E500) is not a citation, and a valid one (E001) is not a conflict");
+  assert.match(describeEvidenceConflict(conflicts.find((c) => c.kind === "cited-missing")!), /task 1\.5 cites evidence E099, which does not exist/);
 });
 
 // --- backward compatibility ---

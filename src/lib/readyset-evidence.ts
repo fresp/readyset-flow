@@ -34,7 +34,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseFrontmatter, setFrontmatterFields } from "./readyset-brainstorm.ts";
-import { changePaths, taskCheckedStates } from "./readyset-spec.ts";
+import { changePaths, taskCheckedStates, taskVerificationNotes } from "./readyset-spec.ts";
 
 /**
  * 300 seconds — matches `TOOL_TIMEOUTS.bash`'s own `default` in real omp source
@@ -317,7 +317,18 @@ export interface EvidenceConflict {
 	taskId: string;
 	evidenceId: string;
 	exitCode: number | null;
+	/** Which claim disagrees with which evidence:
+	 *  - `latest-failed`: the task is checked, but its most recent record failed.
+	 *  - `cited-missing`: the task's `_Verified:` note cites a record that does not exist.
+	 *  - `cited-other-task`: the cited record was captured for a different task.
+	 *  - `cited-failed`: the cited record failed (non-zero exit, no exit code, or timed out). */
+	kind: "latest-failed" | "cited-missing" | "cited-other-task" | "cited-failed";
 }
+
+/** An evidence citation inside a `_Verified:` note: `evidence E003` or `see E003`. Deliberately
+ *  anchored to those words rather than any bare `E\d+` token, so a note quoting an error code
+ *  ("got E500") is never mistaken for a citation. The apply prompt asks for `evidence E00N`. */
+const EVIDENCE_CITATION_RE = /\b(?:evidence|see)\s+(E\d{3,})(?![0-9A-Za-z])/gi;
 
 /**
  * The one and only judgment this file makes, and it's a purely mechanical one: a task marked
@@ -328,14 +339,55 @@ export interface EvidenceConflict {
  * `readyset-review.ts`), never silently reconciled with `_Verified:` or auto-corrected.
  */
 export async function findEvidenceConflicts(cwd: string, changeId: string): Promise<EvidenceConflict[]> {
-	const { byTask } = await checkTaskEvidence(cwd, changeId);
-	if (byTask.size === 0) return [];
-	const checkedStates = await taskCheckedStates(cwd, changeId);
+	const all = await readAllEvidence(cwd, changeId);
 	const conflicts: EvidenceConflict[] = [];
-	for (const [taskId, summary] of byTask) {
-		if (checkedStates.get(taskId) === true && summary.latest.exitCode !== 0) {
-			conflicts.push({ taskId, evidenceId: summary.latest.id, exitCode: summary.latest.exitCode });
+	if (all.length > 0) {
+		const { byTask } = await checkTaskEvidence(cwd, changeId);
+		const checkedStates = await taskCheckedStates(cwd, changeId);
+		for (const [taskId, summary] of byTask) {
+			if (checkedStates.get(taskId) === true && summary.latest.exitCode !== 0) {
+				conflicts.push({ taskId, evidenceId: summary.latest.id, exitCode: summary.latest.exitCode, kind: "latest-failed" });
+			}
+		}
+	}
+	// Citations: a `_Verified:` note that names a record is a claim about that record, so it is
+	// checked the same mechanical way -- the record must exist, belong to this task, and have
+	// passed. A fabricated or mis-attributed citation is worse than no citation at all.
+	const notes = await taskVerificationNotes(cwd, changeId);
+	if (notes.size === 0) return conflicts;
+	const byId = new Map(all.map((r) => [r.id, r]));
+	const seen = new Set(conflicts.map((c) => `${c.taskId}:${c.evidenceId}`));
+	for (const [taskId, note] of notes) {
+		for (const match of note.matchAll(EVIDENCE_CITATION_RE)) {
+			const evidenceId = match[1].toUpperCase();
+			const key = `${taskId}:${evidenceId}`;
+			if (seen.has(key)) continue;
+			const rec = byId.get(evidenceId);
+			const kind: EvidenceConflict["kind"] | undefined = !rec
+				? "cited-missing"
+				: rec.taskId !== taskId
+					? "cited-other-task"
+					: rec.exitCode !== 0 || rec.timedOut
+						? "cited-failed"
+						: undefined;
+			if (!kind) continue;
+			seen.add(key);
+			conflicts.push({ taskId, evidenceId, exitCode: rec?.exitCode ?? null, kind });
 		}
 	}
 	return conflicts;
+}
+
+/** One human-readable line per conflict, shared by the gate panel and readyset_done's refusal. */
+export function describeEvidenceConflict(c: EvidenceConflict): string {
+	switch (c.kind) {
+		case "latest-failed":
+			return `task ${c.taskId} is checked, but its latest evidence ${c.evidenceId} exited ${c.exitCode ?? "without an exit code"}`;
+		case "cited-missing":
+			return `task ${c.taskId} cites evidence ${c.evidenceId}, which does not exist`;
+		case "cited-other-task":
+			return `task ${c.taskId} cites evidence ${c.evidenceId}, which was recorded for a different task`;
+		case "cited-failed":
+			return `task ${c.taskId} cites evidence ${c.evidenceId}, which exited ${c.exitCode ?? "without an exit code"}`;
+	}
 }

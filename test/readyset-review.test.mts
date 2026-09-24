@@ -1927,6 +1927,59 @@ await test("readyset_done: 'blocked' is an explicit pause -- never counted towar
   assert.equal(applyEnd?.handoff?.blocks, 3);
 });
 
+await test("readyset_done: refuses 'done' while a _Verified: note cites evidence that doesn't back it", async () => {
+  const { cwd, dir, ui, sessionId, signal } = await armDoneHandoff("done-cite", "2026-07-26");
+  const toolCtx = eventCtx(cwd, ui.ui, sessionId);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: evidence E007 — npm test, pass_\n", "utf8");
+  const refused = await signal({ status: "done" }, toolCtx);
+  assert.match(refused, /Not recorded: the notes disagree with the runtime evidence/);
+  assert.match(refused, /task 1\.1 cites evidence E007, which does not exist/);
+
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: ran `npm test`, pass_\n", "utf8");
+  assert.match(await signal({ status: "done" }, toolCtx), /Recorded as done/);
+});
+
+await test("apply prompt recommends readyset_verify and the `evidence E00N` citation form", async () => {
+  const mod = await loadMod();
+  const apply = mod.applyTurnPrompt("x");
+  assert.match(apply, /readyset_verify/);
+  assert.match(apply, /evidence E00N/);
+  assert.match(apply, /readyset_done will not accept "done" while any conflict remains/);
+});
+
+await test("on-demand review measures the diff live -- the diff-size trigger no longer sees an empty diff", async () => {
+  const cwd = await freshRepo();
+  execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
+  execFileSync("git", ["config", "user.name", "t"], { cwd });
+  await clearConfig();
+  await writeBrainstorm(cwd, "2026-07-27-diffsize.md", { title: "Diff Size", status: "proposed", created: "2026-07-27", change_id: "diffsize" });
+  const dir = await writeProposedChange(cwd, "diffsize", ["- src/big.ts (new)"]);
+  execFileSync("git", ["add", "-A"], { cwd });
+  execFileSync("git", ["commit", "-qm", "base"], { cwd });
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  const ctx = { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle };
+  ui.selectQueue.push("2026-07-27 · Diff Size");
+  ui.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  // The execution writes 200 lines (default maxLines is 150).
+  await mkdir(join(cwd, "src"), { recursive: true });
+  await writeFile(join(cwd, "src", "big.ts"), Array.from({ length: 200 }, (_, i) => `export const v${i} = ${i};`).join("\n") + "\n", "utf8");
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 x\n  _Verified: ran `npm test`, all pass_\n", "utf8");
+
+  ui.selectQueue.push("Not yet");
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nfine\n\n## Blocking\n\nnone\n", "utf8");
+  });
+  await handler("--review diffsize", ctx);
+  const reviewEnd = (await readPhaseEvents(cwd, "diffsize")).find((e) => e.phase === "review" && e.edge === "end");
+  assert.ok(reviewEnd?.review?.triggersFired.includes("diff-size"), "diff-size fired: " + JSON.stringify(reviewEnd?.review));
+});
+
 await test("readyset_done: a subagent session, or no armed handoff, cannot signal", async () => {
   const { cwd, ui, signal } = await armDoneHandoff("done-sub", "2026-07-25");
   assert.match(await signal({ status: "done" }, eventCtx(cwd, ui.ui, "a-subagent")), /Only the session that approved/);
