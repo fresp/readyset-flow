@@ -364,7 +364,7 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   `session_stop` verification budget (below). Host builds without `sessionManager` fall back to
   matching on the working directory.
 - **The approve-base commit is captured too.** `git rev-parse HEAD` at approve time is recorded in
-  `CONTEXT.md` alongside the handoff. Scope, review triggers and the diff stats on the balancing
+  the change's `state.json` alongside the handoff. Scope, review triggers and the diff stats on the balancing
   `apply` `end` event are all measured against that commit — the current dirty worktree UNIONED
   with whatever has been committed since (`git diff --name-only <base>..HEAD`) — so a commit the
   handed-off execution makes mid-run (leaving the tree clean again) is never invisible.
@@ -716,18 +716,19 @@ specs/**/spec.md ADDED/MODIFIED/REMOVED Requirements as WHEN/THEN scenarios
 tasks.md         checkbox tasks; each `- [x]` carries an indented `_Verified:` note
 evidence/E*.md   optional runtime-evidence records from `readyset_verify` — one per call,
                  numbered E001, E002, ...; never auto-created, never mutated once written
-CONTEXT.md       append-only audit trail — one entry per phase transition, written by the
-                 extension itself (not the model), so it can't be skipped or misremembered.
-                 As well as the human-readable phase entries, it carries a machine-parseable
-                 phase-event log — one `<!-- readyset-phase -->` marker followed by a one-line
-                 `json` fence per phase boundary, recording the phase, `start`/`end` edge, an ISO
-                 timestamp, the effective lane (`fast`/`full`) and its source (`flag`/`brainstorm`),
-                 and where relevant the phase model and an outcome. readyset-bench's compile step
-                 reads these to split runs by lane and attribute tokens/wall time to phases.
-                 A `propose`/`trim` event also carries per-artifact character counts, so the bench
-                 can report planning size by lane. Also carries the once-written pre-existing-dirty
-                 baseline the gate invariant and scope check subtract (see "What it deliberately
-                 does not do")
+CONTEXT.md       append-only, human-readable audit trail — one entry per phase transition,
+                 written by the extension itself (not the model), so it can't be skipped or
+                 misremembered. Machine state no longer lives here (0.18+); changes from earlier
+                 versions keep their fenced-JSON markers, and every reader still falls back to them
+events.jsonl     the machine-parseable phase-event log, one JSON object per line, append-only:
+                 the phase, `start`/`end` edge, an ISO timestamp, the effective lane (`fast`/`full`)
+                 and its source, and where relevant the phase model and an outcome (plus diff,
+                 handoff and review-policy data on the `apply` `end` event, per-artifact character
+                 counts on `propose`/`trim`). readyset-bench reads these to split runs by lane and
+                 attribute tokens/wall time to phases
+state.json       write-once facts about the change: the pre-existing-dirty baseline the gate
+                 invariant and scope check subtract (see "What it deliberately does not do"), and
+                 the approve-base commit
 REVIEW.md        code-review phase findings, written after implementation, before archive
 handoff.json     transient: exists only while an approved change's handed-off execution is
                  unsettled (session id, approve time, last pause fingerprint, review policy).

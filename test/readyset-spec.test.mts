@@ -1066,15 +1066,58 @@ await test("checkPhaseViolations through a baseline: pre-existing dirt is not a 
   assert.equal(violations[0].path, "src/ledger.mjs");
 });
 
-await test("baseline entry survives inside CONTEXT.md without breaking context reads", async () => {
+await test("the baseline lives in state.json and leaves CONTEXT.md human-readable", async () => {
   const cwd = await freshCwd();
-  await scaffoldChange(cwd, "ctxbase");
+  const paths = await scaffoldChange(cwd, "ctxbase");
   await appendContext(cwd, "ctxbase", "Explore", "did some exploration");
   await ensureDirtyBaseline(cwd, "ctxbase", ["a.txt"]);
   const raw = await readContext(cwd, "ctxbase");
-  assert.ok(raw?.includes("## Explore —"), "phase entries must survive the baseline append");
-  assert.ok(raw?.includes("<!-- readyset-baseline-dirty -->"), "baseline marker must be present");
+  assert.ok(raw?.includes("## Explore —"), "phase entries are untouched");
+  assert.ok(!raw?.includes("<!-- readyset-baseline-dirty -->"), "no machine marker in CONTEXT.md any more");
+  const state = JSON.parse(await readFile(join(paths.dir, "state.json"), "utf8"));
+  assert.deepEqual(state.dirtyBaseline.paths, ["a.txt"]);
   assert.deepEqual([...(await readDirtyBaseline(cwd, "ctxbase"))], ["a.txt"]);
+  assert.equal(await hasDirtyBaseline(cwd, "ctxbase"), true);
+});
+
+await test("legacy (pre-0.18) CONTEXT.md markers are still read: baseline, approve base, phase events", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "legacy");
+  const legacyEvent = { phase: "gate", edge: "start", at: "2026-01-01T00:00:00.000Z", lane: "full", laneSource: "brainstorm" };
+  await writeFile(
+    paths.context,
+    [
+      "# Context log",
+      "",
+      "<!-- readyset-baseline-dirty -->",
+      "```json",
+      JSON.stringify({ paths: ["wip.txt"], capturedAt: "2026-01-01T00:00:00.000Z" }),
+      "```",
+      "",
+      "<!-- readyset-approve-base -->",
+      "```json",
+      JSON.stringify({ sha: "abc123", capturedAt: "2026-01-01T00:00:00.000Z" }),
+      "```",
+      "",
+      "<!-- readyset-phase -->",
+      "```json",
+      JSON.stringify(legacyEvent),
+      "```",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "legacy"))], ["wip.txt"]);
+  assert.equal(await readApproveBase(cwd, "legacy"), "abc123");
+  // A capture on a legacy change never overwrites the legacy value (first capture wins).
+  await ensureDirtyBaseline(cwd, "legacy", ["other.txt"]);
+  await writeApproveBase(cwd, "legacy", "def456");
+  assert.deepEqual([...(await readDirtyBaseline(cwd, "legacy"))], ["wip.txt"]);
+  assert.equal(await readApproveBase(cwd, "legacy"), "abc123");
+  // New events append to events.jsonl and read back after the legacy ones.
+  const next: PhaseEvent = { phase: "gate", edge: "end", at: "2026-01-01T00:01:00.000Z", lane: "full", laneSource: "brainstorm", outcome: "approve" };
+  await appendPhaseEvent(cwd, "legacy", next);
+  assert.deepEqual(await readPhaseEvents(cwd, "legacy"), [legacyEvent, next]);
 });
 
 await test("baseline survives later CONTEXT.md content containing braces (e.g. Refine feedback)", async () => {
@@ -1183,7 +1226,17 @@ await test("phase events coexist with the baseline and human-readable entries", 
   assert.deepEqual(await readPhaseEvents(cwd, "mix"), [event]);
   const raw = await readContext(cwd, "mix");
   assert.ok(raw?.includes("## Explore —"), "human entry must survive");
-  assert.ok(raw?.includes(PHASE_MARKER), "phase marker must be present");
+  assert.ok(!raw?.includes(PHASE_MARKER), "phase events no longer land in CONTEXT.md");
+  const jsonl = await readFile(join(changePaths(cwd, "mix").dir, "events.jsonl"), "utf8");
+  assert.deepEqual(jsonl.trim().split("\n").map((l) => JSON.parse(l)), [event]);
+});
+
+await test("events.jsonl: a torn or malformed line is skipped, the rest still read", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "torn");
+  const ok: PhaseEvent = { phase: "explore", edge: "start", at: "2026-01-01T00:00:00.000Z", lane: "full", laneSource: "brainstorm" };
+  await writeFile(join(paths.dir, "events.jsonl"), `${JSON.stringify(ok)}\n{"phase":"explore","edge":\nnot json\n{"phase":1}\n`, "utf8");
+  assert.deepEqual(await readPhaseEvents(cwd, "torn"), [ok]);
 });
 
 await test("phase parse is fence-scoped: braces in a Refine entry don't corrupt later events", async () => {

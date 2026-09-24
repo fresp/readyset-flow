@@ -17,7 +17,7 @@
  */
 
 import type { Dirent } from "node:fs";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
 import { parseFrontmatter } from "./readyset-brainstorm.ts";
@@ -198,6 +198,51 @@ export async function readContext(cwd: string, changeId: string): Promise<string
 	return readFile(paths.context, "utf8").catch(() => undefined);
 }
 
+/** Machine-readable per-change state, kept out of the human-readable CONTEXT.md (0.18+):
+ *  - `state.json`: write-once facts about the change (the pre-existing dirty baseline, the approve
+ *    base commit), rewritten whole on each capture;
+ *  - `events.jsonl`: the phase-event log, one JSON object per line, append-only.
+ *  Both ride along when the change directory is archived. Changes from earlier versions keep their
+ *  fenced-JSON markers inside CONTEXT.md; every reader below still falls back to those, so an
+ *  in-flight change survives the upgrade. */
+export const STATE_FILE = "state.json";
+export const EVENTS_FILE = "events.jsonl";
+
+interface ChangeMachineState {
+	dirtyBaseline?: DirtyBaseline;
+	approveBase?: ApproveBaseEntry;
+}
+
+async function readMachineState(cwd: string, changeId: string): Promise<ChangeMachineState> {
+	const raw = await readFile(join(changePaths(cwd, changeId).dir, STATE_FILE), "utf8").catch(() => undefined);
+	if (raw === undefined) return {};
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const out: ChangeMachineState = {};
+		const b = (parsed as { dirtyBaseline?: unknown }).dirtyBaseline as Partial<DirtyBaseline> | undefined;
+		if (b && Array.isArray(b.paths) && b.paths.every((x) => typeof x === "string") && typeof b.capturedAt === "string") {
+			out.dirtyBaseline = { paths: b.paths, capturedAt: b.capturedAt };
+		}
+		const a = (parsed as { approveBase?: unknown }).approveBase as Partial<ApproveBaseEntry> | undefined;
+		if (a && typeof a.sha === "string" && a.sha !== "" && typeof a.capturedAt === "string") {
+			out.approveBase = { sha: a.sha, capturedAt: a.capturedAt };
+		}
+		return out;
+	} catch {
+		return {};
+	}
+}
+
+async function writeMachineState(cwd: string, changeId: string, next: ChangeMachineState): Promise<void> {
+	await writeFile(join(changePaths(cwd, changeId).dir, STATE_FILE), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+}
+
+/** The legacy (pre-0.18) CONTEXT.md text, for the marker fallbacks below; "" when absent. */
+async function legacyContext(cwd: string, changeId: string): Promise<string> {
+	return (await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined)) ?? "";
+}
+
 /**
  * The set of repo-relative paths that were already dirty *before* this change's own planning
  * turns ever ran, so later `git status` reads can subtract them. Without this, any file that
@@ -205,10 +250,8 @@ export async function readContext(cwd: string, changeId: string): Promise<string
  * misattributed to the current change — hard-stopping a well-behaved run at the gate
  * invariant, or painting a false OUT-OF-SCOPE warning on every gate render.
  *
- * Stored as a marker entry inside CONTEXT.md rather than a separate dotfile: CONTEXT.md
- * already has a deterministic append path (this file's own appendContext), it rides along
- * automatically when the change is archived, and no new file can leak into the change dir
- * as something validateChange or findSpecFiles might trip over.
+ * Stored in the change's `state.json` (see STATE_FILE); read from a CONTEXT.md marker entry for
+ * changes captured before 0.18.
  */
 export interface DirtyBaseline {
 	/** Repo-relative paths that were dirty when the baseline was captured. */
@@ -217,7 +260,7 @@ export interface DirtyBaseline {
 	capturedAt: string;
 }
 
-/** Marker line that opens the baseline entry inside CONTEXT.md. */
+/** Marker line that opens the (legacy, pre-0.18) baseline entry inside CONTEXT.md. */
 export const BASELINE_MARKER = "<!-- readyset-baseline-dirty -->";
 
 /** Opening fence the writer uses for the baseline JSON, and the closing fence it pairs with. */
@@ -264,17 +307,11 @@ function parseBaselineEntry(raw: string): DirtyBaseline | undefined {
  * first capture wins and every later call is a no-op. Returns the stored baseline.
  */
 export async function ensureDirtyBaseline(cwd: string, changeId: string, currentDirty: string[]): Promise<DirtyBaseline> {
-	const paths = changePaths(cwd, changeId);
-	const existing = await readFile(paths.context, "utf8").catch(() => undefined);
-	if (existing !== undefined) {
-		const parsed = parseBaselineEntry(existing);
-		if (parsed !== undefined) return parsed;
-	}
+	const machine = await readMachineState(cwd, changeId);
+	const existing = machine.dirtyBaseline ?? parseBaselineEntry(await legacyContext(cwd, changeId));
+	if (existing !== undefined) return existing;
 	const baseline: DirtyBaseline = { paths: [...currentDirty].sort(), capturedAt: new Date().toISOString() };
-	const entry = `\n\n${BASELINE_MARKER}\n\`\`\`json\n${JSON.stringify(baseline)}\n\`\`\`\n`;
-	const next =
-		existing === undefined ? `# Context log\n${entry}` : `${existing.trimEnd()}\n${entry}`;
-	await writeFile(paths.context, next, "utf8");
+	await writeMachineState(cwd, changeId, { ...machine, dirtyBaseline: baseline });
 	return baseline;
 }
 
@@ -284,10 +321,8 @@ export async function ensureDirtyBaseline(cwd: string, changeId: string, current
  * unbaselined behavior rather than crashing.
  */
 export async function readDirtyBaseline(cwd: string, changeId: string): Promise<Set<string>> {
-	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
-	if (raw === undefined) return new Set();
-	const parsed = parseBaselineEntry(raw);
-	return new Set(parsed?.paths ?? []);
+	const baseline = (await readMachineState(cwd, changeId)).dirtyBaseline ?? parseBaselineEntry(await legacyContext(cwd, changeId));
+	return new Set(baseline?.paths ?? []);
 }
 
 /** True when this change actually has a captured dirty baseline. Distinguishes "the baseline was
@@ -295,12 +330,12 @@ export async function readDirtyBaseline(cwd: string, changeId: string): Promise<
  *  must not be read as "nothing was dirty before the run", or every pre-existing dirty file
  *  becomes a revert candidate. */
 export async function hasDirtyBaseline(cwd: string, changeId: string): Promise<boolean> {
-	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
-	if (raw === undefined) return false;
-	return parseBaselineEntry(raw) !== undefined;
+	if ((await readMachineState(cwd, changeId)).dirtyBaseline !== undefined) return true;
+	return parseBaselineEntry(await legacyContext(cwd, changeId)) !== undefined;
 }
 
-/** Marker line that opens the approve-base entry inside CONTEXT.md — `git rev-parse HEAD` at the
+/** Marker line that opens the legacy (pre-0.18) approve-base entry inside CONTEXT.md; now kept in
+ *  state.json. Originally: — `git rev-parse HEAD` at the
  *  moment the change was approved and execution was handed off. Recorded so later diffing (scope,
  *  review triggers, the Apply `end` event's diff stats) can measure against the commit the run
  *  actually started from, not just the working tree — commits made during a long-running handoff
@@ -341,20 +376,15 @@ function parseApproveBaseEntry(raw: string): ApproveBaseEntry | undefined {
  *  base to diff against, and callers fall back to their pre-base-tracking behavior. */
 export async function writeApproveBase(cwd: string, changeId: string, sha: string | undefined): Promise<void> {
 	if (!sha) return;
-	const paths = changePaths(cwd, changeId);
-	const existing = await readFile(paths.context, "utf8").catch(() => undefined);
-	if (existing !== undefined && parseApproveBaseEntry(existing) !== undefined) return;
-	const entry = `\n\n${APPROVE_BASE_MARKER}\n\`\`\`json\n${JSON.stringify({ sha, capturedAt: new Date().toISOString() })}\n\`\`\`\n`;
-	const next = existing === undefined ? `# Context log${entry}` : `${existing.trimEnd()}\n${entry}`;
-	await writeFile(paths.context, next, "utf8");
+	const machine = await readMachineState(cwd, changeId);
+	if (machine.approveBase !== undefined || parseApproveBaseEntry(await legacyContext(cwd, changeId)) !== undefined) return;
+	await writeMachineState(cwd, changeId, { ...machine, approveBase: { sha, capturedAt: new Date().toISOString() } });
 }
 
 /** Reads this change's approve-base commit sha, or `undefined` when none was ever recorded (a
  *  change that predates this mechanism, or one whose approve base failed to write). */
 export async function readApproveBase(cwd: string, changeId: string): Promise<string | undefined> {
-	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
-	if (raw === undefined) return undefined;
-	return parseApproveBaseEntry(raw)?.sha;
+	return (await readMachineState(cwd, changeId)).approveBase?.sha ?? parseApproveBaseEntry(await legacyContext(cwd, changeId))?.sha;
 }
 
 /** File, inside a change directory, holding a handed-off execution that has not settled yet.
@@ -487,21 +517,25 @@ export interface PhaseEvent {
 	outsideRepoTmp?: number;
 }
 
-/** Marker line that opens one phase-event entry inside CONTEXT.md. */
+/** Marker line that opens one (legacy, pre-0.18) phase-event entry inside CONTEXT.md. */
 export const PHASE_MARKER = "<!-- readyset-phase -->";
 
 /**
- * Appends one phase boundary event to this change's CONTEXT.md as its own marker entry, using the
- * same append path appendContext uses. Every entry is `PHASE_MARKER` followed by a one-line ```json
- * fence, so a reader can find each event's own fence without scanning the whole file (CONTEXT.md is
- * append-only and may later contain braces in raw user text — see parseBaselineEntry's doc comment).
+ * Appends one phase boundary event to this change's `events.jsonl` (EVENTS_FILE) — one JSON
+ * object per line, append-only, so a concurrent reader never sees a half-rewritten file and the
+ * human-readable CONTEXT.md no longer carries machine JSON.
  */
 export async function appendPhaseEvent(cwd: string, changeId: string, event: PhaseEvent): Promise<void> {
-	const paths = changePaths(cwd, changeId);
-	const entry = `\n\n${PHASE_MARKER}\n\`\`\`json\n${JSON.stringify(event)}\n\`\`\`\n`;
-	const existing = await readFile(paths.context, "utf8").catch(() => undefined);
-	const next = existing === undefined ? `# Context log${entry}` : `${existing.trimEnd()}\n${entry}`;
-	await writeFile(paths.context, next, "utf8");
+	await appendFile(join(changePaths(cwd, changeId).dir, EVENTS_FILE), `${JSON.stringify(event)}\n`, "utf8");
+}
+
+/** The one shape check every event source goes through. */
+function asPhaseEvent(parsed: unknown): PhaseEvent | undefined {
+	if (parsed === null || typeof parsed !== "object") return undefined;
+	const e = parsed as Partial<PhaseEvent>;
+	if (typeof e.phase !== "string" || (e.edge !== "start" && e.edge !== "end")) return undefined;
+	if (typeof e.at !== "string" || typeof e.lane !== "string") return undefined;
+	return e as PhaseEvent;
 }
 
 /**
@@ -522,31 +556,37 @@ function parsePhaseEntry(raw: string, from: number): { event?: PhaseEvent; next:
 	const body = raw.slice(bodyStart, fenceEnd).trim();
 	const next = fenceEnd + 3;
 	try {
-		const parsed: unknown = JSON.parse(body);
-		if (parsed === null || typeof parsed !== "object") return { next };
-		const e = parsed as Partial<PhaseEvent>;
-		if (typeof e.phase !== "string" || (e.edge !== "start" && e.edge !== "end")) return { next };
-		if (typeof e.at !== "string" || typeof e.lane !== "string") return { next };
-		return { event: e as PhaseEvent, next };
+		return { event: asPhaseEvent(JSON.parse(body)), next };
 	} catch {
 		return { next };
 	}
 }
 
 /**
- * Reads this change's phase-event log in file order. Returns an empty array when there is none or
- * CONTEXT.md is unreadable. Malformed entries are skipped, never thrown.
+ * Reads this change's phase-event log: legacy CONTEXT.md markers (pre-0.18) first, then
+ * events.jsonl, each in file order. Returns an empty array when there is neither. Malformed
+ * entries are skipped, never thrown.
  */
 export async function readPhaseEvents(cwd: string, changeId: string): Promise<PhaseEvent[]> {
-	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
-	if (raw === undefined) return [];
 	const events: PhaseEvent[] = [];
+	// Legacy markers first: a change that straddles the upgrade logged its earlier events there.
+	const raw = await legacyContext(cwd, changeId);
 	let cursor = 0;
 	for (;;) {
 		const found = parsePhaseEntry(raw, cursor);
 		if (!found) break;
 		if (found.event) events.push(found.event);
 		cursor = found.next;
+	}
+	const jsonl = await readFile(join(changePaths(cwd, changeId).dir, EVENTS_FILE), "utf8").catch(() => "");
+	for (const line of jsonl.split("\n")) {
+		if (line.trim() === "") continue;
+		try {
+			const event = asPhaseEvent(JSON.parse(line));
+			if (event) events.push(event);
+		} catch {
+			/* a torn or malformed line is skipped, never thrown */
+		}
 	}
 	return events;
 }
