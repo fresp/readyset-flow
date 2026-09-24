@@ -1,5 +1,13 @@
 # Benchmark: /plan vs /readyset (0.15.0)
 
+> **⚠ Not a verified claim about the current version.** Everything below is labelled "0.15.0", but
+> the numbers themselves match an earlier v0.12 run — they were never actually regenerated for
+> 0.15.0. They also measure a code path (an internal apply/reconciliation loop, and an
+> unconditional post-Apply review turn) that 0.16's handoff-based execution model removed
+> entirely, so even taken at face value they no longer describe how the current version behaves.
+> Treat this document as historical methodology and a template for a clean rerun, not as a current
+> performance claim — a fresh benchmark run against the present version is still pending.
+
 An empirical, end-to-end evaluation comparing native `omp` **`/plan`** against **`/readyset` (0.15.0)** across 12 realistic software engineering tasks on three distinct Node repositories.
 
 ---
