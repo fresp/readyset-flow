@@ -298,6 +298,12 @@ Covers `grill|explore|propose|apply|review`; **Refine rides the propose override
 re-proposes. An override that fails to resolve or pin warns and falls back to the run model — a
 phase model is a cost optimization, never a reason to stop the run.
 
+**Grill** is a chat turn rather than a fired-and-awaited one, so its model is pinned right before
+the grill turn fires (grill override, else the run pin) and restored as soon as the brainstorm is
+written — before Explore starts — or on the next `/readyset` command if grilling is abandoned.
+The `grill` phase event records the model grilling actually ran on, and records none when
+grilling ran on the session model or happened in an earlier run.
+
 The **apply** override does one thing the others don't: it decides the model the *handed-off
 execution* runs on. On Approve & Execute the execution model is, in order:
 

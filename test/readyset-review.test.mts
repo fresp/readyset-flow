@@ -679,6 +679,82 @@ await test("agent_end: the matching session id triggers the grill->propose trans
   assert.ok(fakeUiWrap.selectPrompts.some((p) => /^Review change "idea"/.test(p)), "the matching session drives the transition");
 });
 
+await test("grill model: --phase-model grill= pins the grill turn, restores before Explore, and the grill event records it", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+  fakeUiWrap.selectQueue.push("Discard");
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir);
+
+  const ctx = {
+    cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle,
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+  };
+  await handler("--phase-model grill=small/fast --idea Add a health endpoint", ctx);
+  assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:small/fast"], "the grill pin is applied before the grill turn fires");
+  assert.equal(fakePiWrap.calls.length, 1, "the grill turn fired");
+  assert.ok(fakeUiWrap.notifications.some((n) => /Grilling runs on "small\/fast" \(from --phase-model flag\)/.test(n.message)));
+
+  await fakePiWrap.waitForIdle(); // the grill turn writes the brainstorm
+  await agentEnd({ willContinue: false }, { cwd, ui: fakeUiWrap.ui, isIdle: () => false, hasPendingMessages: () => false });
+
+  assert.equal(fakePiWrap.setModelCalls[1], "session-default-model", "the pre-grill model is restored once the brainstorm is written");
+  assert.equal(fakePiWrap.calls.length, 3, "grill + explore + propose all fired");
+  const grillEnd = (await readPhaseEvents(cwd, "idea")).find((e) => e.phase === "grill" && e.edge === "end");
+  assert.equal(grillEnd?.model, "small/fast", "the grill event records the model grilling actually ran on");
+});
+
+await test("grill model: nothing configured -> no setModel call, and the grill event records no model (never a guess)", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+  fakeUiWrap.selectQueue.push("Discard");
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir);
+
+  const ctx = {
+    cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle,
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+  };
+  // An explore-only override must not leak onto the grill turn.
+  await handler("--phase-model explore=small/fast --idea Add a health endpoint", ctx);
+  assert.deepEqual(fakePiWrap.setModelCalls, [], "no grill pin without a grill override or a run pin");
+  await fakePiWrap.waitForIdle();
+  await agentEnd({ willContinue: false }, { cwd, ui: fakeUiWrap.ui, isIdle: () => false, hasPendingMessages: () => false });
+
+  const grillEnd = (await readPhaseEvents(cwd, "idea")).find((e) => e.phase === "grill" && e.edge === "end");
+  assert.ok(grillEnd, "a grill end event is written");
+  assert.equal(grillEnd!.model, undefined, "grilling ran on the session model: nothing to record");
+});
+
+await test("grill model: an abandoned grill pin is restored by the next /readyset command", async () => {
+  const cwd = await freshRepo();
+  await clearConfig();
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = {
+    cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle,
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+  };
+  await handler("--phase-model grill=small/fast --idea Add a health endpoint", ctx);
+  assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:small/fast"]);
+
+  // No brainstorm is ever written; the user runs /readyset again.
+  await handler("", ctx);
+  assert.equal(fakePiWrap.setModelCalls[1], "session-default-model", "the grill pin is released by the next command");
+  // One-shot: a third command does not restore again.
+  await handler("", ctx);
+  assert.equal(fakePiWrap.setModelCalls.length, 2, "the restore runs once");
+});
+
 await test("a planning turn that writes outside the change dir during the transition path trips the propose-boundary invariant", async () => {
   const cwd = await freshRepo();
   await execFileSync("git", ["init", "-q"], { cwd });

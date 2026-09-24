@@ -1360,6 +1360,20 @@ export interface BrainstormExecutionOptions {
 	reviewThresholds: ParsedReviewThresholds;
 	scopeProtected: { paths: string[] };
 	testPathsResult: { paths: string[] };
+	/** The model spec the grill turn actually ran on, when THIS run pinned one before grilling
+	 *  (see `applyGrillModel`). Recorded verbatim on the `grill` `end` phase event; `undefined`
+	 *  when grilling ran on the session model or happened in an earlier run -- never a guess. */
+	grillModel?: string;
+}
+
+/** A model pinned for the grill turn by `applyGrillModel`, and what to restore afterward. */
+export interface GrillModelPin {
+	spec: string;
+	source: string;
+	/** Opaque `ctx.models.current()` captured right before the pin was applied. */
+	restoreTo: unknown;
+	/** Set once `restoreGrillModel` has run, so the restore is one-shot. */
+	restored?: boolean;
 }
 
 export interface ActiveGrillSession {
@@ -1378,6 +1392,9 @@ export interface ActiveGrillSession {
 	 *  does not expose sessionManager. Used by the agent_end handler to reject a subagent's own
 	 *  terminal settle (same cwd, different session) from driving the grill→propose transition. */
 	sessionId?: string;
+	/** The grill model this session pinned (`applyGrillModel`), restored when the brainstorm is
+	 *  written (`runGrillEndTransition`) or when a new /readyset command supersedes it. */
+	grillModel?: GrillModelPin;
 }
 
 export let activeGrillSession: ActiveGrillSession | undefined;
@@ -1472,6 +1489,7 @@ export function startGrilling(
 	laneDefault: LaneDefault,
 	preferredLanguage?: string,
 	execOptions?: BrainstormExecutionOptions,
+	grillModel?: GrillModelPin,
 ): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
@@ -1501,6 +1519,7 @@ export function startGrilling(
 			execOptions,
 			waitForIdle: ctx.waitForIdle,
 			sessionId: ctx.sessionManager?.getSessionId?.(),
+			grillModel,
 		};
 	}
 
@@ -1511,6 +1530,91 @@ export function startGrilling(
 		"info",
 	);
 	pi.sendUserMessage(grillTurnPrompt(ideaText, today, laneDefault, preferredLanguage));
+}
+
+/**
+ * Pins the model the grill turn runs on, BEFORE `startGrilling` fires it. Grilling is a plain chat
+ * turn fired with `pi.sendUserMessage` and returned from immediately, so neither
+ * `withPinnedModel` nor `withPhaseModel` (both scoped to an awaited `fn`) can cover it -- which is
+ * why `--phase-model grill=…` used to be accepted, advertised as a cost lever, and silently
+ * ignored, while the `grill` phase event still recorded it as the model used.
+ *
+ * Precedence mirrors every other phase (`phaseModelFor` in executeBrainstorm): the grill phase
+ * override (`--phase-model grill=` flag, else `readyset.model.phases.grill`) wins, else the run's
+ * pin (`--model`, else `readyset.model`/`modelRoles.default`). Like `withPhaseModel`, a spec that
+ * fails to resolve or apply warns and leaves the session model alone -- a cost optimization is
+ * never a reason to stop grilling. Returns the pin (with the pre-pin model to restore), or
+ * `undefined` when nothing was applied.
+ */
+export async function applyGrillModel(pi: ExtensionAPI, ctx: ReviewCtx, parsedArgs: ReadysetArgs): Promise<GrillModelPin | undefined> {
+	let spec: string | undefined;
+	let source = "";
+	const fromFlag = (parsedArgs.phaseModels ?? []).filter((e) => e.phase === "grill").at(-1);
+	if (fromFlag) {
+		spec = fromFlag.model;
+		source = "--phase-model flag";
+	} else {
+		const fromConfig = (await readPhaseModels()).entries.find((e) => e.phase === "grill");
+		if (fromConfig) {
+			spec = fromConfig.model;
+			source = fromConfig.source;
+		} else if (parsedArgs.model) {
+			spec = parsedArgs.model;
+			source = "--model flag";
+		} else {
+			const pinned = await readPinnedModel();
+			if (pinned.model) {
+				spec = pinned.model;
+				source = pinned.source ?? "";
+			}
+		}
+	}
+	if (!spec) return undefined;
+
+	const setModel = resolveHostSetModel(pi);
+	const models = ctx.models;
+	if (!setModel || !models?.current) {
+		ctx.ui.notify(
+			`Grill model "${spec}" (from ${source}) was given, but this omp build doesn't expose pi.setModel/ctx.models.current — grilling runs on the session model.`,
+			"warning",
+		);
+		return undefined;
+	}
+	const resolved = models.resolve ? models.resolve(spec) : spec;
+	if (resolved === undefined || resolved === null) {
+		ctx.ui.notify(`Grill model "${spec}" (from ${source}) didn't resolve to any available model — grilling runs on the session model.`, "warning");
+		return undefined;
+	}
+	const restoreTo = models.current();
+	let applied = false;
+	try {
+		applied = (await setModel(resolved)) !== false;
+	} catch {
+		applied = false;
+	}
+	if (!applied) {
+		ctx.ui.notify(`Grill model "${spec}" (from ${source}) couldn't be applied (usually: no API key) — grilling runs on the session model.`, "warning");
+		return undefined;
+	}
+	ctx.ui.notify(
+		`Grilling runs on "${spec}" (from ${source}). The previous model is restored once the brainstorm is written, or on the next /readyset command.`,
+		"info",
+	);
+	return { spec, source, restoreTo };
+}
+
+/** Restores the model a grill pin replaced. One-shot (marks the pin `restored`), never throws. */
+export async function restoreGrillModel(pi: ExtensionAPI, ctx: ReviewCtx, session: ActiveGrillSession | undefined): Promise<void> {
+	const pin = session?.grillModel;
+	if (!pin || pin.restored) return;
+	pin.restored = true;
+	const setModel = resolveHostSetModel(pi);
+	try {
+		if (!setModel) throw new Error("no setModel");
+		await setModel(pin.restoreTo);
+	} catch {
+		ctx.ui.notify(`Couldn't restore the model this session had before grilling on "${pin.spec}" — check /model if it looks off.`, "warning");
+	}
 }
 
 export async function findNewlyWrittenBrainstorm(cwd: string, session: ActiveGrillSession): Promise<string | undefined> {
@@ -1577,6 +1681,10 @@ async function runGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<
 	// Brainstorm file is written! Mark grilling complete.
 	activeGrillSession = undefined;
 	grillRoundState.active = false;
+	// Grilling is over: give the session its own model back before anything else runs, so
+	// executeBrainstorm's withPinnedModel captures (and later restores to) the real pre-run model,
+	// not the grill pin. Also the right moment for "Finish here" -- nothing else will restore it.
+	await restoreGrillModel(pi, ctx, session);
 
 	const relativePath = relative(ctx.cwd, newlyWritten);
 	ctx.ui.notify(`Brainstorm file created: ${relativePath}`, "info");
@@ -1620,7 +1728,7 @@ async function runGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<
 			ctx.ui.notify(`Could not load brainstorm metadata for ${relativePath}`, "warning");
 			return;
 		}
-		await executeBrainstorm(pi, runCtx, chosen, session.execOptions);
+		await executeBrainstorm(pi, runCtx, chosen, { ...session.execOptions, grillModel: session.grillModel?.spec });
 	} else {
 		ctx.ui.notify(`Brainstorm saved at ${relativePath}. Run /readyset when you're ready to proceed.`, "info");
 	}
@@ -4164,7 +4272,10 @@ export async function executeBrainstorm(
 		// completed is written -- never synthesized from the brainstorm's date-only `created`
 		// frontmatter, which would be a fabricated time.
 		await recordPhase(chosen.changeId, "grill", "end", phaseLane, phaseLaneSource, {
-			model: phaseModelFor("grill"),
+			// The model grilling ACTUALLY ran on (applyGrillModel), never phaseModelFor("grill"):
+			// the grill turn is not fired from here, so a phase override was never applied to it
+			// by this function -- recording it would put a fabricated model in the bench log.
+			model: options.grillModel,
 			outcome: "grilled",
 			grill: {
 				clarity: recommendation.clarity,
@@ -4490,6 +4601,15 @@ export default function (pi: ExtensionAPI) {
 			// boundary (handoff-superseded), where the old resetPendingHandoff cleared the state with
 			// no restore and left the session stuck on the execution model.
 			await supersedePendingHandoff(pi, ctx as unknown as ReviewCtx);
+			// Same idea for a grill pin whose brainstorm was never written (grilling abandoned):
+			// give the session its model back before this command pins anything of its own --
+			// otherwise a new applyGrillModel/withPinnedModel would capture the stale grill pin as
+			// "the model to restore". The grill session itself is left alone (a brainstorm it
+			// wrote may still be picked below; see grillRoundState). The cwd fallback is trivially true:
+			// a /readyset command is user-driven, so only a known, different session id opts out.
+			if (activeGrillSession && sessionMatches(ctx as unknown as ReviewCtx, activeGrillSession.sessionId, ctx.cwd)) {
+				await restoreGrillModel(pi, ctx as unknown as ReviewCtx, activeGrillSession);
+			}
 
 			// Risk-based code-review policy, resolved once for the run. `--review
 			// auto|always|never` (flag) wins over readyset.review.mode (config); the trigger
@@ -4602,7 +4722,8 @@ export default function (pi: ExtensionAPI) {
 			// come last among flags on the command line.
 			const ideaFromFlag = parsedArgs.idea ?? "";
 			if (ideaFromFlag) {
-				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, laneDefault, preferredLanguage, execOptions);
+				const grillModel = await applyGrillModel(pi, ctx as unknown as ReviewCtx, parsedArgs);
+				startGrilling(pi, ctx as unknown as ReviewCtx, ideaFromFlag, laneDefault, preferredLanguage, execOptions, grillModel);
 				return;
 			}
 
@@ -4664,7 +4785,8 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("No idea given -- nothing started.", "info");
 					return;
 				}
-				startGrilling(pi, reviewCtxForInput, idea, laneDefault, preferredLanguage, execOptions);
+				const grillModel = await applyGrillModel(pi, reviewCtxForInput, parsedArgs);
+				startGrilling(pi, reviewCtxForInput, idea, laneDefault, preferredLanguage, execOptions, grillModel);
 				return;
 			}
 
