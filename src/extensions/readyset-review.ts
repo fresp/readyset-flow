@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { parseReadysetArgs } from "../lib/readyset-args.ts";
 import { createRuntime } from "../lib/readyset-runtime.ts";
-import { resolveTestCommand, runTestCommand, testRunSummary } from "../lib/readyset-verify.ts";
+import { baselineFailureLine, judgeTestRun, resolveTestCommand, resolveVerifySettings, runTestCommand, testRunSummary, toBaseline } from "../lib/readyset-verify.ts";
 import { BRAINSTORM_DIR, type BrainstormMeta, type Lane, changeState, isProposed, loadBrainstorms, markApproved, parseFrontmatter, readClaritySignal, recommendLane, reconcileStatuses, validateBrainstormContent } from "../lib/readyset-brainstorm.ts";
 import { type TurnBudget, createTurnBudget, phaseBudgetExceeded, phaseBudgetLine, startPhaseBudget } from "../lib/readyset-budget.ts";
 import { buildReviewDocument, classicGateSelect, openSidebarOverlay, showReviewPanel, takeReviewSnapshot } from "../lib/readyset-gate-ui.ts";
@@ -17,7 +17,7 @@ import { runContractRepair, runTrim } from "../lib/readyset-repair.ts";
 import type { ReviewOverlayResult } from "../lib/readyset-review-overlay.ts";
 import { buildReviewTriggerInput } from "../lib/readyset-review-policy.ts";
 import { evaluateReviewTriggers } from "../lib/readyset-review-trigger.ts";
-import { type ArtifactSizes, type PhaseEvent, type PhaseName, appendContext, appendPhaseEvent, archiveChange, changePaths, checkPhaseViolations, checkScope, ensureDirtyBaseline, ensureReadysetRoot, hasExploration, listSubmodules, readArtifactSizes, readChangeLane, readHandoffState, readOpenDecisions, readReview, readScopeDeviations, scaffoldChange, validateChange, writeApproveBase } from "../lib/readyset-spec.ts";
+import { type ArtifactSizes, type PhaseEvent, type PhaseName, appendContext, appendPhaseEvent, archiveChange, changePaths, checkPhaseViolations, checkScope, ensureDirtyBaseline, ensureReadysetRoot, hasExploration, listSubmodules, readArtifactSizes, readChangeLane, readHandoffState, readOpenDecisions, readReview, readScopeDeviations, readTestBaseline, scaffoldChange, validateChange, writeApproveBase, writeTestBaseline } from "../lib/readyset-spec.ts";
 import { type BrainstormExecutionOptions, type GateRunOptions, type ReadysetState, type ReviewCtx, createReadysetState } from "../lib/readyset-types.ts";
 
 /** This module instance's state. */
@@ -185,7 +185,7 @@ async function reviewAndMaybeExecute(
 		await recordPhase(chosen.changeId, "gate", "start");
 		const snapshot = await takeReviewSnapshot(ctx, chosen, { outside: outsideRepoCount(), tmp: outsideRepoTmpCount() });
 		await flushOutsideRepoEntries(ctx.cwd, chosen.changeId);
-		showReviewPanel(ctx, chosen, snapshot, budget, reviewLane, artifactBudgets);
+		showReviewPanel(ctx, chosen, snapshot, budget, reviewLane, artifactBudgets, opts.verify);
 		ctx.ui.setEditorText(await buildReviewDocument(ctx, chosen, snapshot));
 		const taskSummary = snapshot.counted
 			? `${snapshot.counted.done}/${snapshot.counted.total} tasks ticked`
@@ -402,6 +402,21 @@ async function reviewAndMaybeExecute(
 		// undefined when no execution model was applied, in which case handlePendingHandoff has
 		// nothing to restore and short-circuits. `sessionId` is the arming session's own id (the
 		// command ctx has sessionManager), so a subagent's settle in the same cwd cannot end it.
+		// The pre-change test run: a test that already fails here is not this change's failure, so
+		// readyset_done / settle / --review compare against it instead of refusing on it. Taken after
+		// approve (the user's approval covers running the repo's own test command) and before any
+		// code changes; recorded in state.json so a later --review can use it too.
+		let verify = opts.verify;
+		if (verify.command) {
+			ctx.ui.notify(`Running \`${verify.command}\` once to record the pre-change test baseline...`, "info");
+			const baselineRun = await runTestCommand(ctx.cwd, verify.command).catch(() => undefined);
+			if (baselineRun) {
+				const baseline = toBaseline(baselineRun);
+				verify = { ...verify, baseline };
+				await writeTestBaseline(ctx.cwd, chosen.changeId, baseline).catch(() => {});
+				if (!baseline.passed) ctx.ui.notify(`${baselineFailureLine(baseline)}. Only new failures will hold up "done".`, "warning");
+			}
+		}
 		const armingSessionId = ctx.sessionManager?.getSessionId?.();
 		state.handoff = {
 			changeId: chosen.changeId,
@@ -410,7 +425,7 @@ async function reviewAndMaybeExecute(
 			sessionId: armingSessionId,
 			armedAt: new Date().toISOString(),
 			reviewPolicy: { mode: reviewMode, fullLane: reviewFullLane, thresholds: reviewThresholds, protectedPaths, testPaths },
-			verify: opts.verify,
+			verify,
 		};
 		await persistPendingHandoff(state.handoff);
 		// readyset_verify is only meaningful while THIS change's Apply is live — armed here (the
@@ -427,7 +442,7 @@ async function reviewAndMaybeExecute(
 		ctx.ui.notify(`Approved "${chosen.changeId}". Handing off execution to core omp...`, "info");
 
 		const applyOpenDecisions = await readOpenDecisions(ctx.cwd, chosen.changeId).catch(() => []);
-		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions, reviewLane, opts.verify));
+		pi.sendUserMessage(applyTurnPrompt(chosen.changeId, applyOpenDecisions, reviewLane, verify));
 		return;
 	}
 }
@@ -622,9 +637,13 @@ async function runOnDemandReview(
 	const testCommand = resolveTestCommand(ctx.cwd, verifyConfig);
 	if (testCommand) ctx.ui.notify(`Running \`${testCommand}\` before the review...`, "info");
 	const tests = testCommand ? await runTestCommand(ctx.cwd, testCommand) : undefined;
+	// Failures that were already there at approve are not this change's: the trigger and the review
+	// prompt see them as such (same rule as readyset_done).
+	const testBaseline = tests ? await readTestBaseline(ctx.cwd, changeId).catch(() => undefined) : undefined;
+	const testVerdict = tests ? judgeTestRun(tests, testBaseline?.command === tests.command ? testBaseline : undefined) : undefined;
 	const triggerResult = evaluateReviewTriggers({
 		...(await buildReviewTriggerInput(ctx.cwd, changeId, driftPaths, changedPaths, brainstorm?.clarity, thresholds, (await readOpenDecisions(ctx.cwd, changeId)).length, protectedPaths, testPaths)),
-		...(tests ? { tests: testRunSummary(tests) } : {}),
+		...(tests ? { tests: { ...testRunSummary(tests), passed: !testVerdict?.blocking } } : {}),
 	});
 
 	let reviewContent: string | undefined;
@@ -634,7 +653,7 @@ async function runOnDemandReview(
 	try {
 		const deviationsForReview = await readScopeDeviations(ctx.cwd, changeId);
 		await withPhaseModel(pi, ctx, "review", phaseModels, () =>
-			fireTurnAndWait(pi, ctx, codeReviewTurnPrompt(changeId, lane, deviationsForReview, triggerResult, changedPaths, tests)),
+			fireTurnAndWait(pi, ctx, codeReviewTurnPrompt(changeId, lane, deviationsForReview, triggerResult, changedPaths, tests, testVerdict)),
 		);
 		reviewContent = await readReview(ctx.cwd, changeId);
 		reviewOutcome = reviewContent ? "review-written" : "no-review";
@@ -854,11 +873,15 @@ export async function executeBrainstorm(
 		testPaths: testPathsResult.paths,
 		pinnedModel,
 		pinnedModelSource,
-		verify: {
-			command: resolveTestCommand(ctx.cwd, verifyConfig),
-			requireNotes: verifyConfig.requireNotes,
-		},
+		verify: resolveVerifySettings(ctx.cwd, verifyConfig),
 	};
+	if (!gateRunOptions.verify.command && !verifyConfig.disabled && !verifyConfig.requireNotes) {
+		ctx.ui.notify(
+			"No test command found in this repo (package.json test script, go.mod, Cargo.toml, pytest config or a Makefile test target), " +
+				"so Readyset cannot verify the execution itself — checked tasks need `_Verified:` notes instead. Set readyset.verify.command to change that.",
+			"info",
+		);
+	}
 
 	await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
 		if (isProposed(chosen.status)) {

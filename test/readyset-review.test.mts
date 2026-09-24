@@ -2014,7 +2014,7 @@ await test("verify: with notes optional, the apply prompt drops the note ritual 
 await test("verify: readyset_done refuses while the project's tests fail, then records the passing run on the settle event", async () => {
   await clearConfig();
   const cwd = await freshRepo();
-  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(1), "utf8"); // failing suite at approve time
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(0), "utf8"); // green suite at approve time (the baseline)
   await writeBrainstorm(cwd, "2026-07-31-verify-run.md", { title: "verify-run", status: "proposed", created: "2026-07-31", change_id: "verify-run" });
   const dir = await writeProposedChange(cwd, "verify-run", ["- src/keep.ts"]);
   const fakePiWrap = makeFakePi(cwd);
@@ -2027,8 +2027,10 @@ await test("verify: readyset_done refuses while the project's tests fail, then r
   await loaded.handler("", ctx);
   assert.match(fakePiWrap.calls.at(-1)!.prompt, /Readyset then runs `npm test` itself/, "the apply prompt names the detected command");
 
+  assert.ok(ui.notifications.some((n) => /pre-change test baseline/.test(n.message)), "the baseline run is announced");
   const toolCtx = eventCtx(cwd, ui.ui, sessionId);
   await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n", "utf8"); // no _Verified note: optional now
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(1), "utf8"); // the execution broke the suite
   const refused = await loaded.signal({ status: "done" }, toolCtx);
   assert.match(refused, /Not recorded: Readyset ran `npm test` and it exited 1/);
 
@@ -2044,7 +2046,7 @@ await test("verify: readyset_done refuses while the project's tests fail, then r
 await test("verify: a checkbox settle (no readyset_done) runs the tests at settle; failing tests fire tests-failing", async () => {
   await clearConfig();
   const cwd = await freshRepo();
-  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(2), "utf8");
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(0), "utf8");
   await writeBrainstorm(cwd, "2026-08-01-verify-settle.md", { title: "verify-settle", status: "proposed", created: "2026-08-01", change_id: "verify-settle", lane: "fast" });
   await writeProposedChange(cwd, "verify-settle", ["- src/keep.ts"]);
   const { fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
@@ -2052,6 +2054,7 @@ await test("verify: a checkbox settle (no readyset_done) runs the tests at settl
   fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
   await handler("--lane fast", ctx);
   await markTasksDone(cwd, "verify-settle");
+  await writeFile(join(cwd, "package.json"), TEST_SCRIPT(2), "utf8"); // broken by the execution
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   const applyEnd = (await readPhaseEvents(cwd, "verify-settle")).find((e) => e.phase === "apply" && e.edge === "end");
   assert.equal(applyEnd?.outcome, "handoff-settled");
@@ -2062,13 +2065,58 @@ await test("verify: a checkbox settle (no readyset_done) runs the tests at settl
 });
 
 await test("verify: with notes optional the session_stop gate never blocks", async () => {
-  await clearConfig();
+  await writeConfig("readyset:\n  verify:\n    command: node -e 0\n"); // a test command, so notes stay optional
   const { cwd, dir, ui, sessionId } = await armDoneHandoff("verify-nostop", "2026-08-02");
   await writeFile(join(dir, "tasks.md"), "- [x] 1.1 no note\n- [ ] 1.2 todo\n", "utf8");
   const fakePiWrap = makeFakePi(cwd);
   const { sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
   // A fresh instance re-attaches the persisted handoff (verify settings travel with it).
   assert.equal(await sessionStop({ session_id: sessionId }, { cwd, ui: ui.ui }), undefined);
+  await clearConfig();
+});
+
+await test("verify: no test command in the repo falls back to _Verified notes (and says so)", async () => {
+  await clearConfig();
+  const { cwd, dir, ui, sessionId, signal } = await armDoneHandoff("verify-fallback", "2026-08-05");
+  assert.ok(ui.notifications.some((n) => /No test command found in this repo/.test(n.message)), "the fallback is announced");
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 no note\n", "utf8");
+  assert.match(await signal({ status: "done" }, eventCtx(cwd, ui.ui, sessionId)), /no _Verified: note/);
+});
+
+const TAP_SCRIPT = (names: string[]) =>
+  JSON.stringify({ name: "fx", scripts: { test: `node -e "${names.map((n, i) => `console.log('not ok ${i + 1} - ${n}')`).join(";")};process.exit(${names.length > 0 ? 1 : 0})"` } });
+
+await test("verify: failures already in the approve-time baseline never block done; a new failure does", async () => {
+  await clearConfig();
+  const cwd = await freshRepo();
+  await writeFile(join(cwd, "package.json"), TAP_SCRIPT(["old flaky"]), "utf8"); // red before the change
+  await writeBrainstorm(cwd, "2026-08-06-verify-base.md", { title: "verify-base", status: "proposed", created: "2026-08-06", change_id: "verify-base" });
+  const dir = await writeProposedChange(cwd, "verify-base", ["- src/keep.ts"]);
+  const fakePiWrap = makeFakePi(cwd);
+  const loaded = await loadWithDoneTool(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  const sessionId = "verify-base-session";
+  const ctx = { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+  ui.selectQueue.push("2026-08-06 · verify-base");
+  ui.selectQueue.push("Approve & Execute, keep context");
+  await loaded.handler("", ctx);
+  assert.ok(ui.notifications.some((n) => /already failed before this change .*failing: old flaky/.test(n.message)), "the red baseline is announced");
+  assert.match(fakePiWrap.calls.at(-1)!.prompt, /refuses "done" on any failure that is new.*leave those failures alone/s, "the apply prompt says not to chase them");
+  const state = JSON.parse(await readFile(join(dir, "state.json"), "utf8"));
+  assert.deepEqual(state.testBaseline?.failures, ["old flaky"], "the baseline is recorded in state.json");
+
+  const toolCtx = eventCtx(cwd, ui.ui, sessionId);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n", "utf8");
+  await writeFile(join(cwd, "package.json"), TAP_SCRIPT(["old flaky", "new break"]), "utf8");
+  assert.match(await loaded.signal({ status: "done" }, toolCtx), /Not recorded: .*not there before this change: new break/);
+
+  await writeFile(join(cwd, "package.json"), TAP_SCRIPT(["old flaky"]), "utf8");
+  assert.match(await loaded.signal({ status: "done" }, toolCtx), /still fails, but only as it already did before this change\. Recorded as done/);
+  await loaded.agentEnd({ willContinue: false }, toolCtx);
+  const applyEnd = (await readPhaseEvents(cwd, "verify-base")).find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-done");
+  assert.equal(applyEnd?.tests?.passed, false, "the event records the real exit");
+  assert.ok(!applyEnd?.reviewPolicy?.triggersFired?.includes("tests-failing"), "pre-existing failures do not fire tests-failing");
 });
 
 await test("verify: --review <id> runs the tests first and hands the result to the review", async () => {

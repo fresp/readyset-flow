@@ -25,6 +25,12 @@ Execution now ends on an explicit signal instead of an inference, verification c
 ### Fixed
 - `/readyset --review <id>` looked for an `apply` `end` event with outcome `applied`, which the handoff never writes, so its `diff-size` trigger always saw an empty diff. The diff is now measured live against the approve base.
 
+### Lite without the artifact changes (branch `lite-no4`, pending a benchmark)
+- **Verification is deterministic** (`readyset.verify`): Readyset runs the project's test command itself (auto-detected `npm test`, or `readyset.verify.command`; `none` disables) when `readyset_done` says done, at settle, and before `/readyset --review`. A failing run refuses "done" with the output tail, fires the new `tests-failing` review trigger, and is recorded on the `apply`/`review` end events. `_Verified:` notes, evidence citations and the session_stop gate are only required with `readyset.verify.requireNotes: true`; the apply prompt is correspondingly shorter.
+- **No more settle inference**: an unfinished execution pauses until it signals `readyset_done`, checks every task, or the next `/readyset` command supersedes it. The pause fingerprint and `handoff-stalled` are gone.
+- **Verification hardening**: the test command runs once right after approve as a baseline (recorded in `state.json`); only failures that were not in it refuse `done` or fire `tests-failing`, and the apply prompt tells the model to leave the old ones alone. Detection covers pnpm / yarn / bun lockfiles, go, cargo, pytest and a Makefile `test:` target; with nothing detected, `_Verified:` notes are required instead. The gate panel names the command that Approve lets Readyset run.
+- The brainstorm validator accepts a grilled `## Decision` that names its chosen option (`Chosen option: …`), so the brainstorm-gap warning no longer fires on every grilled run.
+
 ## 0.17.0 - 2026-09-24
 
 Makes the handed-off execution trustworthy: it runs on the model you pinned, pauses and settles correctly, survives an omp restart, has to show verification before it stops, and gets the risk-based review policy applied when it is done.

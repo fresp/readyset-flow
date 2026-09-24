@@ -9,6 +9,7 @@ import { trimmableSizes } from "./readyset-repair.ts";
 import { type OverlaySection, type ReviewOverlayResult, ReviewSidebarOverlay } from "./readyset-review-overlay.ts";
 import { type ArtifactSizes, type ChangeLane, type OpenDecision, brainstormRequestText, changePaths, checkScope, checkScopeRefs, checkTaskVerification, findDocFileWarnings, findMissingRequestedDocs, findSpecFiles, getProgress, hasBeenApplied, hasExploration, readArtifactSizes, readAssumedScenarios, readAssumptions, readChangeLane, readContext, readOpenDecisions, readReview, readScopeContract, validateChange } from "./readyset-spec.ts";
 import type { ReviewCtx } from "./readyset-types.ts";
+import type { VerifySettings } from "./readyset-verify.ts";
 
 /** The Review Gate's snapshot, panel, review document, sidebar overlay and classic menu. */
 export interface ReviewSnapshot {
@@ -435,7 +436,19 @@ export function artifactBudgetLines(sizes: ArtifactSizes, budgets: ArtifactBudge
 	return lines;
 }
 
-export function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot, budget: TurnBudget, lane: ChangeLane, budgets: ArtifactBudgets): void {
+/** The gate line that says what Approve lets Readyset run: approving is the consent for it. */
+export function verifyPanelLine(verify: VerifySettings | undefined): string | undefined {
+	if (!verify) return undefined;
+	if (verify.command) {
+		return `tests: Approve lets Readyset run \`${verify.command}\` (${verify.source === "config" ? "readyset.verify.command" : "auto-detected"}) ` +
+			"before execution (baseline), at readyset_done and at settle";
+	}
+	return verify.requireNotes
+		? "tests: no test command — checked tasks need _Verified: notes (set readyset.verify.command)"
+		: "tests: verification off (readyset.verify.command: none)";
+}
+
+export function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot: ReviewSnapshot, budget: TurnBudget, lane: ChangeLane, budgets: ArtifactBudgets, verify?: VerifySettings): void {
 	// Informational only -- doesn't gate which CTAs are offered (Approve & Compact is always
 	// there; see reviewAndMaybeExecute). Lets the user judge for themselves whether it's worth
 	// reaching for right now instead of Readyset guessing at a threshold.
@@ -453,6 +466,7 @@ export function showReviewPanel(ctx: ReviewCtx, chosen: BrainstormMeta, snapshot
 		snapshot.evidenceTotal > 0
 			? `runtime evidence: ${snapshot.evidenceTotal} record(s)${snapshot.evidenceConflicts.length > 0 ? ` -- ${snapshot.evidenceConflicts.length} conflict(s): ${snapshot.evidenceConflicts.map(describeEvidenceConflict).join("; ")}` : ""}`
 			: "runtime evidence: none",
+		...(verifyPanelLine(verify) ? [verifyPanelLine(verify) as string] : []),
 		snapshot.reviewed ? "code review: done — see REVIEW.md" : "code review: not run yet",
 		snapshot.scope.noContract
 			? "scope: no 'Files This Change Will Touch' contract in proposal.md — scope unknown"

@@ -208,9 +208,20 @@ export async function readContext(cwd: string, changeId: string): Promise<string
 export const STATE_FILE = "state.json";
 export const EVENTS_FILE = "events.jsonl";
 
+/** The project's test run taken at approve (readyset-verify.ts TestRun, kept opaque here). */
+export interface TestBaselineEntry {
+	command: string;
+	passed: boolean;
+	exitCode: number | null;
+	timedOut: boolean;
+	failures?: string[];
+	at: string;
+}
+
 interface ChangeMachineState {
 	dirtyBaseline?: DirtyBaseline;
 	approveBase?: ApproveBaseEntry;
+	testBaseline?: TestBaselineEntry;
 }
 
 async function readMachineState(cwd: string, changeId: string): Promise<ChangeMachineState> {
@@ -227,6 +238,17 @@ async function readMachineState(cwd: string, changeId: string): Promise<ChangeMa
 		const a = (parsed as { approveBase?: unknown }).approveBase as Partial<ApproveBaseEntry> | undefined;
 		if (a && typeof a.sha === "string" && a.sha !== "" && typeof a.capturedAt === "string") {
 			out.approveBase = { sha: a.sha, capturedAt: a.capturedAt };
+		}
+		const t = (parsed as { testBaseline?: unknown }).testBaseline as Partial<TestBaselineEntry> | undefined;
+		if (t && typeof t.command === "string" && typeof t.passed === "boolean" && typeof t.at === "string") {
+			out.testBaseline = {
+				command: t.command,
+				passed: t.passed,
+				exitCode: typeof t.exitCode === "number" ? t.exitCode : null,
+				timedOut: t.timedOut === true,
+				...(Array.isArray(t.failures) && t.failures.every((f) => typeof f === "string") ? { failures: t.failures } : {}),
+				at: t.at,
+			};
 		}
 		return out;
 	} catch {
@@ -379,6 +401,18 @@ export async function writeApproveBase(cwd: string, changeId: string, sha: strin
 	const machine = await readMachineState(cwd, changeId);
 	if (machine.approveBase !== undefined || parseApproveBaseEntry(await legacyContext(cwd, changeId)) !== undefined) return;
 	await writeMachineState(cwd, changeId, { ...machine, approveBase: { sha, capturedAt: new Date().toISOString() } });
+}
+
+/** Records the test run taken at approve. Unlike the approve base it is replaced on a re-approve:
+ *  the latest pre-execution state is the one a later failure is compared against. */
+export async function writeTestBaseline(cwd: string, changeId: string, baseline: TestBaselineEntry): Promise<void> {
+	const machine = await readMachineState(cwd, changeId);
+	await writeMachineState(cwd, changeId, { ...machine, testBaseline: baseline });
+}
+
+/** Reads the test run taken at approve, or `undefined` when none was recorded. */
+export async function readTestBaseline(cwd: string, changeId: string): Promise<TestBaselineEntry | undefined> {
+	return (await readMachineState(cwd, changeId)).testBaseline;
 }
 
 /** Reads this change's approve-base commit sha, or `undefined` when none was ever recorded (a

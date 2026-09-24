@@ -17,7 +17,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/readyset-brainstorm.test.mts && node --experimental-strip-types test/readyset-omp-config.test.mts && node --experimental-strip-types test/readyset-review-overlay.test.mts && node --experimental-strip-types test/readyset-review.test.mts && node --experimental-strip-types test/readyset-review-trigger.test.mts && node --experimental-strip-types test/readyset-evidence.test.mts && node --experimental-strip-types test/readyset-cli-validate.test.mts && node --experimental-strip-types test/readyset-install-link.test.mts && node --experimental-strip-types test/readyset-configure.test.mts",
+    "test": "node --experimental-strip-types test/readyset-spec.test.mts && node --experimental-strip-types test/readyset-brainstorm.test.mts && node --experimental-strip-types test/readyset-omp-config.test.mts && node --experimental-strip-types test/readyset-review-overlay.test.mts && node --experimental-strip-types test/readyset-review.test.mts && node --experimental-strip-types test/readyset-review-trigger.test.mts && node --experimental-strip-types test/readyset-evidence.test.mts && node --experimental-strip-types test/readyset-verify.test.mts && node --experimental-strip-types test/readyset-cli-validate.test.mts && node --experimental-strip-types test/readyset-install-link.test.mts && node --experimental-strip-types test/readyset-configure.test.mts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm test"
   },

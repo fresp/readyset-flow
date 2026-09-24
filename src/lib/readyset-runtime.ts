@@ -10,7 +10,7 @@ import { asReviewCtx, resolveHostSetModel, sessionMatches } from "./readyset-hos
 import { type LaneDefault, readPhaseModels, readPinnedModel } from "./readyset-omp-config.ts";
 import { GRILL_ROUND_CAP, grillTurnPrompt } from "./readyset-prompts.ts";
 import { writeReviewSkipStub } from "./readyset-review-policy.ts";
-import { type TestRun, type VerifySettings, runTestCommand, testRunSummary } from "./readyset-verify.ts";
+import { type TestRun, type VerifySettings, judgeTestRun, runTestCommand, testRunSummary } from "./readyset-verify.ts";
 import { evaluateReviewTriggers } from "./readyset-review-trigger.ts";
 import { type PhaseEvent, appendContext, appendPhaseEvent, checkScope, checkTaskVerification, clearHandoffState, getProgress, listHandoffStates, readChangeLane, readOpenDecisions, readPhaseEvents, readScopeDeviations, writeHandoffState } from "./readyset-spec.ts";
 import type { ActiveGrillSession, ArmedReviewPolicy, BrainstormExecutionOptions, GrillModelPin, HandoffSignal, OutsideRepoKind, PendingHandoff, ReadysetState, ReviewCtx } from "./readyset-types.ts";
@@ -605,10 +605,15 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			? (handoff.tests ?? (await runTestCommand(ctx.cwd, handoff.verify.command).catch(() => undefined)))
 			: undefined;
 
+		// Failures already present at approve do not count against the change (judgeTestRun): the
+		// review policy sees such a run as passing, the event still records the real exit code.
+		const verdict = tests ? judgeTestRun(tests, handoff.verify?.baseline) : undefined;
+		const testsForPolicy = tests && verdict ? { ...tests, passed: !verdict.blocking } : tests;
+
 		// The review decision is taken BEFORE the apply `end` event is written, so the event can carry
 		// it (the bench reads the settle's decision from there rather than from notify text).
 		const reviewDecision = isRealSettle && changedPaths && handoff.reviewPolicy
-			? await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }, tests).catch(() => undefined)
+			? await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }, testsForPolicy).catch(() => undefined)
 			: undefined;
 
 		await appendPhaseEvent(ctx.cwd, handoff.changeId, {
@@ -630,8 +635,15 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 			...(reviewDecision ? { reviewPolicy: reviewDecision } : {}),
 			...(tests ? { tests: testRunSummary(tests) } : {}),
 		}).catch(() => {});
-		if (tests && !tests.passed) {
-			ctx.ui.notify(`Tests are failing after the execution of "${handoff.changeId}": \`${tests.command}\` exited ${tests.exitCode ?? "without an exit code"}.`, "warning");
+		if (tests && verdict?.blocking) {
+			ctx.ui.notify(
+				`Tests are failing after the execution of "${handoff.changeId}": \`${tests.command}\` exited ${tests.exitCode ?? "without an exit code"}` +
+					(verdict.newFailures.length > 0 ? ` (new: ${verdict.newFailures.slice(0, 10).join(", ")})` : "") +
+					".",
+				"warning",
+			);
+		} else if (tests && verdict?.preexisting) {
+			ctx.ui.notify(`\`${tests.command}\` still fails after "${handoff.changeId}", but only as it already did before it was approved.`, "info");
 		}
 		// The window is closed: the persisted copy must not be re-attached by a later process.
 		await clearHandoffState(ctx.cwd, handoff.changeId).catch(() => {});
@@ -1277,22 +1289,28 @@ export function createRuntime(state: ReadysetState, deps: RuntimeDeps) {
 				// The deterministic check: Readyset runs the project's test command itself. A failing run
 				// refuses "done" with the output tail — the one verification signal that cannot be a
 				// claim. The passing run is kept for the settle that follows (no second run).
+				// Only a failure this change introduced refuses: one already in the approve-time
+				// baseline is reported, not held against it (judgeTestRun).
 				let tests: TestRun | undefined;
+				let preexistingNote = "";
 				if (handoff.verify?.command) {
 					tests = await runTestCommand(cwd, handoff.verify.command);
-					if (!tests.passed) {
+					const verdict = judgeTestRun(tests, handoff.verify.baseline);
+					if (verdict.blocking) {
 						state.handoff = { ...handoff, tests: undefined };
 						return reply(
-							`Not recorded: Readyset ran \`${tests.command}\` and it ${tests.timedOut ? "timed out" : `exited ${tests.exitCode ?? "without an exit code"}`}. ` +
-								`Fix the failure, then call readyset_done again. Last output:\n${tests.tail}`,
+							`Not recorded: Readyset ran \`${tests.command}\` and it ${tests.timedOut ? "timed out" : `exited ${tests.exitCode ?? "without an exit code"}`}` +
+								(verdict.newFailures.length > 0 ? `, with failures that were not there before this change: ${verdict.newFailures.slice(0, 10).join(", ")}` : "") +
+								`. Fix the failure, then call readyset_done again. Last output:\n${tests.tail}`,
 						);
 					}
+					if (verdict.preexisting) preexistingNote = `\`${tests.command}\` still fails, but only as it already did before this change. `;
 				}
 				state.handoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at }, ...(tests ? { tests } : {}) };
 				await persistPendingHandoff(state.handoff);
 				await appendContext(cwd, handoff.changeId, "Apply", `Execution signalled done: ${text || "(no summary)"}`).catch(() => {});
 				return reply(
-					(tests ? `\`${tests.command}\` passed (${Math.round(tests.durationMs / 1000)}s). ` : "") +
+					(tests && tests.passed ? `\`${tests.command}\` passed (${Math.round(tests.durationMs / 1000)}s). ` : preexistingNote) +
 						"Recorded as done. End your turn now with a short report for the user; Readyset closes the execution, restores " +
 						"the model and applies the review policy when the turn ends.",
 				);

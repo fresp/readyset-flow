@@ -345,18 +345,31 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   review policy's decision (`reviewPolicy: { mode, decision, triggersFired }`), so the bench can
   score handoff outcomes directly.
 - **Verification is deterministic (`readyset.verify`).** Readyset runs the project's test command
-  itself — at `readyset_done`, at a checkbox settle, and before an on-demand `--review` — instead of
-  trusting what the model wrote about its checks. The command is `readyset.verify.command`, else
-  `npm test` when `package.json` has a real test script; `command: none` turns it off. A failing
-  run fires the `tests-failing` review trigger, and a passing one counts as evidence (it satisfies
-  `no-evidence`). `_Verified:` notes are optional by default; `readyset.verify.requireNotes: true`
-  restores the older contract (notes required, the session_stop gate below, the note-driven apply
-  prompt).
+  itself — once right after approve (the **baseline**, before any code changes), at `readyset_done`,
+  at a checkbox settle, and before an on-demand `--review` — instead of trusting what the model
+  wrote about its checks. Approving is the consent: the gate panel names the command
+  (`tests: Approve lets Readyset run …`).
+  - **Which command.** `readyset.verify.command`, else auto-detected: a real `package.json` test
+    script (run via `pnpm` / `yarn` / `bun run` when their lockfile is present, else `npm test`),
+    `go test ./...` for `go.mod`, `cargo test` for `Cargo.toml`, `python -m pytest -q` when pytest
+    is configured, `make test` for a Makefile `test:` target. `command: none` turns it off.
+  - **Nothing detected** (and not `none`): checked tasks need `_Verified:` notes instead, so a repo
+    Readyset cannot test never ends up with no verification at all.
+  - **Only new failures count.** A red baseline is recorded in `state.json` and announced. Failing
+    tests are parsed from the output (TAP, node / jest / vitest marks, pytest, go, cargo); a run
+    that fails only with failures already in the baseline does not refuse `done`, does not fire
+    `tests-failing`, and the apply prompt tells the model to leave them alone. When the output
+    format is not recognised and the baseline was already red, Readyset cannot tell old from new
+    and does not block.
+  - A blocking failure fires the `tests-failing` review trigger; a passing run counts as evidence
+    (it satisfies `no-evidence`). `_Verified:` notes are optional by default;
+    `readyset.verify.requireNotes: true` restores the older contract (notes required, the
+    session_stop gate below, the note-driven apply prompt).
 
   ```yaml
   readyset:
     verify:
-      command: pnpm test --silent   # default: auto-detect `npm test`; `none` disables
+      command: pnpm test --silent   # default: auto-detect; `none` disables
       requireNotes: false           # true = enforce _Verified: notes as before
   ```
 - **Settling is simple and idempotent.** The handoff settles on exactly three things:
@@ -739,7 +752,7 @@ events.jsonl     the machine-parseable phase-event log, one JSON object per line
                  attribute tokens/wall time to phases
 state.json       write-once facts about the change: the pre-existing-dirty baseline the gate
                  invariant and scope check subtract (see "What it deliberately does not do"), and
-                 the approve-base commit
+                 the approve-base commit, and the test baseline taken right after approve
 REVIEW.md        code-review phase findings, written after implementation, before archive
 handoff.json     transient: exists only while an approved change's handed-off execution is
                  unsettled (session id, approve time, last pause fingerprint, review policy).

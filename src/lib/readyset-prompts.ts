@@ -2,7 +2,7 @@ import type { BrainstormMeta } from "./readyset-brainstorm.ts";
 import { type ArtifactBudgets, DEFAULT_ARTIFACT_BUDGETS, type LaneDefault } from "./readyset-omp-config.ts";
 import type { ReviewTriggerResult } from "./readyset-review-trigger.ts";
 import { type ChangeLane, type OpenDecision, type ScopeDeviation, changePaths } from "./readyset-spec.ts";
-import type { TestRun, VerifySettings } from "./readyset-verify.ts";
+import { type TestBaseline, type TestRun, type TestVerdict, type VerifySettings, baselineFailureLine } from "./readyset-verify.ts";
 
 /** Every prompt /readyset fires (grill, explore, propose, refine, apply, review, repair, trim)
  *  and the compaction guidance for each phase boundary. Pure string builders. */
@@ -273,14 +273,14 @@ export function applyTurnPrompt(
 	// not pass readyset.verify; executeBrainstorm always passes the resolved settings.
 	verify: VerifySettings = { requireNotes: true },
 ): string {
-	if (!verify.requireNotes) return applyTurnPromptVerified(changeId, openDecisions, lane, verify.command);
+	if (!verify.requireNotes) return applyTurnPromptVerified(changeId, openDecisions, lane, verify.command, verify.baseline);
 	return applyTurnPromptWithNotes(changeId, openDecisions, lane);
 }
 
 /** The apply prompt when Readyset verifies deterministically (readyset.verify.requireNotes: false):
  *  it runs the project's test command itself at readyset_done, so the prompt asks for working code
  *  and a real check, not for a note ritual or evidence citations. */
-function applyTurnPromptVerified(changeId: string, openDecisions: OpenDecision[], lane: ChangeLane, testCommand: string | undefined): string {
+function applyTurnPromptVerified(changeId: string, openDecisions: OpenDecision[], lane: ChangeLane, testCommand: string | undefined, baseline?: TestBaseline): string {
 	const paths = changePaths("", changeId);
 	const readList = lane === "fast"
 		? `${paths.proposal} and ${paths.tasks}`
@@ -292,7 +292,10 @@ function applyTurnPromptVerified(changeId: string, openDecisions: OpenDecision[]
 			openDecisions.map((d) => `- ${d.question} — recommended: ${d.recommended ?? "(none stated)"}`).join("\n")
 		: "";
 	const doneCheck = testCommand
-		? `Readyset then runs \`${testCommand}\` itself and refuses "done" if it fails, so run it yourself first.`
+		? baseline && !baseline.passed
+			? `Readyset then runs \`${testCommand}\` itself and refuses "done" on any failure that is new. ${baselineFailureLine(baseline)}: ` +
+				"leave those failures alone unless a task is about them."
+			: `Readyset then runs \`${testCommand}\` itself and refuses "done" if it fails, so run it yourself first.`
 		: "Readyset then closes the execution.";
 	return withRepoRule(
 		`Implement the Readyset change "${changeId}". Read ${readList} first.\n\n` +
@@ -439,13 +442,16 @@ export function codeReviewTurnPrompt(
 	triggerResult?: ReviewTriggerResult,
 	changedPaths: string[] = [],
 	tests?: TestRun,
+	verdict?: TestVerdict,
 ): string {
 	const paths = changePaths("", changeId);
 	// The one deterministic fact the review starts from: Readyset ran the project's test command.
 	const testsLine = tests
-		? tests.passed
-			? `Readyset ran \`${tests.command}\` just before this review and it passed; do not re-run the whole suite just to confirm that — spend the effort on what the tests do not cover.\n\n`
-			: `Readyset ran \`${tests.command}\` just before this review and it FAILED (${tests.timedOut ? "timed out" : `exit ${tests.exitCode ?? "none"}`}). A failure caused by this change is blocking. Last output:\n\`\`\`\n${tests.tail}\n\`\`\`\n\n`
+		? verdict?.preexisting
+			? `Readyset ran \`${tests.command}\` just before this review. It still fails, but only with failures that were already there before this change was approved; do not count those against it, and do not re-run the whole suite just to confirm that.\n\n`
+				: tests.passed
+				? `Readyset ran \`${tests.command}\` just before this review and it passed; do not re-run the whole suite just to confirm that — spend the effort on what the tests do not cover.\n\n`
+				: `Readyset ran \`${tests.command}\` just before this review and it FAILED (${tests.timedOut ? "timed out" : `exit ${tests.exitCode ?? "none"}`}). A failure caused by this change is blocking. Last output:\n\`\`\`\n${tests.tail}\n\`\`\`\n\n`
 		: "";
 	// Lane-aware read list, same reasoning as applyTurnPrompt's: the fast lane never writes
 	// design.md or a spec delta, and its scenarios live under proposal.md's `## Acceptance`.
