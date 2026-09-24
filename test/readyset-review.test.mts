@@ -1578,9 +1578,77 @@ await test("session_stop verification gate: blocks while a checked task lacks a 
   const third = await sessionStop({ session_id: sessionId }, { cwd });
   assert.equal(third, undefined);
 
-  // A DIFFERENT session id gets its own budget, not the exhausted one.
+  // A DIFFERENT session in the same cwd (a subagent core omp spawned during the handed-off
+  // execution) is never gated at all -- only the session that armed the handoff is.
   const otherSession = await sessionStop({ session_id: "another-session" }, { cwd });
-  assert.equal(otherSession?.decision, "block");
+  assert.equal(otherSession, undefined, "a subagent's session_stop is not blocked for the parent's tasks.md");
+});
+
+await test("session_stop verification gate: a subagent session in the same cwd is never blocked, even with budget left", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-14-sessionstop-sub.md", {
+    title: "Session Stop Sub", status: "proposed", created: "2026-07-14", change_id: "session-stop-sub",
+  });
+  await writeProposedChange(cwd, "session-stop-sub", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const sessionId = "parent-session";
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+  fakeUiWrap.selectQueue.push("2026-07-14 · Session Stop Sub");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  const dir = join(cwd, "readyset", "changes", "session-stop-sub");
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 no note\n- [ ] 1.2 todo\n", "utf8");
+  // The subagent's id comes from its own sessionManager on the hook ctx, not the event payload.
+  assert.equal(await sessionStop({}, eventCtx(cwd, fakeUiWrap.ui, "subagent-session")), undefined, "subagent (by sessionManager) not gated");
+  assert.equal(await sessionStop({ session_id: "subagent-2" }, { cwd }), undefined, "subagent (by event session_id) not gated");
+  // The arming session still is, with its full budget.
+  const parent = await sessionStop({}, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.equal(parent?.decision, "block");
+  assert.match(parent?.reason ?? "", /1\/2/);
+});
+
+await test("session_stop verification gate: the cap is per handoff -- a new change in the same session is gated again", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-14-sessionstop-a.md", {
+    title: "Session Stop A", status: "proposed", created: "2026-07-14", change_id: "session-stop-a",
+  });
+  await writeProposedChange(cwd, "session-stop-a", ["- src/keep.ts"]);
+  await writeBrainstorm(cwd, "2026-07-15-sessionstop-b.md", {
+    title: "Session Stop B", status: "proposed", created: "2026-07-15", change_id: "session-stop-b",
+  });
+  await writeProposedChange(cwd, "session-stop-b", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd, sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const sessionId = "same-session";
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+
+  // Change A: exhaust the cap.
+  fakeUiWrap.selectQueue.push("2026-07-14 · Session Stop A");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+  const dirA = join(cwd, "readyset", "changes", "session-stop-a");
+  await writeFile(join(dirA, "tasks.md"), "- [x] 1.1 no note\n", "utf8");
+  assert.equal((await sessionStop({ session_id: sessionId }, { cwd }))?.decision, "block");
+  assert.equal((await sessionStop({ session_id: sessionId }, { cwd }))?.decision, "block");
+  assert.equal(await sessionStop({ session_id: sessionId }, { cwd }), undefined, "cap reached on A");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId)); // A settles (all ticked)
+
+  // Change B in the SAME session: the gate applies again with a fresh budget.
+  fakeUiWrap.selectQueue.push("2026-07-15 · Session Stop B");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+  const dirB = join(cwd, "readyset", "changes", "session-stop-b");
+  await writeFile(join(dirB, "tasks.md"), "- [x] 1.1 no note\n- [ ] 1.2 todo\n", "utf8");
+  const onB = await sessionStop({ session_id: sessionId }, { cwd });
+  assert.equal(onB?.decision, "block", "change B is gated even though A exhausted its cap");
+  assert.match(onB?.reason ?? "", /session-stop-b/);
+  assert.match(onB?.reason ?? "", /1\/2/);
 });
 
 await test("session_stop verification gate: a verified task, or no cwd, never blocks", async () => {

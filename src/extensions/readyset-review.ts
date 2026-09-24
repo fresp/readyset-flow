@@ -1900,25 +1900,36 @@ const MAX_TURNS_PER_RUN = 10;
  *  that never adds a `_Verified:` note must not loop forever. */
 const MAX_VERIFICATION_SENDBACKS = 2;
 
-/** Per-session count of how many times the `session_stop` verification gate has blocked THIS
- *  session, keyed by `session_id` for the same reason `sessionMatches` keys the handoff/grill
- *  session by id rather than cwd -- omp rebinds a parent-imported extension factory into subagent
- *  runtimes in the same process, so module-level state here is shared and a subagent's own
- *  session_stop must not spend (or be capped by) the parent session's budget. Never pruned: a
- *  long-running process could in principle accumulate an entry per session, but each entry is a
- *  few bytes and sessions are not created at a rate where this matters in practice. */
+/** How many times the `session_stop` verification gate has blocked, keyed by
+ *  `<session id>:<change id>`. The session half: only the arming session is ever gated (see
+ *  `sessionStopVerificationCheck`), but keying by it keeps one session's budget from being spent
+ *  by another. The change half: the cap is per handoff, not per session lifetime -- keyed by
+ *  session alone, a session that exhausted the cap on change A would never be gated again on
+ *  change B. Never pruned: each entry is a few bytes and handoffs are not created at a rate where
+ *  this matters in practice. */
 const sessionStopBlockCounts = new Map<string, number>();
 
 /**
- * Whether `session_stop`'s verification gate should block: true only while readyset_verify is
- * attached to a live handoff (`activeVerifyChangeId`, armed at approve, cleared at settle -- see
- * settleHandoff) AND that change's tasks.md has at least one checked task with no `_Verified:`
- * note. Scoped to the active handoff, not "every change under readyset/changes/", so an unrelated
- * chat session with old changes lying around is never blocked by this gate.
+ * Whether `session_stop`'s verification gate should block: true only while a handoff is armed
+ * (`pendingHandoff`, with readyset_verify attached to the same change -- `activeVerifyChangeId`,
+ * armed at approve, cleared at settle), the stopping session IS the session that armed it, AND
+ * that change's tasks.md has at least one checked task with no `_Verified:` note.
+ *
+ * Session identity matters here for the same reason `sessionMatches` exists: omp rebinds a
+ * parent-imported extension factory into subagent runtimes in the same process, so every subagent
+ * core omp spawns during the handed-off execution shares this module's state and the parent's
+ * cwd. Without the check, each of them would be blocked (up to the cap) for a tasks.md it may not
+ * even own -- N parallel subagents, up to 2N wasted turns. Falls back to cwd matching when either
+ * side has no session id (older host builds). Scoped to the active handoff, not "every change
+ * under readyset/changes/", so an unrelated chat session with old changes lying around is never
+ * blocked by this gate.
  */
-async function sessionStopVerificationCheck(cwd: string): Promise<{ changeId: string; missing: number } | undefined> {
+async function sessionStopVerificationCheck(cwd: string, sessionId: string | undefined): Promise<{ changeId: string; missing: number } | undefined> {
+	const handoff = pendingHandoff;
 	const changeId = activeVerifyChangeId;
-	if (!changeId) return undefined;
+	if (!handoff || !changeId || handoff.changeId !== changeId) return undefined;
+	const stopping = { cwd, sessionManager: sessionId === undefined ? undefined : { getSessionId: () => sessionId } };
+	if (!sessionMatches(stopping, handoff.sessionId, handoff.cwd)) return undefined;
 	const verification = await checkTaskVerification(cwd, changeId).catch(() => undefined);
 	if (!verification || verification.missing <= 0) return undefined;
 	return { changeId, missing: verification.missing };
@@ -4353,6 +4364,7 @@ export default function (pi: ExtensionAPI) {
 					isIdle?: () => boolean;
 					hasPendingMessages?: () => boolean;
 					models?: { current?: () => unknown; resolve?: (spec: string) => unknown };
+					sessionManager?: { getSessionId?: () => string };
 				},
 			) => void,
 		) => void;
@@ -4426,18 +4438,19 @@ export default function (pi: ExtensionAPI) {
 		// attached to (activeVerifyChangeId -- armed for the same handoff this file tracks) lacks a
 		// `_Verified:` note. omp itself does not cap how many times a hook may return `block` --
 		// left unbounded, a model that never adds the note would loop forever, so this file enforces
-		// its own cap (MAX_VERIFICATION_SENDBACKS) per session, keyed by session_id the same way the
-		// handoff/grill session matching above is (a subagent's session_stop must not spend the
-		// parent's budget or vice versa).
+		// its own cap (MAX_VERIFICATION_SENDBACKS) per handoff. Only the session that armed the
+		// handoff is ever gated -- a subagent's own session_stop (same process, same cwd, different
+		// session id) is let through untouched; see sessionStopVerificationCheck.
 		toolCallHost.on("session_stop", async (event, ctx) => {
 			const cwd = ctx?.cwd;
 			if (!cwd) return undefined;
-			const check = await sessionStopVerificationCheck(cwd).catch(() => undefined);
+			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? (event as { session_id?: string } | undefined)?.session_id;
+			const check = await sessionStopVerificationCheck(cwd, sessionId).catch(() => undefined);
 			if (!check) return undefined;
-			const sessionId = (event as { session_id?: string } | undefined)?.session_id ?? "unknown-session";
-			const blocked = sessionStopBlockCounts.get(sessionId) ?? 0;
+			const counterKey = `${sessionId ?? "unknown-session"}:${check.changeId}`;
+			const blocked = sessionStopBlockCounts.get(counterKey) ?? 0;
 			if (blocked >= MAX_VERIFICATION_SENDBACKS) return undefined; // cap reached: let the session stop
-			sessionStopBlockCounts.set(sessionId, blocked + 1);
+			sessionStopBlockCounts.set(counterKey, blocked + 1);
 			return {
 				decision: "block" as const,
 				reason:
