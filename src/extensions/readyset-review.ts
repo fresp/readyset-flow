@@ -979,10 +979,22 @@ interface ReviewCtx {
 			options?: { overlay?: boolean; overlayOptions?: Record<string, unknown> },
 		) => Promise<T>;
 	};
-	waitForIdle: () => Promise<void>;
+	waitForIdle?: () => Promise<void>;
 	// Both documented on the general handler ctx (see extensions.md "Handler Context
 	// Capabilities"). Optional here because real-world timing means we'd rather degrade to
 	// the old (racy) behavior than throw if a given omp build doesn't expose them.
+	//
+	// `waitForIdle` is optional for a second, sharper reason: omp has two ctx shapes and only
+	// one of them has it. The `agent_end` hook ctx is the general `ExtensionContext`
+	// (`runner.ts` `createContext()`), which exposes `isIdle`/`hasPendingMessages`/`compact`/
+	// `models` but NO `waitForIdle`; `waitForIdle` is added only by `createCommandContext()`,
+	// which spreads `createContext()` and adds it and is what a registered command handler
+	// receives. Declaring it required here is exactly what let `ctx as unknown as ReviewCtx` in
+	// the `agent_end` registration hide the mismatch from `tsc` -- the grill->propose transition
+	// then died with `TypeError: ctx.waitForIdle is not a function` inside `fireTurnAndWait`,
+	// out of sight (omp dispatches that notification detached). See `fireTurnAndWait` for the
+	// fallback and `ActiveGrillSession.waitForIdle` for why the command ctx's own function is
+	// stashed at grill-start time.
 	isIdle?: () => boolean;
 	hasPendingMessages?: () => boolean;
 	// ctx.models.current() — confirmed in extensions.md ("the live session model, read lazily
@@ -1246,20 +1258,60 @@ export async function withPinnedModel<T>(
  * calling waitForIdle() for real. If `isIdle`/`hasPendingMessages` aren't available on this
  * build's ctx, this falls back to the original (racy) immediate wait rather than hanging
  * forever on an unknown API.
+ *
+ * The wait itself is feature-detected, because `waitForIdle` only exists on the command ctx
+ * (`ExtensionCommandContext`) and NOT on the `agent_end` hook ctx (`ExtensionContext`) this also
+ * runs under during the grill->propose transition. Preference order: (1) `waitForIdle` when
+ * present -- the command path, unchanged; (2) `isIdle`/`hasPendingMessages` polled until the
+ * session is idle with nothing pending on two *consecutive* checks -- the agent_end safety net.
+ * The fallback deliberately has no deadline: a planning turn legitimately runs for minutes, and
+ * requiring two consecutive clean reads is what makes "idle" trustworthy (a single read can land
+ * in the same instant a turn has not started yet, which is the race this whole function exists to
+ * avoid). The loop exits the moment the session is genuinely settled, so it costs nothing on a
+ * fast turn. (3) Neither API: fail loudly via `ctx.ui.notify` and return -- do NOT throw, because
+ * omp dispatches the agent_end notification detached and would swallow it.
  */
 async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string): Promise<void> {
 	pi.sendUserMessage(prompt);
 
-	if (ctx.isIdle || ctx.hasPendingMessages) {
+	const sleep = (ms: number): Promise<void> =>
+		// `new Promise` rather than `Promise.withResolvers`: tsconfig targets ES2022, where
+		// `withResolvers` is not in `lib` (same reason readyset-evidence.ts uses this form).
+		new Promise((resolve) => setTimeout(resolve, ms));
+
+	const pollStarted = ctx.isIdle || ctx.hasPendingMessages;
+	if (pollStarted) {
 		const deadline = Date.now() + 5000;
 		while (Date.now() < deadline) {
 			const idle = ctx.isIdle ? ctx.isIdle() : true;
 			const pending = ctx.hasPendingMessages ? ctx.hasPendingMessages() : false;
 			if (!idle || pending) break;
-			await new Promise((resolve) => setTimeout(resolve, 100));
+			await sleep(100);
 		}
 	}
-	await ctx.waitForIdle();
+
+	if (typeof ctx.waitForIdle === "function") {
+		await ctx.waitForIdle();
+		return;
+	}
+
+	if (typeof ctx.isIdle === "function" && typeof ctx.hasPendingMessages === "function") {
+		const isIdle = ctx.isIdle;
+		const hasPendingMessages = ctx.hasPendingMessages;
+		let consecutive = 0;
+		while (consecutive < 2) {
+			await sleep(200);
+			consecutive = isIdle() && !hasPendingMessages() ? consecutive + 1 : 0;
+		}
+		return;
+	}
+
+	ctx.ui.notify(
+		"Can't tell when this turn finished: this omp build's ctx exposes neither waitForIdle() nor isIdle()/hasPendingMessages(). " +
+			"Re-run /readyset and pick the brainstorm to resume.",
+		"error",
+	);
+	return;
 }
 
 export interface BrainstormExecutionOptions {
@@ -1283,6 +1335,9 @@ export interface ActiveGrillSession {
 	writtenBrainstormFile?: string;
 	existingFiles: Set<string>;
 	execOptions: BrainstormExecutionOptions;
+	/** The command ctx's own waitForIdle, captured because the runner closure stays valid after
+	 *  the command handler returns, while the agent_end hook ctx (ExtensionContext) has none. */
+	waitForIdle?: () => Promise<void>;
 }
 
 export let activeGrillSession: ActiveGrillSession | undefined;
@@ -1331,6 +1386,7 @@ export function startGrilling(
 			preferredLanguage,
 			existingFiles: files,
 			execOptions,
+			waitForIdle: ctx.waitForIdle,
 		};
 	}
 
@@ -1374,8 +1430,30 @@ export async function findNewlyWrittenBrainstorm(cwd: string, session: ActiveGri
 }
 
 export async function handleGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
+	try {
+		await runGrillEndTransition(pi, ctx);
+	} catch (err) {
+		ctx.ui.notify(
+			`Readyset couldn't continue from grilling: ${err instanceof Error ? err.message : String(err)}. ` +
+				"Run /readyset and pick the brainstorm to resume.",
+			"error",
+		);
+		return;
+	}
+}
+
+async function runGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
 	if (!activeGrillSession?.active) return;
 	const session = activeGrillSession;
+	// The ctx this run is driven with from here on. This function fires from two places: the
+	// /readyset command handler (command ctx: has waitForIdle) and omp's agent_end hook (general
+	// ExtensionContext: no waitForIdle). `session` was captured from the command ctx at
+	// startGrilling time and carries that ctx's own waitForIdle, so spread it in when the hook
+	// ctx lacks one. The spread also keeps cwd/ui/models/mode/isIdle/hasPendingMessages from the
+	// hook ctx and replaces only the missing member; `session.waitForIdle` may itself be
+	// undefined (a direct call with a non-command ctx), in which case fireTurnAndWait's polling
+	// fallback takes over.
+	const runCtx: ReviewCtx = ctx.waitForIdle ? ctx : { ...ctx, waitForIdle: session.waitForIdle };
 	const newlyWritten = await findNewlyWrittenBrainstorm(ctx.cwd, session);
 	if (!newlyWritten) {
 		// Grilling still in progress (intermediate question round)
@@ -1428,7 +1506,7 @@ export async function handleGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx)
 			ctx.ui.notify(`Could not load brainstorm metadata for ${relativePath}`, "warning");
 			return;
 		}
-		await executeBrainstorm(pi, ctx, chosen, session.execOptions);
+		await executeBrainstorm(pi, runCtx, chosen, session.execOptions);
 	} else {
 		ctx.ui.notify(`Brainstorm saved at ${relativePath}. Run /readyset when you're ready to proceed.`, "info");
 	}
@@ -2615,6 +2693,7 @@ async function reviewAndMaybeExecute(
 			"Apply",
 			"Change approved at the Review Gate. Handing off execution to core omp.",
 		);
+
 		await recordPhase(chosen.changeId, "apply", "start", {
 			model: phaseModels.get("apply")?.model,
 			outcome: "handoff-omp",
@@ -3714,7 +3793,21 @@ export default function (pi: ExtensionAPI) {
 	// above): this file takes zero type dependency on host internals, so the hook shape is cast
 	// rather than imported.
 	const toolCallHost = pi as unknown as {
-		on?: (event: string, handler: (event: unknown, ctx: { cwd?: string; ui?: unknown; mode?: string; waitForIdle?: () => Promise<void> }) => void) => void;
+		on?: (
+			event: string,
+			handler: (
+				event: unknown,
+				ctx: {
+					cwd?: string;
+					ui?: unknown;
+					mode?: string;
+					waitForIdle?: () => Promise<void>;
+					isIdle?: () => boolean;
+					hasPendingMessages?: () => boolean;
+					models?: { current?: () => unknown; resolve?: (spec: string) => unknown };
+				},
+			) => void,
+		) => void;
 	};
 	if (typeof toolCallHost.on === "function") {
 		toolCallHost.on("tool_call", (event, ctx) => {
@@ -3735,9 +3828,28 @@ export default function (pi: ExtensionAPI) {
 		});
 		toolCallHost.on("agent_end", async (event, ctx) => {
 			const endEv = event as { willContinue?: boolean } | undefined;
+			// Terminal settles only. omp fires `agent_end` with `willContinue: true` whenever it has
+			// already scheduled an automatic continuation (auto-retry, empty/unexpected-stop retry),
+			// and documents that subscribers "must not treat this as a user-visible terminal settle"
+			// (`AgentEndEvent.willContinue`, shared-events.ts). `session_stop` is deliberately NOT used
+			// here: it is a *control* hook whose return value can schedule a hidden continuation turn,
+			// so "settled" would be ambiguous, whereas a handler returning nothing is only consulted
+			// when the session is already settling. `agent_end` fires once per genuinely settled run.
 			if (endEv?.willContinue) return;
 			if (activeGrillSession?.active) {
-				await handleGrillEndTransition(pi, ctx as unknown as ReviewCtx);
+				// Belt and braces: omp dispatches this handler detached (`void ...catch(logger.error)`
+				// in agent-session.ts), so a throw here would be invisible to the user. The inner
+				// notify in handleGrillEndTransition handles the common case; this outer one covers a
+				// failure in the notify path itself or in the guard above.
+				try {
+					await handleGrillEndTransition(pi, ctx as unknown as ReviewCtx);
+				} catch (err) {
+					(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
+						`Readyset: the grill→propose transition failed: ${err instanceof Error ? err.message : String(err)}. ` +
+							"Run /readyset and pick the brainstorm to resume.",
+						"error",
+					);
+				}
 			}
 		});
 	}

@@ -134,6 +134,7 @@ function makeFakePi(cwd: string) {
   const pendingEffects: (() => Promise<void>)[] = [];
   const setModelCalls: unknown[] = [];
   const outsideHandlers: ((event: unknown, ctx: { cwd?: string }) => void)[] = [];
+  const agentEndHandlers: ((event: unknown, ctx: unknown) => Promise<void> | void)[] = [];
   return {
     pi: {
       sendUserMessage(prompt: string, _opts: unknown) {
@@ -149,6 +150,7 @@ function makeFakePi(cwd: string) {
       // the tripwire tests can drive it; existing tests never call it, so counts stay 0.
       on(event: string, handler: (event: unknown, ctx: { cwd?: string }) => void) {
         if (event === "tool_call") outsideHandlers.push(handler);
+        if (event === "agent_end") agentEndHandlers.push(handler);
       },
       zod: fakeZod,
       async setModel(spec: unknown) {
@@ -162,6 +164,7 @@ function makeFakePi(cwd: string) {
     calls,
     setModelCalls,
     outsideHandlers,
+    agentEndHandlers,
     queueEffect(fn: () => Promise<void>) {
       pendingEffects.push(fn);
     },
@@ -296,6 +299,34 @@ async function loadHandlerAndAskTool(fakePi: { sendUserMessage: (prompt: string,
   return { handler: capturedHandler.handler, askExecute: capturedAsk.execute as any };
 }
 
+// Loads one fresh module instance and captures BOTH the command handler and the pi.on("agent_end")
+// handler from the same instance, so the module-level activeGrillSession set by startGrilling is
+// the one the agent_end handler sees.
+async function loadHandlerAndAgentEnd(fakePi: { sendUserMessage: (prompt: string, opts: unknown) => void }): Promise<{
+  handler: (args: string, ctx: unknown) => Promise<void>;
+  agentEnd: (event: unknown, ctx: unknown) => Promise<void>;
+}> {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    default: (pi: unknown) => void;
+  };
+  let capturedHandler: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  let capturedAgentEnd: ((event: unknown, ctx: unknown) => Promise<void> | void) | undefined;
+  mod.default({
+    ...fakePi,
+    registerCommand(_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      capturedHandler = def;
+    },
+    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
+      if (event === "agent_end") capturedAgentEnd = handler;
+    },
+    registerTool(_def: unknown) {},
+    zod: fakeZod,
+  } as any);
+  if (!capturedHandler) throw new Error("registerCommand was never called");
+  if (!capturedAgentEnd) throw new Error("the agent_end handler was never registered");
+  return { handler: capturedHandler.handler, agentEnd: async (event, ctx) => void (await capturedAgentEnd!(event, ctx)) };
+}
+
 await test("full happy path: open -> explore -> propose -> approve & execute -> code review -> archive", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-01-my-feature.md", {
@@ -379,6 +410,181 @@ await test("full happy path: open -> explore -> propose -> approve & execute -> 
     assert.match(archived, /## Apply —/);
     assert.match(archived, /## Code review —/);
   }
+});
+
+// --- grill -> propose transition from the agent_end hook -----------------------------------------
+//
+// The grill -> propose transition runs from omp's `agent_end` hook, whose ctx is the general
+// `ExtensionContext` -- it has isIdle/hasPendingMessages but NO waitForIdle (that only exists on
+// `ExtensionCommandContext`, i.e. the /readyset command handler's ctx). These tests drive the
+// captured agent_end handler with exactly such a ctx.
+
+// Shared setup for the four transition tests: an idea that is already on disk (so a real
+// grilling conversation would have already produced it), and a command-style ctx whose waitForIdle
+// drains the queued turn effects (mirroring the fake pi's fire-and-forget send -> waitForIdle
+// contract).
+//
+// Note on filenames: `startGrilling` snapshots `.ai/brainstorms/*.md` into `existingFiles`, and
+// `findNewlyWrittenBrainstorm` only reports a file that is NOT in that snapshot. The command
+// handler's own grill turn fires *before* the pre-seeded file exists, and the queued grill effect
+// writes it -- that is the sequence `--idea` produces in a real session.
+async function queueTransitionTurns(
+  fakePiWrap: ReturnType<typeof makeFakePi>,
+  cwd: string,
+  dir: string,
+  proposeExtra?: (dir: string) => Promise<void>,
+) {
+  // The grill turn itself: writes the brainstorm the transition is waiting for.
+  fakePiWrap.queueEffect(async () => {
+    await writeBrainstorm(cwd, "2026-01-01-idea.md", {
+      title: "Idea",
+      status: "open",
+      created: "2026-01-01",
+    }, VALID_BRAINSTORM_BODY);
+  });
+  // Explore turn: writes EXPLORATION.md.
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\nChecked docker-compose.yml, nothing relevant.\n", "utf8");
+  });
+  // Propose turn: writes valid artifacts (plus anything the test wants to leak).
+  fakePiWrap.queueEffect(async () => {
+    await mkdir(join(dir, "specs", "my-cap"), { recursive: true });
+    await writeFile(join(dir, "proposal.md"), "## Why\n\nx\n\n## What Changes\n\n- x\n", "utf8");
+    await writeFile(join(dir, "design.md"), "## Context\n\nx\n", "utf8");
+    await writeFile(
+      join(dir, "specs", "my-cap", "spec.md"),
+      "## Purpose\n\nx\n\n### Requirement: Foo\n\n#### Scenario: bar\n\n- **WHEN** a\n- **THEN** b\n",
+      "utf8",
+    );
+    await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 do thing\n", "utf8");
+    if (proposeExtra) await proposeExtra(dir);
+  });
+}
+
+await test("grill→propose transition from an agent_end ctx without waitForIdle reaches the review gate", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  // 1st select: the transition picker. 2nd: the review gate.
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir);
+
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+  await handler("--idea Add a health endpoint", ctx);
+  assert.equal(fakePiWrap.calls.length, 1, "the command handler fires the grill turn");
+  // startGrilling fires the grill turn with a bare pi.sendUserMessage (it is a chat turn the
+  // user answers, not a fired-and-awaited one), so nothing drains the queue for us -- do it the
+  // way omp would: the turn runs, then agent_end arrives.
+  await fakePiWrap.waitForIdle();
+
+  await agentEnd(
+    { willContinue: false },
+    { cwd, ui: fakeUiWrap.ui, isIdle: () => false, hasPendingMessages: () => false },
+  );
+
+  assert.equal(fakePiWrap.calls.length, 3, "grill + explore + propose all fired");
+  assert.ok(
+    fakeUiWrap.selectPrompts.some((p) => /^Review change "idea"/.test(p)),
+    "the review gate was reached after the transition",
+  );
+  assert.ok(
+    !fakeUiWrap.notifications.some((n) => n.level === "error"),
+    "no error notification expected, got: " + JSON.stringify(fakeUiWrap.notifications.filter((n) => n.level === "error")),
+  );
+});
+
+await test("grill→propose transition with neither waitForIdle nor isIdle notifies an error and does not throw", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir);
+
+  // The command ctx itself omits waitForIdle too, so the captured session.waitForIdle is
+  // undefined and fireTurnAndWait has no way to know when the turn finished.
+  await handler("--idea Add a health endpoint", { cwd, ui: fakeUiWrap.ui });
+  await fakePiWrap.waitForIdle();
+
+  await agentEnd({ willContinue: false }, { cwd, ui: fakeUiWrap.ui });
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Can't tell when this turn finished/.test(n.message) && n.level === "error"),
+    "expected the fail-loudly notification, got: " + JSON.stringify(fakeUiWrap.notifications),
+  );
+  assert.ok(
+    !fakeUiWrap.selectPrompts.some((p) => /^Review change/.test(p)),
+    "no gate may be offered when the run could not tell that its turn finished",
+  );
+});
+
+await test("grill→propose transition with an event ctx that has waitForIdle still works (regression)", async () => {
+  const cwd = await freshRepo();
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir);
+
+  await handler("--idea Add a health endpoint", { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle });
+  await fakePiWrap.waitForIdle();
+  await agentEnd(
+    { willContinue: false },
+    { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle, isIdle: () => false, hasPendingMessages: () => false },
+  );
+
+  assert.equal(fakePiWrap.calls.length, 3);
+  assert.ok(fakeUiWrap.selectPrompts.some((p) => /^Review change "idea"/.test(p)));
+  assert.ok(!fakeUiWrap.notifications.some((n) => n.level === "error"));
+});
+
+await test("a planning turn that writes outside the change dir during the transition path trips the propose-boundary invariant", async () => {
+  const cwd = await freshRepo();
+  await execFileSync("git", ["init", "-q"], { cwd });
+  await execFileSync("git", ["config", "user.email", "t@t.t"], { cwd });
+  await execFileSync("git", ["config", "user.name", "t"], { cwd });
+  await writeFile(join(cwd, "seed.txt"), "seed\n", "utf8");
+  await execFileSync("git", ["add", "-A"], { cwd });
+  await execFileSync("git", ["commit", "-qm", "base"], { cwd });
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("Continue to Explore & Propose (Recommended)");
+
+  const dir = join(cwd, "readyset", "changes", "idea");
+  await queueTransitionTurns(fakePiWrap, cwd, dir, async () => {
+    await mkdir(join(cwd, "src"), { recursive: true });
+    await writeFile(join(cwd, "src", "leak.ts"), "export const leak = 1;\n", "utf8");
+  });
+
+  await handler("--idea Add a health endpoint", { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle });
+  await fakePiWrap.waitForIdle();
+  await agentEnd({ willContinue: false }, { cwd, ui: fakeUiWrap.ui, isIdle: () => false, hasPendingMessages: () => false });
+
+  assert.ok(
+    !fakeUiWrap.selectPrompts.some((p) => /^Review change/.test(p)),
+    "no gate may be offered once the planning turn wrote outside its boundary",
+  );
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /changed files outside the change directory/.test(n.message) && n.level === "error"),
+    "expected the boundary error, got: " + JSON.stringify(fakeUiWrap.notifications),
+  );
+  const context = await readContext(cwd, "idea");
+  assert.match(context ?? "", /STOPPED — planning turn wrote outside its boundary/);
 });
 
 await test("fast lane: --lane fast skips the Explore turn, tightens Propose, and narrows review", async () => {
