@@ -1067,6 +1067,188 @@ await test("--model pins a model for the run's turns and restores the original m
   assert.ok(fakeUiWrap.notifications.some((n) => /Pinned model "anthropic\/claude-opus-5"/.test(n.message)));
 });
 
+// --- handed-off execution model (--model / --phase-model apply) -------------------------------
+
+// A change already at the gate, with the fake pi + fake ui wired exactly like the existing pin
+// tests: `ctx.models.current()` is the session's pre-run model and `resolve` maps a spec to the
+// value the fake `pi.setModel` records.
+async function gateCtx(cwd: string, extraCtx: Record<string, unknown> = {}) {
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+    ...extraCtx,
+  };
+  return { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx };
+}
+
+// The ctx omp hands the agent_end hook: no waitForIdle (that is the whole point of Bug 1), and no
+// models either -- the restore goes through pi.setModel, not ctx.models.
+function eventCtx(cwd: string, ui: unknown) {
+  return { cwd, ui };
+}
+
+await test("handoff model: --model X pins at the gate, no restore before the handler returns, restore(original) after a terminal agent_end", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-01-handoff-pin.md", {
+    title: "Handoff Pin",
+    status: "proposed",
+    created: "2026-07-01",
+    change_id: "handoff-pin",
+  });
+  await writeProposedChange(cwd, "handoff-pin", ["- src/keep.ts"]);
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-01 · Handoff Pin");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+
+  await handler("--model pinned-model", ctx);
+
+  // The pin is applied by withPinnedModel and then again by the approve branch (the execution model
+  // is the same pin -- setModel is called with the same resolved value, matching withPhaseModel).
+  // What matters is that NO restore ran: no session-default-model call before the handler returned.
+  assert.deepEqual(
+    fakePiWrap.setModelCalls,
+    ["resolved:pinned-model", "resolved:pinned-model"],
+    "the pin applies twice (run pin + execution model), and withPinnedModel must not restore while the handoff is pending",
+  );
+  assert.ok(
+    !fakePiWrap.setModelCalls.includes("session-default-model"),
+    "no restore before the execution turn settles",
+  );
+  assert.ok(fakeUiWrap.notifications.some((n) => /Pinned model "pinned-model"/.test(n.message)));
+  assert.ok(fakeUiWrap.notifications.some((n) => /Execution runs on "pinned-model" \(from --model flag\)/.test(n.message)));
+  assert.equal(fakePiWrap.calls.length, 1, "the execution prompt was handed off");
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "handoff-pin"/);
+
+  // A non-terminal settle (willContinue: true) must not restore.
+  await agentEnd({ willContinue: true }, eventCtx(cwd, fakeUiWrap.ui));
+  assert.ok(
+    !fakePiWrap.setModelCalls.includes("session-default-model"),
+    "a willContinue settle is not a terminal settle -- no restore",
+  );
+
+  // The terminal settle restores the pre-run model and records the balancing apply end event.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the pre-run model is restored after the execution settles");
+  assert.ok(fakeUiWrap.notifications.some((n) => /Execution settled/.test(n.message)));
+
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-pin");
+  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
+  assert.ok(applyEnd, "a balancing apply end event exists");
+  assert.equal(applyEnd.outcome, "handoff-settled");
+  assert.equal(applyEnd.model, "pinned-model", "the apply end event carries the model execution ran on");
+});
+
+await test("handoff model: --phase-model apply=Y sets Y before the handoff and restores the original after settle", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-02-handoff-phase.md", {
+    title: "Handoff Phase",
+    status: "proposed",
+    created: "2026-07-02",
+    change_id: "handoff-phase",
+  });
+  await writeProposedChange(cwd, "handoff-phase", ["- src/keep.ts"]);
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-02 · Handoff Phase");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+
+  await handler("--phase-model apply=apply-model --model run-pin-model", ctx);
+
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "resolved:apply-model", "the apply phase override wins over the run pin");
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Execution runs on "apply-model" \(from --phase-model flag\)/.test(n.message)),
+  );
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model");
+
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-phase");
+  const applyEnd = events.find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-settled");
+  assert.equal(applyEnd?.model, "apply-model");
+});
+
+await test("handoff model: Discard restores the model immediately (unchanged behavior)", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-03-handoff-discard.md", {
+    title: "Handoff Discard",
+    status: "proposed",
+    created: "2026-07-03",
+    change_id: "handoff-discard",
+  });
+  await writeProposedChange(cwd, "handoff-discard", ["- src/keep.ts"]);
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-03 · Handoff Discard");
+  fakeUiWrap.selectQueue.push("Discard");
+
+  await handler("--model pinned-model", ctx);
+
+  // No handoff was set, so withPinnedModel's finally restored straight away.
+  assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:pinned-model", "session-default-model"]);
+  assert.equal(fakePiWrap.calls.length, 0, "no execution turn fires on discard");
+
+  // A later terminal agent_end must add nothing: no pending handoff, no apply end event.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  assert.deepEqual(fakePiWrap.setModelCalls, ["resolved:pinned-model", "session-default-model"]);
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-discard");
+  assert.ok(!events.some((e) => e.phase === "apply" && e.edge === "end"), "no handoff-settled apply end event for a discarded run");
+});
+
+await test("handoff model: a failed apply-model pins falls back to the run pin, and the restore failure warns", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-04-handoff-noapply.md", {
+    title: "Handoff No Apply",
+    status: "proposed",
+    created: "2026-07-04",
+    change_id: "handoff-noapply",
+  });
+  await writeProposedChange(cwd, "handoff-noapply", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  // The apply override can't be applied (no API key) -- it must warn and execution must continue.
+  // The post-settle restore rejects, which must also warn rather than throw.
+  fakePiWrap.pi.setModel = async (spec: unknown) => {
+    fakePiWrap.setModelCalls.push(spec);
+    if (spec === "session-default-model") throw new Error("model registry unavailable");
+    return spec !== "resolved:apply-model";
+  };
+  const { handler, agentEnd } = await loadHandlerAndAgentEnd(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  fakeUiWrap.selectQueue.push("2026-07-04 · Handoff No Apply");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  const ctx = {
+    cwd,
+    ui: fakeUiWrap.ui,
+    waitForIdle: fakePiWrap.waitForIdle,
+    models: { current: () => "session-default-model", resolve: (spec: string) => `resolved:${spec}` },
+  };
+
+  await handler("--phase-model apply=apply-model --model run-pin-model", ctx);
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Execution model "apply-model" .*couldn't be applied/.test(n.message) && n.level === "warning"),
+    "the failed apply override warns and execution continues: " + JSON.stringify(fakeUiWrap.notifications),
+  );
+  assert.equal(fakePiWrap.calls.length, 1, "the execution prompt is still handed off");
+  assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "handoff-noapply"/);
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Couldn't restore the model this session had before the \/readyset run/.test(n.message) && n.level === "warning"),
+    "the failed restore warns: " + JSON.stringify(fakeUiWrap.notifications),
+  );
+  const applyEnd = (await phaseEventsArchivedOrLive(cwd, "handoff-noapply")).find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-settled");
+  assert.equal(applyEnd?.model, "apply-model", "the apply end event records what the apply start recorded");
+});
+
 await test("setModel is called bound to pi, not detached -- a real terminal run hit 'this.runtime' undefined from a bare extracted reference", async () => {
   // The other model-pinning tests' fake `setModel` is a plain shorthand method that ignores
   // `this` entirely, so it would pass whether or not withPinnedModel keeps setModel bound to

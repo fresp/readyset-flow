@@ -296,6 +296,18 @@ Covers `grill|explore|propose|apply|review`; **Refine rides the propose override
 re-proposes. An override that fails to resolve or pin warns and falls back to the run model — a
 phase model is a cost optimization, never a reason to stop the run.
 
+The **apply** override does one thing the others don't: it decides the model the *handed-off
+execution* runs on. On Approve & Execute the execution model is, in order:
+
+1. the apply phase override (`--phase-model apply=<spec>` / `readyset.model.phases.apply`),
+2. else the run pin (`--model` / `readyset.model.default`),
+3. else the session's current model, untouched.
+
+That model stays active for the whole handed-off execution turn, and the model the session had
+before `/readyset` is restored on the first **terminal** `agent_end` for that execution. An
+automatic continuation (`willContinue`, e.g. an auto-retry) is not a terminal settle, so it does
+not trigger the restore. Readyset notifies which model execution runs on and where it came from.
+
 The `configure` wizard does **not** cover phase models (it stays limited to language, default
 model, and fallback chain) — `readyset.model.phases` is hand-edited YAML.
 
@@ -493,7 +505,11 @@ Picks a brainstorm, then depending on its status:
 - **Approve & Execute** hands off implementation of the change directly to core omp's native runtime.
   Readyset marks the change approved, logs the handoff in `CONTEXT.md` and phase events (`outcome: "handoff-omp"`),
   clears editor and widget state, sends the execution prompt (`applyTurnPrompt`) to omp via `pi.sendUserMessage`,
-  and exits immediately. Core omp executes the tasks natively, with full support for subagents, parallel tool
+  and exits immediately. Before that send it applies the execution model (apply phase override → run pin, see
+  [Per-phase models](#per-phase-models)), keeps the session's pre-`/readyset` model pinned back until the handed-off
+  execution settles, then restores it and records the balancing `apply` `end` phase event
+  (`outcome: "handoff-settled"`, carrying the model execution actually ran on).
+  Core omp executes the tasks natively, with full support for subagents, parallel tool
   calls, and real-time task checklist updates.
 - **On-demand Code Review & Archiving**. After omp finishes implementing the tasks, run
   `/readyset --review <change-id>` on demand. Readyset evaluates risk triggers against working tree changes,

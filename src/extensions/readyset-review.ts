@@ -1056,6 +1056,23 @@ interface ReviewCtx {
  * in config, or is a single `--fallback-model` flag value), not each entry individually.
  */
 /**
+ * The host's `pi.setModel`, bound to `pi`, or `undefined` when this omp build doesn't expose it.
+ *
+ * Bound, not merely extracted: a bare `pi.setModel` reference loses its `this` when called
+ * detached (`const f = obj.method; f()`), which a real terminal run (2026-09-18) hit as
+ * "undefined is not an object (evaluating 'this.runtime')" on every call — the real
+ * implementation reads state off `this` internally. `.bind(pi)` keeps the existence check
+ * working (bind on undefined would throw, so the optional chain still yields `undefined`) while
+ * fixing every call site at once. The cast is read once here instead of at each call site.
+ */
+function resolveHostSetModel(pi: ExtensionAPI): ((spec: unknown) => unknown) | undefined {
+	// pi is the public ExtensionAPI; setModel exists on it per extensions.md but is not in this
+	// build's published type surface, so the shape is asserted once, here, at the boundary.
+	const host = pi as unknown as { setModel?: (spec: unknown) => unknown };
+	return host.setModel?.bind(pi);
+}
+
+/**
  * Runs `fn` with a phase-specific model override for one labeled phase. The run's pinned model
  * is captured from ctx.models.current() and restored afterward, so an override only affects the
  * turns fired inside `fn`. An override that fails to pin warns and runs the phase on the pinned
@@ -1079,7 +1096,7 @@ export async function withPhaseModel<T>(
 	const override = overrides.get(phase);
 	if (!override) return fn();
 
-	const setModel = (pi as unknown as { setModel?: (spec: unknown) => unknown }).setModel?.bind(pi);
+	const setModel = resolveHostSetModel(pi);
 	const models = ctx.models;
 	if (!setModel || !models?.current) {
 		ctx.ui.notify(
@@ -1133,14 +1150,7 @@ export async function withPinnedModel<T>(
 ): Promise<T> {
 	if (!modelSpec) return fn();
 
-	// Bound to `pi`, not just extracted — a bare `pi.setModel` reference loses its `this` when
-	// called detached (`const f = obj.method; f()`), which is exactly what a real terminal run
-	// (2026-09-18) hit: "undefined is not an object (evaluating 'this.runtime')" on every call,
-	// pin and fallback and restore alike, because the real setModel implementation reads state
-	// off `this` internally. `.bind(pi)` keeps the existence check below working unchanged
-	// (bind on undefined would throw, so the optional chain still yields `undefined` when
-	// `pi.setModel` isn't there) while fixing every call site without touching them.
-	const setModel = (pi as unknown as { setModel?: (spec: unknown) => unknown }).setModel?.bind(pi);
+	const setModel = resolveHostSetModel(pi);
 	const models = ctx.models;
 	if (!setModel || !models?.current) {
 		ctx.ui.notify(
@@ -1174,6 +1184,7 @@ export async function withPinnedModel<T>(
 	};
 
 	const original = models.current();
+	handoffRestoreTarget = original;
 	let activeSpec = modelSpec;
 	let activeSource = source;
 
@@ -1224,13 +1235,21 @@ export async function withPinnedModel<T>(
 	try {
 		return await fn();
 	} finally {
-		try {
-			await setModel(original);
-		} catch {
-			ctx.ui.notify(
-				`Couldn't restore the model this session had before pinning "${activeSpec}" — check /model if it looks off.`,
-				"warning",
-			);
+		// The approve branch of the gate sets `pendingHandoff` before it fires the execution turn
+		// and returns. Execution is handed to core omp fire-and-forget, so restoring here would
+		// land exactly as the execution turn starts, making it run on the pre-run model instead of
+		// the pinned/apply-phase one. The restore moves to the first terminal agent_end for this
+		// cwd (the agent_end hook -> handlePendingHandoff).
+		const handedOff = pendingHandoff !== undefined && pendingHandoff.cwd === ctx.cwd;
+		if (!handedOff) {
+			try {
+				await setModel(original);
+			} catch {
+				ctx.ui.notify(
+					`Couldn't restore the model this session had before pinning "${activeSpec}" — check /model if it looks off.`,
+					"warning",
+				);
+			}
 		}
 	}
 }
@@ -1344,6 +1363,35 @@ export let activeGrillSession: ActiveGrillSession | undefined;
 
 export function resetActiveGrillSession(): void {
 	activeGrillSession = undefined;
+}
+
+/**
+ * A pending execution handoff: the approve branch fires the apply turn fire-and-forget and
+ * returns, so the run's model pin (withPinnedModel) must NOT be restored in its `finally` —
+ * execution has to run on the pinned/apply model for its whole handed-off turn.
+ * `restoreTo` is the model the session had before the run pinned anything (opaque, from
+ * ctx.models.current(); `undefined` when nothing was ever pinned, in which case there is
+ * nothing to restore).
+ *
+ * Single-session limitation: this is module-level process state, like `activeGrillSession`, so a
+ * second /readyset run started in the same process before the first handoff settles would
+ * overwrite it. Only the approve path sets it, and it is cleared on the first terminal agent_end
+ * for the same cwd.
+ */
+export let pendingHandoff: { changeId: string; restoreTo: unknown; cwd: string } | undefined;
+
+/**
+ * The model the current run's `withPinnedModel` captured before it pinned anything. Only
+ * `withPinnedModel` can observe this value, so the approve branch (which runs inside its `fn`)
+ * reads it through here rather than calling `ctx.models.current()` again — that call would return
+ * the already-pinned model, not the original. Left untouched (undefined) when no pin was
+ * configured, which is exactly what `pendingHandoff.restoreTo` should be in that case.
+ */
+export let handoffRestoreTarget: unknown;
+
+export function resetPendingHandoff(): void {
+	pendingHandoff = undefined;
+	handoffRestoreTarget = undefined;
 }
 
 /**
@@ -1510,6 +1558,64 @@ async function runGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<
 	} else {
 		ctx.ui.notify(`Brainstorm saved at ${relativePath}. Run /readyset when you're ready to proceed.`, "info");
 	}
+}
+
+/**
+ * Reads this change's `apply` `start` phase event and returns the model it recorded, or
+ * `undefined` when there is none (an unpinned run, or events that predate the field). That is the
+ * honest value to carry onto the balancing `apply` `end` event — never a fabricated one.
+ */
+async function executionModelOf(cwd: string, changeId: string): Promise<string | undefined> {
+	const events = await readPhaseEvents(cwd, changeId);
+	return events.find((e) => e.phase === "apply" && e.edge === "start")?.model;
+}
+
+/**
+ * Settles a pending execution handoff: records the balancing `apply` `end` phase event and
+ * restores the model the session had before the run pinned anything.
+ *
+ * Runs from the `agent_end` hook, and only on a terminal settle — see the handler's comment for
+ * why `agent_end` (`willContinue !== true`) and not `session_stop`. The hook ctx is the general
+ * `ExtensionContext`, which is all this needs: cwd, ui, and (for the restore) `pi.setModel`.
+ *
+ * The handoff state is cleared first, so a throw later cannot leave a stale handoff armed forever
+ * and re-firing on every subsequent agent_end.
+ */
+export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
+	const handoff = pendingHandoff;
+	if (!handoff) return;
+	if (handoff.cwd !== ctx.cwd) return; // a different session's settle: leave it
+	pendingHandoff = undefined;
+	const restoreTarget = handoff.restoreTo ?? handoffRestoreTarget;
+	handoffRestoreTarget = undefined;
+
+	// Record the boundary BEFORE restoring, so the event carries the model execution actually ran
+	// on rather than the restored one. appendPhaseEvent never throws by design (its callers all
+	// swallow), and this one is wrapped the same way.
+	await appendPhaseEvent(ctx.cwd, handoff.changeId, {
+		phase: "apply",
+		edge: "end",
+		at: new Date().toISOString(),
+		lane: (await readChangeLane(ctx.cwd, handoff.changeId)) ?? "full",
+		laneSource: "brainstorm",
+		model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
+		outcome: "handoff-settled",
+	}).catch(() => {});
+
+	if (restoreTarget === undefined) return; // nothing was ever pinned; nothing to restore
+
+	const setModel = resolveHostSetModel(pi);
+	if (!setModel) {
+		ctx.ui.notify("Couldn't restore the model this session had before the /readyset run — check /model if it looks off.", "warning");
+		return;
+	}
+	try {
+		await setModel(restoreTarget);
+	} catch {
+		ctx.ui.notify("Couldn't restore the model this session had before the /readyset run — check /model if it looks off.", "warning");
+		return;
+	}
+	ctx.ui.notify("Execution settled — restored the model this session had before the run.", "info");
 }
 
 const MAX_TURNS_PER_RUN = 10;
@@ -2526,6 +2632,11 @@ async function reviewAndMaybeExecute(
 	reviewThresholds: ParsedReviewThresholds = { ...DEFAULT_REVIEW_THRESHOLDS, warning: undefined },
 	protectedPaths: string[] = [],
 	testPaths: string[] = [],
+	// The run's pinned model (--model / readyset.model.default) and its source label. Carried
+	// explicitly because the pin lives in `executeBrainstorm`'s closure, not in `phaseModels`, and
+	// the approve branch needs it to work out which model the handed-off execution runs on.
+	pinnedModel: string | undefined = undefined,
+	pinnedModelSource: string = "",
 ): Promise<void> {
 	let chosen = initial;
 
@@ -2694,10 +2805,67 @@ async function reviewAndMaybeExecute(
 			"Change approved at the Review Gate. Handing off execution to core omp.",
 		);
 
+		// Precedence mirrors withPhaseModel: the apply phase override wins, else the run's pin, else
+		// the session model untouched. This deliberately does NOT call withPhaseModel — that would
+		// restore in its own `finally`, which is the bug this whole path exists to avoid.
+		const applyOverride = phaseModels.get("apply");
+		const executionSpec = applyOverride?.model ?? pinnedModel;
+		const executionSource = applyOverride ? applyOverride.source : pinnedModelSource;
+
 		await recordPhase(chosen.changeId, "apply", "start", {
-			model: phaseModels.get("apply")?.model,
+			model: executionSpec,
 			outcome: "handoff-omp",
 		});
+
+		// The execution handoff is fire-and-forget: `pi.sendUserMessage` starts the turn and this
+		// branch returns immediately, so withPinnedModel's `finally` would restore the pre-run model
+		// exactly as execution begins. Apply the execution model here and record the handoff so
+		// withPinnedModel leaves the pin alone (see its `finally`) until the execution settles.
+		const setModel = resolveHostSetModel(pi);
+		const models = ctx.models;
+		let executionModelApplied = false;
+		if (!executionSpec) {
+			// Nothing pinned or overridden: leave the session model alone.
+		} else if (!setModel || !models?.current) {
+			ctx.ui.notify(
+				`Execution model "${executionSpec}" (from ${executionSource}) can't be applied — this omp build doesn't expose ` +
+					"pi.setModel/ctx.models.current. Running on the current model.",
+				"warning",
+			);
+		} else {
+			const resolved = models.resolve ? models.resolve(executionSpec) : executionSpec;
+			if (resolved === undefined || resolved === null) {
+				ctx.ui.notify(
+					`Execution model "${executionSpec}" (from ${executionSource}) didn't resolve to any available model — ` +
+						"running on the current model.",
+					"warning",
+				);
+			} else {
+				try {
+					executionModelApplied = (await setModel(resolved)) !== false;
+				} catch {
+					executionModelApplied = false;
+				}
+				if (!executionModelApplied) {
+					ctx.ui.notify(
+						`Execution model "${executionSpec}" (from ${executionSource}) couldn't be applied (usually: no API key) — ` +
+							"running on the current model.",
+						"warning",
+					);
+				} else {
+					ctx.ui.notify(`Execution runs on "${executionSpec}" (from ${executionSource}).`, "info");
+				}
+			}
+		}
+		if (!executionSpec) {
+			ctx.ui.notify("Execution runs on this session's current model (no --model pin and no apply phase model).", "info");
+		}
+
+		// Armed before the send below, so withPinnedModel's `finally` (which runs during the
+		// `return` right after) observes it and skips its restore. `handoffRestoreTarget` is what
+		// withPinnedModel captured as the pre-pin model; it is undefined when no pin was configured,
+		// in which case handlePendingHandoff has nothing to restore and short-circuits.
+		pendingHandoff = { changeId: chosen.changeId, restoreTo: handoffRestoreTarget, cwd: ctx.cwd };
 
 		if (typeof ctx.ui.setEditorText === "function") {
 			ctx.ui.setEditorText("");
@@ -3541,7 +3709,7 @@ export async function executeBrainstorm(
 			// Defensive: a change that predates the baseline mechanism has no capture
 			// yet. This never overwrites an existing baseline (first capture wins).
 			await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-			await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
+			await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths, pinnedModel, pinnedModelSource);
 			return;
 		}
 
@@ -3782,7 +3950,7 @@ export async function executeBrainstorm(
 			return;
 		}
 
-		await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths);
+		await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths, pinnedModel, pinnedModelSource);
 	});
 }
 
@@ -3836,6 +4004,20 @@ export default function (pi: ExtensionAPI) {
 			// so "settled" would be ambiguous, whereas a handler returning nothing is only consulted
 			// when the session is already settling. `agent_end` fires once per genuinely settled run.
 			if (endEv?.willContinue) return;
+			// A settled execution handoff is handled first, before the grill block, so it still runs
+			// when activeGrillSession is unset (the usual case: approve fires long after grilling).
+			// Await it: this handler is already async and omp awaits the returned promise, so the
+			// restore has completed by the time the notification dispatch finishes. The try/catch
+			// keeps a failure from taking down the grill-transition block below.
+			try {
+				await handlePendingHandoff(pi, ctx as unknown as ReviewCtx);
+			} catch (err) {
+				(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
+					`Readyset: restoring the model after the handed-off execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
+						"Check /model if it looks off.",
+					"warning",
+				);
+			}
 			if (activeGrillSession?.active) {
 				// Belt and braces: omp dispatches this handler detached (`void ...catch(logger.error)`
 				// in agent-session.ts), so a throw here would be invisible to the user. The inner
@@ -3872,6 +4054,9 @@ export default function (pi: ExtensionAPI) {
 			// separate init step or CLI to run first.
 			await ensureReadysetRoot(ctx.cwd);
 			resetOutsideRepoWatch(ctx.cwd);
+			// A handoff whose execution turn never settled (user aborted the process, or a different
+			// session's settle was never observed) must not linger and hijack this run's restore.
+			resetPendingHandoff();
 
 			// Risk-based code-review policy, resolved once for the run. `--review
 			// auto|always|never` (flag) wins over readyset.review.mode (config); the trigger
