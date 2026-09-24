@@ -4196,17 +4196,76 @@ await test("T4: an exhausted budget skips the repair and still reaches the gate"
     "the run still reached the review gate",
   );
   assert.equal(fakePiWrap.calls.length, 10, "10 model turns fired total (6 Refine + 4 repair), never more than the budget");
-  // New semantics (turn reserves): the repair only fires when 2 turns would still remain for
-  // Apply + Review, so it stops firing at spent=9 (10-9=1, not > 2) and records skipped-budget
-  // instead — the reserve keeps Apply/Review from being starved. The loop itself halts when the
-  // 10-turn budget is fully spent.
+  // Turn reserve (AUTO_TURN_RESERVE = 1): an automatic repair never takes the last turn, which
+  // stays free for a user Refine. Refine 5 lands at spent=9 (10-9=1, not > 1), so from there the
+  // repair records skipped-budget instead. The loop itself halts when the 10-turn budget is spent.
   const skipped = repairEnds.filter((e) => e.outcome === "skipped-budget");
   assert.equal(skipped.length, 2, "the last two gate iterations reserved turns and skipped the repair");
   assert.equal(repairEnds.length, 6, "four repair turns ran, then two skipped-budget events");
   assert.ok(
-    fakeUiWrap.notifications.some((n) => /starve Apply\/Review/.test(n.message) && n.level === "warning"),
-    "the reserve notify names Apply/Review retention",
+    fakeUiWrap.notifications.some((n) => /leave no turn for a Refine/.test(n.message) && n.level === "warning"),
+    "the reserve notify says the last turn is kept for a Refine",
   );
+});
+
+await test("phase budget: an Explore/Propose turn past readyset.phaseBudget.minutes is aborted and recorded", async () => {
+  const cwd = await freshRepo();
+  await writeConfig("readyset:\n  phaseBudget:\n    minutes: 0.001\n"); // 60ms
+  try {
+    await writeBrainstorm(cwd, "2026-07-28-slow.md", { title: "Slow", status: "open", created: "2026-07-28" }, VALID_BRAINSTORM_BODY);
+    const dir = join(cwd, "readyset", "changes", "slow");
+    const fakePiWrap = makeFakePi(cwd);
+    fakePiWrap.queueEffect(async () => {
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "EXPLORATION.md"), "## Findings\n\npartial\n", "utf8");
+    });
+    fakePiWrap.queueEffect(async () => {});
+    const handler = await loadHandler(fakePiWrap.pi);
+    const ui = makeFakeUi();
+    ui.selectQueue.push("2026-07-28 · Slow");
+    let aborts = 0;
+    const ctx = {
+      cwd, ui: ui.ui,
+      // Each turn takes 250ms, well past the 60ms ceiling.
+      waitForIdle: async () => { await new Promise((r) => setTimeout(r, 250)); await fakePiWrap.waitForIdle(); },
+      abort: () => { aborts++; },
+    };
+    await handler("", ctx);
+
+    assert.equal(aborts, 2, "both Explore and Propose were aborted at the ceiling");
+    assert.ok(ui.notifications.some((n) => /Explore ran past its <1-minute phase budget — aborting the turn/.test(n.message)));
+    const events = await readPhaseEvents(cwd, "slow");
+    assert.equal(events.find((e) => e.phase === "explore" && e.edge === "end")?.outcome, "budget-aborted-partial");
+    assert.equal(events.find((e) => e.phase === "propose" && e.edge === "end")?.outcome, "budget-aborted");
+    assert.match((await readContext(cwd, "slow")) ?? "", /ABORTED at the ceiling/);
+  } finally {
+    await clearConfig();
+  }
+});
+
+await test("phase budget: minutes 0 measures only and never aborts", async () => {
+  const cwd = await freshRepo();
+  await writeConfig("readyset:\n  phaseBudget:\n    minutes: 0\n");
+  try {
+    await writeBrainstorm(cwd, "2026-07-29-unbounded.md", { title: "Unbounded", status: "open", created: "2026-07-29" }, VALID_BRAINSTORM_BODY);
+    const fakePiWrap = makeFakePi(cwd);
+    fakePiWrap.queueEffect(async () => {});
+    fakePiWrap.queueEffect(async () => {});
+    const handler = await loadHandler(fakePiWrap.pi);
+    const ui = makeFakeUi();
+    ui.selectQueue.push("2026-07-29 · Unbounded");
+    let aborts = 0;
+    const ctx = {
+      cwd, ui: ui.ui,
+      waitForIdle: async () => { await new Promise((r) => setTimeout(r, 30)); await fakePiWrap.waitForIdle(); },
+      abort: () => { aborts++; },
+    };
+    await handler("", ctx);
+    assert.equal(aborts, 0);
+    assert.match((await readContext(cwd, "unbounded")) ?? "", /\(no budget\)/);
+  } finally {
+    await clearConfig();
+  }
 });
 
 await test("T5: Refine triggers the repair again", async () => {
@@ -5192,9 +5251,9 @@ await test("fast lane: an exhausted budget skips the Trim and only warns", async
   const cwd = await freshRepo();
   await clearConfig();
   // A valid scope contract means no contract-repair turn interferes, so each Refine round
-  // consumes exactly one turn. The proposal stays under 1.5x for the first six rounds (where a
-  // trim would still be affordable) and only blows past 1.5x from round seven on — by then
-  // turnsAvailableFor(budget, 3) is false, so the trim is skipped and only warns.
+  // consumes exactly one turn. The proposal blows past 1.5x from round seven on: round seven
+  // (spent=7) can still afford a trim and keep a turn for a Refine; round eight's trim would take
+  // the last turn (turnsAvailableFor(budget, AUTO_TURN_RESERVE) is false), so it is skipped.
   const bigBullets = Array.from({ length: 200 }, (_, i) => `- change number ${i} with some padding text`).join("\n");
   const contract = "## Files This Change Will Touch\n\n- src/thing.ts (new)\n";
   const small = FAST_LANE_PROPOSAL(`${contract}\n## Acceptance\n\n- **WHEN** a\n- **THEN** the command exits 0\n`);
@@ -5232,13 +5291,14 @@ await test("fast lane: an exhausted budget skips the Trim and only warns", async
   const trimEnds = events.filter((e) => e.phase === "trim" && e.edge === "end");
   assert.ok(trimEnds.some((e) => e.outcome === "skipped-budget"), "a trim end event records skipped-budget");
   assert.ok(
-    fakeUiWrap.notifications.some((n) => /starve Apply\/Review/.test(n.message) && n.level === "warning"),
-    "the trim reserve warns about starving Apply/Review",
+    fakeUiWrap.notifications.some((n) => /leave no turn for a Refine/.test(n.message) && n.level === "warning"),
+    "the trim reserve says the last turn is kept for a Refine",
   );
-  // No trim prompt ever fired (every trim that wanted to run was skipped at the reserve boundary).
-  assert.ok(
-    !fakePiWrap.calls.some((c) => /over their character budget/.test(c.prompt)),
-    "no Trim turn fired",
+  // Exactly one trim fired (round seven); round eight's was skipped at the reserve boundary.
+  assert.equal(
+    fakePiWrap.calls.filter((c) => /over their character budget/.test(c.prompt)).length,
+    1,
+    "one Trim turn fired while a Refine still fit afterwards",
   );
 });
 

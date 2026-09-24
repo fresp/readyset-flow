@@ -75,6 +75,7 @@ import {
 	readCompactMinContextPercent,
 	readFallbackChain,
 	readLaneDefault,
+	readPhaseBudgetMinutes,
 	readPhaseModels,
 	readPinnedModel,
 	readPreferredLanguage,
@@ -1056,6 +1057,9 @@ interface ReviewCtx {
 	// user can judge for themselves whether Approve & Compact is worth reaching for; nothing here
 	// gates which CTAs are offered.
 	getContextUsage?: () => { tokens: number; contextWindow: number; percent: number } | undefined;
+	/** Aborts the agent operation in flight (ExtensionContext.abort). Used by the phase budget to
+	 *  stop an Explore/Propose turn that ran past its wall-clock ceiling. */
+	abort?: () => void;
 }
 
 /**
@@ -1325,8 +1329,37 @@ export async function withPinnedModel<T>(
  * fast turn. (3) Neither API: fail loudly via `ctx.ui.notify` and return -- do NOT throw, because
  * omp dispatches the agent_end notification detached and would swallow it.
  */
-async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string): Promise<void> {
+async function fireTurnAndWait(pi: ExtensionAPI, ctx: ReviewCtx, prompt: string, phaseBudget?: PhaseBudget, label = "this phase"): Promise<void> {
 	pi.sendUserMessage(prompt);
+
+	// Phase budget watchdog (see PhaseBudget): abort the turn once the phase's wall-clock ceiling
+	// passes. Armed only when there is a ceiling and the host can abort; always disarmed on return.
+	let watchdog: ReturnType<typeof setTimeout> | undefined;
+	if (phaseBudget && phaseBudget.maxMs > 0 && typeof ctx.abort === "function") {
+		const abort = ctx.abort;
+		const remaining = Math.max(0, phaseBudget.maxMs - phaseBudgetElapsedMs(phaseBudget));
+		watchdog = setTimeout(() => {
+			phaseBudget.aborted = true;
+			ctx.ui.notify(
+				`${label} ran past its ${Math.round(phaseBudget.maxMs / 60000) || "<1"}-minute phase budget — aborting the turn and continuing with what it wrote (readyset.phaseBudget.minutes).`,
+				"warning",
+			);
+			try {
+				abort();
+			} catch {
+				/* an abort that throws still leaves the turn to finish on its own */
+			}
+		}, remaining);
+	}
+	try {
+		await waitForTurn(ctx);
+	} finally {
+		if (watchdog !== undefined) clearTimeout(watchdog);
+	}
+}
+
+/** The waiting half of fireTurnAndWait -- see its doc comment. */
+async function waitForTurn(ctx: ReviewCtx): Promise<void> {
 
 	const sleep = (ms: number): Promise<void> =>
 		// `new Promise` rather than `Promise.withResolvers`: tsconfig targets ES2022, where
@@ -2203,27 +2236,37 @@ async function sessionStopVerificationCheck(cwd: string, sessionId: string | und
 }
 
 /**
- * A phase budget caps how much wall-clock work one labeled phase may consume before it must
- * either hand something concrete back or stop. Distinct from TurnBudget (which counts fired
- * agent turns): this watches elapsed time while a single turn runs, because a turn can churn
- * for an unbounded number of tool calls without spending any more TurnBudget. The benchmark
- * runs showed Explore/Product phases consuming millions of tokens in a single fired turn; a
- * turn-count ceiling alone cannot see that.
+ * A phase budget caps how much wall-clock time one Explore or Propose turn may run. Distinct
+ * from TurnBudget (which counts fired agent turns): a single turn can churn through an unbounded
+ * number of tool calls without spending any more TurnBudget -- the benchmark runs showed
+ * Explore/Propose consuming millions of tokens in one fired turn.
+ *
+ * Enforced, not advisory: `fireTurnAndWait` arms a timer for the remaining budget and calls
+ * `ctx.abort()` when it fires, marking `aborted`. The caller then continues with whatever the
+ * phase wrote so far (Explore: Propose may run less grounded; Propose: the "doesn't look
+ * finished" check and the gate's validation catch a partial artifact). `maxMs === 0`
+ * (`readyset.phaseBudget.minutes: 0`), or a host with no `ctx.abort`, measures and reports only.
  */
 interface PhaseBudget {
-	/** Wall-clock ceiling for the phase, in milliseconds. */
+	/** Wall-clock ceiling for the phase, in milliseconds; 0 = never abort. */
 	readonly maxMs: number;
 	startedAt: number;
+	/** Set when the ceiling was hit and the turn was aborted. */
+	aborted?: boolean;
 }
 
-const DEFAULT_PHASE_BUDGET_MS = 20 * 60 * 1000;
-
-function startPhaseBudget(maxMs: number = DEFAULT_PHASE_BUDGET_MS): PhaseBudget {
+function startPhaseBudget(maxMs: number): PhaseBudget {
 	return { maxMs, startedAt: Date.now() };
 }
 
 function phaseBudgetExceeded(budget: PhaseBudget): boolean {
-	return Date.now() - budget.startedAt > budget.maxMs;
+	return budget.maxMs > 0 && Date.now() - budget.startedAt > budget.maxMs;
+}
+
+/** "12s of 1200s budget", or "12s (no budget)" when enforcement is off. */
+function phaseBudgetLine(budget: PhaseBudget): string {
+	const elapsed = `${Math.round(phaseBudgetElapsedMs(budget) / 1000)}s`;
+	return budget.maxMs > 0 ? `${elapsed} of ${Math.round(budget.maxMs / 1000)}s budget${budget.aborted ? ", ABORTED at the ceiling" : ""}` : `${elapsed} (no budget)`;
 }
 
 function phaseBudgetElapsedMs(budget: PhaseBudget): number {
@@ -2249,16 +2292,18 @@ function createTurnBudget(max: number = MAX_TURNS_PER_RUN): TurnBudget {
 }
 
 /**
- * True when this run can fire one more turn AND still leave `reserve` turns for the phases that
- * must not be starved. `spendTurn` only checks `spent >= max`, so a repair/reconcile turn fired
- * when `spent === max - 1` would consume the last unit; the code-review `spendTurn` then returns
- * false and the run ends with no REVIEW.md and no archive offer. Callers pass the number of later
- * phases that must still get a turn: 2 for contract repair (Apply + Review), 1 for scope
- * reconciliation (Review).
+ * True when this run can fire one more turn AND still leave `reserve` turns unspent. Since 0.16
+ * Apply and Review no longer draw on this budget (execution is handed off to core omp; review is
+ * on demand), so the only turn worth protecting is a Refine the user asks for at the gate.
+ * Automatic follow-up turns (contract repair, trim) therefore reserve exactly that one turn
+ * (`AUTO_TURN_RESERVE`): they may run while a Refine would still fit, never with the last turn.
  */
 function turnsAvailableFor(budget: TurnBudget, reserve: number): boolean {
 	return budget.max - budget.spent > reserve;
 }
+
+/** Turns an automatic follow-up (contract repair, trim) leaves unspent: one, for a user Refine. */
+const AUTO_TURN_RESERVE = 1;
 
 /**
  * Runs `git status --porcelain` in the repo root and returns the repo-relative paths of every
@@ -2379,7 +2424,7 @@ async function applyDiffStats(cwd: string, changeId: string, changedPaths: strin
 
 /** Fires a turn against the budget. Returns false (and notifies) without firing anything if
  *  the budget is already spent — callers must stop, not retry, when this returns false. */
-async function spendTurn(pi: ExtensionAPI, ctx: ReviewCtx, budget: TurnBudget, label: string, prompt: string): Promise<boolean> {
+async function spendTurn(pi: ExtensionAPI, ctx: ReviewCtx, budget: TurnBudget, label: string, prompt: string, phaseBudget?: PhaseBudget): Promise<boolean> {
 	if (budget.spent >= budget.max) {
 		ctx.ui.notify(
 			`Turn budget (${budget.max} agent turns) reached for this /readyset run — stopping before ${label} to avoid an ` +
@@ -2389,7 +2434,7 @@ async function spendTurn(pi: ExtensionAPI, ctx: ReviewCtx, budget: TurnBudget, l
 		return false;
 	}
 	budget.spent++;
-	await fireTurnAndWait(pi, ctx, prompt);
+	await fireTurnAndWait(pi, ctx, prompt, phaseBudget, label);
 	return true;
 }
 
@@ -2433,8 +2478,8 @@ export function contractRepairPrompt(problems: string[]): string {
  * Once the change has been applied (`hasBeenApplied`), the contract is read with post-Apply
  * semantics and the repair turn never fires: a `(new)` file Apply created and a `(delete)` file it
  * removed would otherwise look wrong, and "repairing" them would strip correct markers. Remaining
- * problems only warn. When not applied, the turn is additionally reserved — it fires only if Apply
- * and Review would still each get a turn (`turnsAvailableFor(budget, 2)`).
+ * problems only warn. When not applied, the turn is additionally reserved — it fires only while a
+ * user Refine would still fit afterwards (`turnsAvailableFor(budget, AUTO_TURN_RESERVE)`).
  */
 async function runContractRepair(
 	pi: ExtensionAPI,
@@ -2466,9 +2511,9 @@ async function runContractRepair(
 		return before;
 	}
 
-	if (!turnsAvailableFor(budget, 2)) {
+	if (!turnsAvailableFor(budget, AUTO_TURN_RESERVE)) {
 		ctx.ui.notify(
-			`The scope contract for "${changeId}" has ${problems.length} problem(s), but repairing them now would starve Apply/Review of their turns — keeping the turn and showing them in the gate instead.`,
+			`The scope contract for "${changeId}" has ${problems.length} problem(s), but repairing them now would leave no turn for a Refine — keeping the turn and showing them in the gate instead.`,
 			"warning",
 		);
 		await record("contract-repair", "end", { outcome: "skipped-budget" });
@@ -2559,8 +2604,8 @@ export function trimPrompt(overruns: TrimOverrun[]): string {
  * An ordinary overrun (<= 1.5x) does not reach here at all: it only warns in the gate panel.
  *
  * `record` is the caller's `recordPhase`/`recordRepair` so the event carries the run's
- * lane/laneSource. The turn is reserved — it fires only if Apply + Review + one spare turn would
- * still remain (`turnsAvailableFor(budget, 3)`); otherwise the overrun only warns in the gate.
+ * lane/laneSource. The turn is reserved — it fires only while a user Refine would still fit
+ * afterwards (`turnsAvailableFor(budget, AUTO_TURN_RESERVE)`); otherwise the overrun only warns.
  */
 async function runTrim(
 	pi: ExtensionAPI,
@@ -2576,10 +2621,10 @@ async function runTrim(
 	const overruns = trimOverruns(before, budgets, lane);
 	if (overruns.length === 0) return; // nothing past 1.5x: no event, no turn
 
-	if (!turnsAvailableFor(budget, 3)) {
+	if (!turnsAvailableFor(budget, AUTO_TURN_RESERVE)) {
 		ctx.ui.notify(
 			`The planning artifacts for "${changeId}" are far over budget (${overruns.map((o) => `${o.file} ${o.chars}/${o.budget}`).join(", ")}), ` +
-				"but trimming them now would starve Apply/Review of their turns — keeping the turns and only warning in the gate.",
+				"but trimming them now would leave no turn for a Refine — keeping the turns and only warning in the gate.",
 			"warning",
 		);
 		await record("trim", "end", { outcome: "skipped-budget", artifactChars: { before, after: before } });
@@ -4463,6 +4508,12 @@ export async function executeBrainstorm(
 	if (resolvedCompactMin.warning) ctx.ui.notify(resolvedCompactMin.warning, "warning");
 	const minContextPercent = resolvedCompactMin.percent;
 
+	// Wall-clock ceiling per Explore/Propose turn (PhaseBudget): enforced by aborting the turn;
+	// `readyset.phaseBudget.minutes: 0` measures and reports only.
+	const resolvedPhaseBudget = await readPhaseBudgetMinutes();
+	if (resolvedPhaseBudget.warning) ctx.ui.notify(resolvedPhaseBudget.warning, "warning");
+	const phaseBudgetMs = Math.round(resolvedPhaseBudget.minutes * 60_000);
+
 	// Per-artifact character budgets, resolved once for the run. The lane's own set is
 	// picked once `effectiveLane` is known (it is by this point): the fast lane only
 	// budgets proposal.md and tasks.md.
@@ -4576,7 +4627,6 @@ export async function executeBrainstorm(
 		// is unchanged below.
 		const isFastLane = effectiveLane === "fast";
 		let explored = false;
-		const exploreBudget = startPhaseBudget();
 		if (isFastLane) {
 			await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
 			await appendContext(
@@ -4608,14 +4658,17 @@ export async function executeBrainstorm(
 			});
 			let exploreOutcome = "aborted";
 			await recordPhase(chosen.changeId, "explore", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("explore") });
+			const exploreBudget = startPhaseBudget(phaseBudgetMs);
 			try {
 				const exploreFired = await withPhaseModel(pi, reviewCtx, "explore", phaseModelOverrides, () =>
-					spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules)),
+					spendTurn(pi, reviewCtx, budget, "Explore", exploreTurnPrompt(chosen, submodules), exploreBudget),
 				);
 				if (!exploreFired) return;
 
 				explored = await hasExploration(ctx.cwd, chosen.changeId);
-				exploreOutcome = explored ? "exploration-written" : "no-exploration";
+				exploreOutcome = exploreBudget.aborted
+					? explored ? "budget-aborted-partial" : "budget-aborted"
+					: explored ? "exploration-written" : "no-exploration";
 				await appendContext(
 					ctx.cwd,
 					chosen.changeId,
@@ -4623,12 +4676,12 @@ export async function executeBrainstorm(
 					(explored
 						? `EXPLORATION.md written. ${submodules.length} submodule(s) known from .gitmodules: ${submodules.map((s) => s.name).join(", ") || "(none)"}.`
 						: "Explore turn ran but EXPLORATION.md is empty or missing — Propose will still run, but without grounded findings to lean on.") +
-						` (phase wall time: ${Math.round(phaseBudgetElapsedMs(exploreBudget) / 1000)}s of ${Math.round(exploreBudget.maxMs / 1000)}s budget.)`,
+						` (phase wall time: ${phaseBudgetLine(exploreBudget)}.)`,
 				);
-				if (phaseBudgetExceeded(exploreBudget)) {
+				if (exploreBudget.aborted || phaseBudgetExceeded(exploreBudget)) {
 					ctx.ui.notify(
 						`Explore for "${chosen.changeId}" hit its phase budget without finishing — continuing anyway since ` +
-							`${explored ? "EXPLORATION.md exists" : "Propose can still run ungrounded"}. Re-run /readyset to continue with a fresh budget if this stalls.`,
+							`${explored ? "EXPLORATION.md exists (possibly partial)" : "Propose can still run ungrounded"}. Raise readyset.phaseBudget.minutes if this repo legitimately needs longer.`,
 						"warning",
 					);
 				}
@@ -4662,13 +4715,13 @@ export async function executeBrainstorm(
 			boundary: "propose",
 			context: { beforePercent: proposeCompact.beforePercent, afterPercent: proposeCompact.afterPercent },
 		});
-		const proposeBudget = startPhaseBudget();
 		let proposeOutcome = "aborted";
 		let proposeSizes: ArtifactSizes | undefined;
 		await recordPhase(chosen.changeId, "propose", "start", phaseLane, phaseLaneSource, { model: phaseModelFor("propose") });
+		const proposeBudget = startPhaseBudget(phaseBudgetMs);
 		try {
 			const proposeFired = await withPhaseModel(pi, reviewCtx, "propose", phaseModelOverrides, () =>
-				spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane, artifactBudgets)),
+				spendTurn(pi, reviewCtx, budget, "Propose", proposeTurnPrompt(chosen, effectiveLane, artifactBudgets), proposeBudget),
 			);
 			if (!proposeFired) return;
 			proposeSizes = await readArtifactSizes(ctx.cwd, chosen.changeId);
@@ -4695,14 +4748,14 @@ export async function executeBrainstorm(
 				);
 				return;
 			}
-			proposeOutcome = "proposed";
+			proposeOutcome = proposeBudget.aborted ? "budget-aborted" : "proposed";
 			await appendContext(
 				ctx.cwd,
 				chosen.changeId,
 				"Propose",
 				`Propose turn ran; see proposal.md/design.md/specs/tasks.md.` +
 					(proposeSizes ? ` Planning size: proposal ${proposeSizes.proposal ?? 0}, design ${proposeSizes.design ?? 0}, specs ${proposeSizes.specs}, tasks ${proposeSizes.tasks ?? 0} chars (lane ${phaseLane}).` : "") +
-					` (phase wall time: ${Math.round(phaseBudgetElapsedMs(proposeBudget) / 1000)}s of ${Math.round(proposeBudget.maxMs / 1000)}s budget.)`,
+					` (phase wall time: ${phaseBudgetLine(proposeBudget)}.)`,
 			);
 		} finally {
 			await recordPhase(chosen.changeId, "propose", "end", phaseLane, phaseLaneSource, {
@@ -4711,10 +4764,10 @@ export async function executeBrainstorm(
 				artifactChars: proposeSizes ? { before: proposeSizes, after: proposeSizes } : undefined,
 			});
 		}
-		if (phaseBudgetExceeded(proposeBudget)) {
+		if (proposeBudget.aborted || phaseBudgetExceeded(proposeBudget)) {
 			ctx.ui.notify(
-				`Propose for "${chosen.changeId}" hit its phase budget (${Math.round(proposeBudget.maxMs / 60000)} min) — the artifacts exist but the turn ran long. ` +
-					"Continuing to the gate; runaway cost like this is recorded in CONTEXT.md so you can see it.",
+				`Propose for "${chosen.changeId}" hit its phase budget (${phaseBudgetLine(proposeBudget)}) — the turn was stopped, so the artifacts may be partial. ` +
+					"The gate's validation shows what is missing; Refine or re-run /readyset to finish them.",
 				"warning",
 			);
 		}

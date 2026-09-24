@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
 	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
 	parseCompactMinContextPercent,
+	parsePhaseBudgetMinutes,
 	parseFallbackChain,
 	parseFallbackModel,
 	parseLanguageOverride,
@@ -330,6 +331,17 @@ await test("readPhaseModels: reads a real file and tags the source", async () =>
 await test("readPhaseModels: missing file -> empty entries, never throws", async () => {
   const dir = await mkdtemp(join(tmpdir(), "omp-cfg-"));
   assert.deepEqual(await readPhaseModels(join(dir, "does-not-exist.yml")), { entries: [] });
+});
+
+// -- parsePhaseBudgetMinutes ---------------------------------------------------------------
+
+await test("parsePhaseBudgetMinutes: absent -> default 20; fractions and 0 accepted; junk warns", () => {
+  assert.deepEqual(parsePhaseBudgetMinutes("readyset:\n  language: Indonesian\n"), { minutes: 20, warning: undefined });
+  assert.deepEqual(parsePhaseBudgetMinutes("readyset:\n  phaseBudget:\n    minutes: 7.5\n"), { minutes: 7.5, warning: undefined });
+  assert.deepEqual(parsePhaseBudgetMinutes("readyset:\n  phaseBudget:\n    minutes: 0\n"), { minutes: 0, warning: undefined });
+  const bad = parsePhaseBudgetMinutes("readyset:\n  phaseBudget:\n    minutes: -3\n");
+  assert.equal(bad.minutes, 20);
+  assert.match(bad.warning ?? "", /isn't a number >= 0/);
 });
 
 // -- parseCompactMinContextPercent ----------------------------------------------------------

@@ -242,6 +242,39 @@ export async function readCompactMinContextPercent(configPath: string = OMP_CONF
 	return { percent: parsed.percent, warning: parsed.warning };
 }
 
+/** Default for `readyset.phaseBudget.minutes`: the wall-clock ceiling on one Explore or Propose
+ *  turn before Readyset aborts it. */
+export const DEFAULT_PHASE_BUDGET_MINUTES = 20;
+
+export interface ParsedPhaseBudgetMinutes {
+	/** Minutes (> 0 enforces the ceiling; 0 = measure and report only, never abort). */
+	minutes: number;
+	warning: string | undefined;
+}
+
+/** Parses `readyset.phaseBudget.minutes` — a number >= 0 (fractions allowed). 0 turns enforcement
+ *  off (the phase is still timed and reported). Anything else warns and uses the default. */
+export function parsePhaseBudgetMinutes(raw: string): ParsedPhaseBudgetMinutes {
+	const value = getPath(parseYamlSubset(raw), "readyset.phaseBudget.minutes");
+	if (value === undefined) return { minutes: DEFAULT_PHASE_BUDGET_MINUTES, warning: undefined };
+	const text = typeof value === "string" ? value.trim() : String(value);
+	const num = Number(text);
+	if (text === "" || !Number.isFinite(num) || num < 0) {
+		return {
+			minutes: DEFAULT_PHASE_BUDGET_MINUTES,
+			warning: `readyset.phaseBudget.minutes ("${text}") isn't a number >= 0 — using the default (${DEFAULT_PHASE_BUDGET_MINUTES}).`,
+		};
+	}
+	return { minutes: num, warning: undefined };
+}
+
+/** Reads `readyset.phaseBudget.minutes` (or `configPath`, for tests). Never throws. */
+export async function readPhaseBudgetMinutes(configPath: string = OMP_CONFIG_PATH): Promise<ParsedPhaseBudgetMinutes> {
+	const raw = await readFile(configPath, "utf8").catch(() => undefined);
+	if (raw === undefined) return { minutes: DEFAULT_PHASE_BUDGET_MINUTES, warning: undefined };
+	return parsePhaseBudgetMinutes(raw);
+}
+
 /** How the post-Apply code-review turn decides whether to run: `auto` = only when a risk
  *  trigger fires (see `readyset-review-trigger.ts`), `always` = every run (the pre-0.14
  *  behavior), `never` = no run at all (a stub is written in place of findings). */

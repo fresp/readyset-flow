@@ -106,8 +106,12 @@ Phase discipline is enforced, not just requested. After the Propose turn fires, 
 the working tree and **stops the run with no gate offered** if anything outside
 `readyset/changes/<id>/` and `.ai/brainstorms/` changed — a planning turn may only leave planning
 artifacts. See [What it deliberately does not do](#what-it-deliberately-does-not-do) for the exact
-boundary of that check. Each of Explore and Propose also runs under a wall-clock budget (20 min by
-default); a breach warns visibly in `CONTEXT.md` rather than failing silently.
+boundary of that check. Each Explore and Propose turn also runs under a wall-clock budget
+(`readyset.phaseBudget.minutes`, 20 by default). When the budget runs out, Readyset **aborts the
+turn** (`ctx.abort()`) and continues with whatever the turn wrote so far. The phase event records
+`outcome: "budget-aborted"` (or `"budget-aborted-partial"` when Explore still left an
+EXPLORATION.md), and the elapsed time is logged in `CONTEXT.md`. Set it to `0` to only measure and
+report without aborting. Fractions are allowed.
 
 ## Configure
 
@@ -274,7 +278,9 @@ pin failing before a turn starts, not a model going down mid-turn — for that, 
 Every run also has a hard turn budget (10 by default), shown as `agent turns this run: N/10` in
 the review panel — a guardrail against an unbounded Refine loop, not a cost estimate. It counts
 fired turns, so it does not bound the tool calls *inside* one turn; the per-phase wall-clock
-budgets (see [How it works](#how-it-works)) cover that gap.
+budgets (see [How it works](#how-it-works)) cover that gap. Since execution and review no longer
+draw on this budget, the only turn it protects is a Refine you ask for. Automatic follow-up turns
+(contract repair, trim) therefore never take the last turn.
 
 ### Per-phase models
 
@@ -469,7 +475,7 @@ raised to a real budget. An invalid value (non-numeric, `0`, negative, empty) si
 default — a budget is a soft signal, so a typo must not block a run.
 
 A file that runs **more than 1.5× its budget** fires at most **one** Trim turn (planning-only,
-never code; skipped when the turn budget is too tight to keep Apply and Review), which rewrites
+never code; skipped when it would take the run's last turn, which stays free for a Refine), which rewrites
 just the over-budget artifacts down to budget by removing restated content. The turn is recorded
 as a `trim` phase event carrying the before/after sizes.
 
@@ -512,8 +518,9 @@ Picks a brainstorm, then depending on its status:
     would overwrite a real file believing it creates one), and a path marked `(delete)` that doesn't
     exist (**delete-but-missing**). If any are present, one repair turn rewrites only the
     `## Files This Change Will Touch` section (and matching path mentions) to correct them, then the
-    check re-runs. The repair **runs at most once per Propose or Refine** and is skipped when the run
-    has no turn budget left. Anything it could not fix is still shown — `scope refs: DANGLING …
+    check re-runs. The repair **runs at most once per Propose or Refine** and is skipped when it
+    would take the run's last turn, which stays free for a Refine. Anything it could not fix is still
+    shown — `scope refs: DANGLING …
     · NEW-BUT-EXISTS … · DELETE-BUT-MISSING …` in the panel, and all three listed in the review
     document's **Scope** section, which also shows `contract repair: fixed N of M` when a repair ran.
     Mark files the change will *create* with `(new)` and files it will *delete* with `(delete)` so
