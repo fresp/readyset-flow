@@ -119,6 +119,49 @@ interface OverlayKeybindings {
 }
 
 /**
+ * All of this extension's mutable runtime state, in one place. `createReadysetState()` is called
+ * once per module instance (below), so a fresh import of this file (the tests' `?t=` imports, or
+ * omp re-loading the extension) starts clean, while omp's rebinding of the same instance into
+ * subagent runtimes shares it -- which is exactly why every consumer checks session identity
+ * (`sessionMatches`) before acting on `handoff` or `grill`.
+ */
+export interface ReadysetState {
+	/** The grilling session started by `startGrilling`, until its brainstorm is written. */
+	grill: ActiveGrillSession | undefined;
+	/** readyset_ask rounds this grilling session, plus whether a grilling session was started that
+	 *  the command handler's zero-rounds check has not consumed yet (see GRILL_ROUND_CAP). */
+	grillRounds: { rounds: number; active: boolean };
+	/** The handed-off execution awaiting its settle (mirrored to handoff.json). */
+	handoff: PendingHandoff | undefined;
+	/** The pre-pin model `withPinnedModel` captured, read by the approve branch. */
+	handoffRestoreTarget: unknown;
+	/** Which change readyset_verify records evidence into; set only while a handoff is live. */
+	verifyChangeId: string | undefined;
+	/** `${cwd}\0${sessionId}` pairs already scanned for a persisted handoff. */
+	rehydrationChecked: Set<string>;
+	/** session_stop gate blocks, keyed `${sessionId}:${changeId}`. */
+	sessionStopBlocks: Map<string, number>;
+	/** Outside-repo tripwire observations for the current run. */
+	outsideRepo: { cwd: string | undefined; entries: OutsideRepoEntry[]; written: number };
+}
+
+export function createReadysetState(): ReadysetState {
+	return {
+		grill: undefined,
+		grillRounds: { rounds: 0, active: false },
+		handoff: undefined,
+		handoffRestoreTarget: undefined,
+		verifyChangeId: undefined,
+		rehydrationChecked: new Set(),
+		sessionStopBlocks: new Map(),
+		outsideRepo: { cwd: undefined, entries: [], written: 0 },
+	};
+}
+
+/** This module instance's state. */
+const state: ReadysetState = createReadysetState();
+
+/**
  * /readyset — Readyset's core command: grill a brainstorm, propose a change against real repo
  * state, and hold it at the Review Gate until a human approves it. Execution itself is handed
  * off to core omp; the code review and the archive offer stay here, on demand.
@@ -698,7 +741,7 @@ export function codeReviewTurnPrompt(
  * produced — /readyset's own picker, and reconcileStatuses, treat either identically.
  *
  * Round cap is enforced in code now, not just prompt-level: `readyset_ask`'s own `execute()`
- * tracks how many rounds have run for the current grilling session (`grillRoundState`, reset by
+ * tracks how many rounds have run for the current grilling session (`state.grillRounds`, reset by
  * `startGrilling`) and, once `GRILL_ROUND_CAP` is reached, refuses to open the dialog again and
  * instead returns a tool result telling the model to check in via plain text — summarize what's
  * decided, name what's open, ask whether to keep going. This is a real ceiling (the tool simply
@@ -742,7 +785,7 @@ const GRILL_ROUND_CAP = 4;
  * structural one — so a model running fast/aggressively (more likely with `tools.approvalMode:
  * yolo`, though that setting itself only gates tool-call approval and has no effect on
  * `ctx.ui.select`/`askDialog` truly waiting for real input) could in principle skip asking
- * entirely and just write a brainstorm from its own assumptions. `grillRoundState.active` is
+ * entirely and just write a brainstorm from its own assumptions. `state.grillRounds.active` is
  * deliberately scoped tight to avoid false alarms: it only means "grilling was started THIS
  * session and the gate hasn't looked yet" — a brainstorm hand-written, or grilled in an earlier
  * omp process, leaves `active` at its default `false` and triggers no warning, since this
@@ -750,7 +793,6 @@ const GRILL_ROUND_CAP = 4;
  * actually attest to: a grilling run that started and finished (or was abandoned) in this same
  * process without ever calling `readyset_ask`. See the gate's call site (in the command handler)
  * for how this combines with `validateBrainstormContent`. */
-const grillRoundState = { rounds: 0, active: false };
 
 const OUTSIDE_REPO_TOOLS = new Set(["bash", "read", "grep", "glob"]);
 
@@ -810,35 +852,32 @@ export function classifyOutsideRepoAccess(toolName: string, input: Record<string
 }
 
 interface OutsideRepoEntry { kind: OutsideRepoKind; text: string; }
-const outsideRepoState: { cwd: string | undefined; entries: OutsideRepoEntry[]; written: number } = {
-	cwd: undefined, entries: [], written: 0,
-};
 export function outsideRepoCount(): number {
-	return outsideRepoState.entries.filter((e) => e.kind === "outside").length;
+	return state.outsideRepo.entries.filter((e) => e.kind === "outside").length;
 }
 export function outsideRepoTmpCount(): number {
-	return outsideRepoState.entries.filter((e) => e.kind === "tmp").length;
+	return state.outsideRepo.entries.filter((e) => e.kind === "tmp").length;
 }
 
 export function resetOutsideRepoWatch(cwd: string): void {
-	outsideRepoState.cwd = cwd;
-	outsideRepoState.entries = [];
-	outsideRepoState.written = 0;
+	state.outsideRepo.cwd = cwd;
+	state.outsideRepo.entries = [];
+	state.outsideRepo.written = 0;
 }
 
 function noteOutsideRepoCall(toolName: string, input: Record<string, unknown>, kind: OutsideRepoKind): void {
-	if (outsideRepoState.entries.length >= 200) return; // bound memory; the counts below keep growing
+	if (state.outsideRepo.entries.length >= 200) return; // bound memory; the counts below keep growing
 	const text = toolName === "bash" ? String(input.command ?? "")
 		: (typeof input.path === "string" ? input.path : ""); // grep: never the pattern
-	outsideRepoState.entries.push({ kind, text: `${toolName}: ${text.slice(0, 140)}` });
+	state.outsideRepo.entries.push({ kind, text: `${toolName}: ${text.slice(0, 140)}` });
 }
 
 /** Advisory CONTEXT.md flush: one entry per gate/archive pass, carrying only the calls observed
  *  since the previous flush. Never throws — a phase log is diagnostics, not control flow. */
 async function flushOutsideRepoEntries(cwd: string, changeId: string): Promise<void> {
-	const unwritten = outsideRepoState.entries.slice(outsideRepoState.written);
+	const unwritten = state.outsideRepo.entries.slice(state.outsideRepo.written);
 	if (unwritten.length === 0) return;
-	outsideRepoState.written = outsideRepoState.entries.length;
+	state.outsideRepo.written = state.outsideRepo.entries.length;
 	const outside = unwritten.filter((e) => e.kind === "outside").map((e) => e.text);
 	const tmp = unwritten.filter((e) => e.kind === "tmp").map((e) => e.text);
 	if (outside.length > 0) {
@@ -1219,7 +1258,7 @@ export async function withPinnedModel<T>(
 	};
 
 	const original = models.current();
-	handoffRestoreTarget = original;
+	state.handoffRestoreTarget = original;
 	let activeSpec = modelSpec;
 	let activeSource = source;
 
@@ -1270,14 +1309,14 @@ export async function withPinnedModel<T>(
 	try {
 		return await fn();
 	} finally {
-		// The approve branch of the gate sets `pendingHandoff` before it fires the execution turn
+		// The approve branch of the gate sets `state.handoff` before it fires the execution turn
 		// and returns. Execution is handed to core omp fire-and-forget, so restoring here would
 		// land exactly as the execution turn starts, making it run on the pre-run model instead of
 		// the pinned/apply-phase one. The restore moves to the settle of this session's handoff
 		// (the agent_end hook -> handlePendingHandoff).
 		// Session identity, like every other handoff check (sessionMatches; cwd fallback only when
 		// either side has no session id).
-		const handedOff = pendingHandoff !== undefined && sessionMatches(ctx, pendingHandoff.sessionId, pendingHandoff.cwd);
+		const handedOff = state.handoff !== undefined && sessionMatches(ctx, state.handoff.sessionId, state.handoff.cwd);
 		if (!handedOff) {
 			try {
 				await setModel(original);
@@ -1446,10 +1485,9 @@ export interface ActiveGrillSession {
 	grillModel?: GrillModelPin;
 }
 
-export let activeGrillSession: ActiveGrillSession | undefined;
 
 export function resetActiveGrillSession(): void {
-	activeGrillSession = undefined;
+	state.grill = undefined;
 }
 
 /**
@@ -1484,57 +1522,55 @@ export interface ArmedReviewPolicy {
 	testPaths: string[];
 }
 
-export let pendingHandoff:
-	| {
-			changeId: string;
-			restoreTo: unknown;
-			cwd: string;
-			sessionId?: string;
-			/** ISO timestamp of the approve that armed this handoff (persisted; see
-			 *  `persistPendingHandoff`). */
-			armedAt?: string;
-			/** The progress+tree fingerprint (`computePauseFingerprint`) recorded at the LAST pause,
-			 *  so the next terminal settle can tell "still working" from "stopped making progress" —
-			 *  see `handlePendingHandoff`'s pause branch. `undefined` before the first pause. */
-			pauseFingerprint?: string;
-			/** The review policy this run resolved, captured so a real settle (not a pause or a
-			 *  supersede) can apply it — see `applyReviewPolicyAtSettle`. */
-			reviewPolicy?: ArmedReviewPolicy;
-			/** Running counts, recorded on the `apply` `end` event (PhaseEvent `handoff`). */
-			pauses?: number;
-			blocks?: number;
-			verificationBlocks?: number;
-			/** True when this handoff was re-attached from handoff.json after a restart. */
-			rehydrated?: boolean;
-			/** The executing model's latest readyset_done signal, consumed by the next terminal
-			 *  settle (`done` settles as handoff-done; `blocked` is an explicit, non-stall pause). */
-			signal?: HandoffSignal;
-	  }
-	| undefined;
+/** A pending execution handoff (see `ReadysetState.handoff`). */
+export interface PendingHandoff {
+	changeId: string;
+	restoreTo: unknown;
+	cwd: string;
+	sessionId?: string;
+	/** ISO timestamp of the approve that armed this handoff (persisted; see
+	 *  `persistPendingHandoff`). */
+	armedAt?: string;
+	/** The progress+tree fingerprint (`computePauseFingerprint`) recorded at the LAST pause,
+	 *  so the next terminal settle can tell "still working" from "stopped making progress" —
+	 *  see `handlePendingHandoff`'s pause branch. `undefined` before the first pause. */
+	pauseFingerprint?: string;
+	/** The review policy this run resolved, captured so a real settle (not a pause or a
+	 *  supersede) can apply it — see `applyReviewPolicyAtSettle`. */
+	reviewPolicy?: ArmedReviewPolicy;
+	/** Running counts, recorded on the `apply` `end` event (PhaseEvent `handoff`). */
+	pauses?: number;
+	blocks?: number;
+	verificationBlocks?: number;
+	/** True when this handoff was re-attached from handoff.json after a restart. */
+	rehydrated?: boolean;
+	/** The executing model's latest readyset_done signal, consumed by the next terminal
+	 *  settle (`done` settles as handoff-done; `blocked` is an explicit, non-stall pause). */
+	signal?: HandoffSignal;
+}
 
 /**
  * The model the current run's `withPinnedModel` captured before it pinned anything. Only
  * `withPinnedModel` can observe this value, so the approve branch (which runs inside its `fn`)
  * reads it through here rather than calling `ctx.models.current()` again — that call would return
  * the already-pinned model, not the original. Left untouched (undefined) when no pin was
- * configured, which is exactly what `pendingHandoff.restoreTo` should be in that case.
+ * configured, which is exactly what `state.handoff.restoreTo` should be in that case.
  */
-export let handoffRestoreTarget: unknown;
 
 export function resetPendingHandoff(): void {
-	pendingHandoff = undefined;
-	handoffRestoreTarget = undefined;
+	state.handoff = undefined;
+	state.handoffRestoreTarget = undefined;
 }
 
 /**
- * Mirrors `pendingHandoff` to `readyset/changes/<id>/handoff.json` (readyset-spec.ts
+ * Mirrors `state.handoff` to `readyset/changes/<id>/handoff.json` (readyset-spec.ts
  * `HANDOFF_STATE_FILE`). Module state dies with the omp process; without this, a restart, crash
  * or session resume mid-execution left the `apply` window open forever, readyset_verify detached,
  * the session_stop gate silent and the review policy never applied. `restoreTo` is NOT persisted:
  * it is an opaque host model object, and a fresh process has no pin of this run's to undo anyway.
  * Never throws -- persistence is best-effort, the in-memory handoff still works without it.
  */
-async function persistPendingHandoff(handoff: NonNullable<typeof pendingHandoff>): Promise<void> {
+async function persistPendingHandoff(handoff: PendingHandoff): Promise<void> {
 	await writeHandoffState(handoff.cwd, {
 		changeId: handoff.changeId,
 		...(handoff.sessionId !== undefined ? { sessionId: handoff.sessionId } : {}),
@@ -1551,26 +1587,25 @@ async function persistPendingHandoff(handoff: NonNullable<typeof pendingHandoff>
 /** `${cwd}\0${sessionId}` pairs already scanned for a persisted handoff this process, so the scan
  *  (a readdir of readyset/changes/) runs once per session per repo, not on every agent_end. Keyed by
  *  session too: a subagent's own first agent_end must not use up the parent's one scan. */
-const handoffRehydrationChecked = new Set<string>();
 
 /**
  * Re-attaches a handed-off execution armed by THIS session in an earlier process (see
  * `persistPendingHandoff`), once per session per cwd. Called at every entry point that consults
- * `pendingHandoff`: the agent_end settle, the session_stop gate, readyset_verify and the
+ * `state.handoff`: the agent_end settle, the session_stop gate, readyset_verify and the
  * /readyset command. A no-op while a handoff is already armed in memory. Matching uses
  * `sessionMatches`, so a different session's handoff is never adopted (it is closed explicitly by
  * `/readyset --review <id>` instead); with no session id on either side it falls back to cwd.
  */
 export async function rehydratePendingHandoff(ctx: { cwd?: string; ui?: unknown; sessionManager?: { getSessionId?: () => string } }): Promise<void> {
-	if (pendingHandoff !== undefined || !ctx.cwd) return;
+	if (state.handoff !== undefined || !ctx.cwd) return;
 	const cwd = ctx.cwd;
 	const sessionId = ctx.sessionManager?.getSessionId?.();
 	const key = `${cwd}\u0000${sessionId ?? ""}`;
-	if (handoffRehydrationChecked.has(key)) return;
-	handoffRehydrationChecked.add(key);
+	if (state.rehydrationChecked.has(key)) return;
+	state.rehydrationChecked.add(key);
 	const mine = (await listHandoffStates(cwd).catch(() => [])).find((h) => sessionMatches(ctx, h.sessionId, cwd));
-	if (!mine || pendingHandoff !== undefined) return;
-	pendingHandoff = {
+	if (!mine || state.handoff !== undefined) return;
+	state.handoff = {
 		changeId: mine.changeId,
 		restoreTo: undefined,
 		cwd,
@@ -1584,7 +1619,7 @@ export async function rehydratePendingHandoff(ctx: { cwd?: string; ui?: unknown;
 		rehydrated: true,
 		signal: mine.signal,
 	};
-	activeVerifyChangeId = mine.changeId;
+	state.verifyChangeId = mine.changeId;
 	(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
 		`Readyset re-attached to the handed-off execution of "${mine.changeId}" (approved ${mine.armedAt}, before this omp process started).`,
 		"info",
@@ -1626,8 +1661,8 @@ export function startGrilling(
 ): void {
 	const today = new Date().toISOString().slice(0, 10);
 	const preview = ideaText.length > 60 ? `${ideaText.slice(0, 57)}...` : ideaText;
-	grillRoundState.rounds = 0;
-	grillRoundState.active = true; // consumed by the command handler's zero-rounds check -- see grillRoundState's doc comment
+	state.grillRounds.rounds = 0;
+	state.grillRounds.active = true; // consumed by the command handler's zero-rounds check -- see state.grillRounds's doc comment
 
 	const files = new Set<string>();
 	const brainstormDir = join(ctx.cwd, BRAINSTORM_DIR);
@@ -1642,7 +1677,7 @@ export function startGrilling(
 	}
 
 	if (execOptions) {
-		activeGrillSession = {
+		state.grill = {
 			active: true,
 			startedAt: Date.now(),
 			ideaText,
@@ -1794,8 +1829,8 @@ export async function handleGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx)
 }
 
 async function runGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
-	if (!activeGrillSession?.active) return;
-	const session = activeGrillSession;
+	if (!state.grill?.active) return;
+	const session = state.grill;
 	// The ctx this run is driven with from here on. This function fires from two places: the
 	// /readyset command handler (command ctx: has waitForIdle) and omp's agent_end hook (general
 	// ExtensionContext: no waitForIdle). `session` was captured from the command ctx at
@@ -1812,8 +1847,8 @@ async function runGrillEndTransition(pi: ExtensionAPI, ctx: ReviewCtx): Promise<
 	}
 
 	// Brainstorm file is written! Mark grilling complete.
-	activeGrillSession = undefined;
-	grillRoundState.active = false;
+	state.grill = undefined;
+	state.grillRounds.active = false;
 	// Grilling is over: give the session its own model back before anything else runs, so
 	// executeBrainstorm's withPinnedModel captures (and later restores to) the real pre-run model,
 	// not the grill pin. Also the right moment for "Finish here" -- nothing else will restore it.
@@ -1939,7 +1974,7 @@ export async function settleHandoff(
 	await clearHandoffState(ctx.cwd, handoff.changeId).catch(() => {});
 
 	// readyset_verify is only meaningful while THIS handoff's execution is live.
-	if (activeVerifyChangeId === handoff.changeId) activeVerifyChangeId = undefined;
+	if (state.verifyChangeId === handoff.changeId) state.verifyChangeId = undefined;
 
 	if (outcome === "handoff-done") {
 		ctx.ui.notify(`Execution of "${handoff.changeId}" signalled done: ${handoff.signal?.summary ?? "(no summary)"}`, "info");
@@ -2104,15 +2139,15 @@ async function computePauseFingerprint(cwd: string, changeId: string): Promise<s
  * and re-firing on every subsequent agent_end.
  */
 export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
-	const handoff = pendingHandoff;
+	const handoff = state.handoff;
 	if (!handoff) return;
 	if (!sessionMatches(ctx, handoff.sessionId, handoff.cwd)) return; // another session's settle: leave it
 	// The executing model's own completion signal wins over every heuristic below: readyset_done
 	// only records `done` once every task is checked and verified (see registerDoneTool), so the
 	// turn that sent it is the end of the execution — no inference from checkboxes or git needed.
 	if (handoff.signal?.status === "done") {
-		pendingHandoff = undefined;
-		handoffRestoreTarget = undefined;
+		state.handoff = undefined;
+		state.handoffRestoreTarget = undefined;
 		await settleHandoff(pi, ctx, handoff, "handoff-done");
 		return;
 	}
@@ -2123,8 +2158,8 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 			// something it cannot resolve alone. That is a pause by definition, never evidence of a
 			// stall — the fingerprint is reset so the stall check starts fresh after the user answers.
 			const summary = handoff.signal.summary;
-			pendingHandoff = { ...handoff, signal: undefined, pauseFingerprint: undefined, blocks: (handoff.blocks ?? 0) + 1 };
-			await persistPendingHandoff(pendingHandoff);
+			state.handoff = { ...handoff, signal: undefined, pauseFingerprint: undefined, blocks: (handoff.blocks ?? 0) + 1 };
+			await persistPendingHandoff(state.handoff);
 			const where = `${blockedProgress?.done ?? 0}/${blockedProgress?.total ?? 0} tasks`;
 			await appendContext(ctx.cwd, handoff.changeId, "Apply", `Execution blocked at ${where}: ${summary}`).catch(() => {});
 			ctx.ui.notify(
@@ -2146,8 +2181,8 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 		const total = progress?.total ?? 0;
 		const fingerprint = await computePauseFingerprint(ctx.cwd, handoff.changeId);
 		if (handoff.pauseFingerprint !== undefined && handoff.pauseFingerprint === fingerprint) {
-			pendingHandoff = undefined;
-			handoffRestoreTarget = undefined;
+			state.handoff = undefined;
+			state.handoffRestoreTarget = undefined;
 			await appendContext(
 				ctx.cwd,
 				handoff.changeId,
@@ -2157,8 +2192,8 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 			await settleHandoff(pi, ctx, handoff, "handoff-stalled");
 			return;
 		}
-		pendingHandoff = { ...handoff, pauseFingerprint: fingerprint, pauses: (handoff.pauses ?? 0) + 1 };
-		await persistPendingHandoff(pendingHandoff);
+		state.handoff = { ...handoff, pauseFingerprint: fingerprint, pauses: (handoff.pauses ?? 0) + 1 };
+		await persistPendingHandoff(state.handoff);
 		await appendContext(
 			ctx.cwd,
 			handoff.changeId,
@@ -2169,10 +2204,10 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 			`Execution paused at ${done}/${total} tasks — execution model stays active. It is restored when all tasks are done or on the next /readyset command.`,
 			"info",
 		);
-		return; // handoff stays armed; handoffRestoreTarget stays set
+		return; // handoff stays armed; state.handoffRestoreTarget stays set
 	}
-	pendingHandoff = undefined;
-	handoffRestoreTarget = undefined;
+	state.handoff = undefined;
+	state.handoffRestoreTarget = undefined;
 	await settleHandoff(pi, ctx, handoff, "handoff-settled");
 }
 
@@ -2185,10 +2220,10 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
  * Shares settleHandoff with the terminal-settle path. No-ops when nothing is pending.
  */
 export async function supersedePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Promise<void> {
-	const handoff = pendingHandoff;
+	const handoff = state.handoff;
 	if (!handoff) return;
-	pendingHandoff = undefined;
-	handoffRestoreTarget = undefined;
+	state.handoff = undefined;
+	state.handoffRestoreTarget = undefined;
 	await settleHandoff(pi, ctx, handoff, "handoff-superseded");
 }
 
@@ -2205,11 +2240,10 @@ const MAX_VERIFICATION_SENDBACKS = 2;
  *  session alone, a session that exhausted the cap on change A would never be gated again on
  *  change B. Never pruned: each entry is a few bytes and handoffs are not created at a rate where
  *  this matters in practice. */
-const sessionStopBlockCounts = new Map<string, number>();
 
 /**
  * Whether `session_stop`'s verification gate should block: true only while a handoff is armed
- * (`pendingHandoff`, with readyset_verify attached to the same change -- `activeVerifyChangeId`,
+ * (`state.handoff`, with readyset_verify attached to the same change -- `state.verifyChangeId`,
  * armed at approve, cleared at settle), the stopping session IS the session that armed it, AND
  * that change's tasks.md has at least one checked task with no `_Verified:` note.
  *
@@ -2223,8 +2257,8 @@ const sessionStopBlockCounts = new Map<string, number>();
  * blocked by this gate.
  */
 async function sessionStopVerificationCheck(cwd: string, sessionId: string | undefined): Promise<{ changeId: string; missing: number } | undefined> {
-	const handoff = pendingHandoff;
-	const changeId = activeVerifyChangeId;
+	const handoff = state.handoff;
+	const changeId = state.verifyChangeId;
 	if (!handoff || !changeId || handoff.changeId !== changeId) return undefined;
 	const stopping = { cwd, sessionManager: sessionId === undefined ? undefined : { getSessionId: () => sessionId } };
 	if (!sessionMatches(stopping, handoff.sessionId, handoff.cwd)) return undefined;
@@ -3516,10 +3550,10 @@ async function reviewAndMaybeExecute(
 		// exactly as execution begins. Apply the execution model here and record the handoff so
 		// withPinnedModel leaves the pin alone (see its `finally`) until the execution settles.
 		// The restore target for this handoff: the pin's captured pre-pin model when there was a pin
-		// (withPinnedModel stored it in `handoffRestoreTarget`), else the session model captured at the
+		// (withPinnedModel stored it in `state.handoffRestoreTarget`), else the session model captured at the
 		// capture site below just before the execution model is applied. Stays undefined when no
 		// execution model was ever applied, so the settle has nothing to restore and short-circuits.
-		let restoreTarget: unknown = handoffRestoreTarget;
+		let restoreTarget: unknown = state.handoffRestoreTarget;
 		const setModel = resolveHostSetModel(pi);
 		const models = ctx.models;
 		let executionModelApplied = false;
@@ -3573,7 +3607,7 @@ async function reviewAndMaybeExecute(
 		// nothing to restore and short-circuits. `sessionId` is the arming session's own id (the
 		// command ctx has sessionManager), so a subagent's settle in the same cwd cannot end it.
 		const armingSessionId = ctx.sessionManager?.getSessionId?.();
-		pendingHandoff = {
+		state.handoff = {
 			changeId: chosen.changeId,
 			restoreTo: restoreTarget,
 			cwd: ctx.cwd,
@@ -3581,10 +3615,10 @@ async function reviewAndMaybeExecute(
 			armedAt: new Date().toISOString(),
 			reviewPolicy: { mode: reviewMode, fullLane: reviewFullLane, thresholds: reviewThresholds, protectedPaths, testPaths },
 		};
-		await persistPendingHandoff(pendingHandoff);
+		await persistPendingHandoff(state.handoff);
 		// readyset_verify is only meaningful while THIS change's Apply is live — armed here (the
 		// handoff is about to fire), cleared by settleHandoff once it settles for real.
-		activeVerifyChangeId = chosen.changeId;
+		state.verifyChangeId = chosen.changeId;
 
 		if (typeof ctx.ui.setEditorText === "function") {
 			ctx.ui.setEditorText("");
@@ -3738,8 +3772,8 @@ async function runOnDemandReview(
 	protectedPaths: string[],
 	testPaths: string[],
 ): Promise<void> {
-	const state = await changeState(ctx.cwd, changeId);
-	if (state === "archived") {
+	const changeStatus = await changeState(ctx.cwd, changeId);
+	if (changeStatus === "archived") {
 		ctx.ui.notify(
 			`Change "${changeId}" is already archived — review runs only on a not-yet-archived change. ` +
 				"Run /readyset on a new brainstorm for follow-up work.",
@@ -3747,7 +3781,7 @@ async function runOnDemandReview(
 		);
 		return;
 	}
-	if (state === "none") {
+	if (changeStatus === "none") {
 		ctx.ui.notify(
 			`No active change "${changeId}" found under readyset/changes/ — check the id (it is the change directory name, not the brainstorm title).`,
 			"error",
@@ -3762,7 +3796,7 @@ async function runOnDemandReview(
 	// leaving it open forever. The one handoff armed in this process was already superseded by
 	// the command handler before this ran.
 	const orphan = await readHandoffState(ctx.cwd, changeId);
-	if (orphan && pendingHandoff?.changeId !== changeId) {
+	if (orphan && state.handoff?.changeId !== changeId) {
 		await settleHandoff(pi, ctx, { changeId, restoreTo: undefined }, "handoff-orphaned");
 		ctx.ui.notify(
 			`Closed the handed-off execution of "${changeId}" that never settled (approved ${orphan.armedAt}` +
@@ -3869,7 +3903,7 @@ interface ReadysetAskParams {
  * and returns the user's picks (or their own typed answer, or "let's discuss instead") back to
  * the model as the tool result so it can decide whether the design tree is settled yet.
  *
- * Enforces `GRILL_ROUND_CAP` in code (see `grillRoundState`'s doc comment) — once the cap is
+ * Enforces `GRILL_ROUND_CAP` in code (see `state.grillRounds`'s doc comment) — once the cap is
  * hit, this refuses to open another dialog and tells the model to check in via plain text
  * instead, a real ceiling rather than the prompt-level-only convention grilling used before this
  * tool existed.
@@ -3917,7 +3951,7 @@ function registerAskTool(pi: ExtensionAPI): void {
 		approval: "read",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { questions: askedQuestions } = params as ReadysetAskParams;
-			if (grillRoundState.rounds >= GRILL_ROUND_CAP) {
+			if (state.grillRounds.rounds >= GRILL_ROUND_CAP) {
 				return {
 					content: [
 						{
@@ -3952,7 +3986,7 @@ function registerAskTool(pi: ExtensionAPI): void {
 					],
 				};
 			}
-			grillRoundState.rounds++;
+			state.grillRounds.rounds++;
 
 			if (!ctx.ui.askDialog) {
 				return {
@@ -4034,7 +4068,7 @@ function registerAskTool(pi: ExtensionAPI): void {
 
 /**
  * Which Readyset change `readyset_verify` should attach evidence to. Module-level, same
- * trade-off `grillRoundState` documents above: `registerTool`'s `execute()` has no per-run
+ * trade-off `state.grillRounds` documents above: `registerTool`'s `execute()` has no per-run
  * channel for extension-local state, only `ctx`, and evidence needs to know which
  * `readyset/changes/<id>/` to write into — a concept Readyset owns, not omp. Armed at approve,
  * right before the execution is handed off to core omp (`reviewAndMaybeExecute`), and cleared by
@@ -4044,7 +4078,6 @@ function registerAskTool(pi: ExtensionAPI): void {
  * designed for two concurrent Apply turns in the same process — an accepted limitation, not a
  * real scenario this single-session tool needs to guard against.
  */
-let activeVerifyChangeId: string | undefined;
 
 /** Shape of `readyset_verify`'s params — see `ReadysetAskParams` for why this is declared and
  *  cast to rather than inferred from the `pi.zod` schema passed to `registerTool`. */
@@ -4086,7 +4119,7 @@ interface ReadysetVerifyParams {
  * default when the field is omitted, set explicitly here to self-document rather than rely on
  * the default silently). This goes through the SAME approval gate as any other write/exec
  * tool call — `tools.approvalMode` in the user's own config governs it exactly like it
- * governs the model's ordinary bash tool, per the same reasoning `grillRoundState`'s doc
+ * governs the model's ordinary bash tool, per the same reasoning `state.grillRounds`'s doc
  * comment above lays out for `ctx.ui` dialogs (except this genuinely is a permission-gated
  * tool call, not a UI dialog, so approval mode DOES apply here — this is real command
  * execution, deliberately not exempted from it).
@@ -4123,7 +4156,7 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { taskId, command } = params as ReadysetVerifyParams;
 			await rehydratePendingHandoff(ctx as unknown as ReviewCtx).catch(() => {});
-			const changeId = activeVerifyChangeId;
+			const changeId = state.verifyChangeId;
 			if (!changeId) {
 				return {
 					content: [
@@ -4223,7 +4256,7 @@ function registerDoneTool(pi: ExtensionAPI): void {
 			const { status, summary } = params as ReadysetDoneParams;
 			const c = ctx as unknown as ReviewCtx;
 			await rehydratePendingHandoff(c).catch(() => {});
-			const handoff = pendingHandoff;
+			const handoff = state.handoff;
 			if (!handoff) {
 				return reply(
 					"readyset_done isn't attached to a handed-off Readyset execution right now, so there is nothing to signal. " +
@@ -4241,8 +4274,8 @@ function registerDoneTool(pi: ExtensionAPI): void {
 			const at = new Date().toISOString();
 			if (status === "blocked") {
 				if (!text) return reply('Not recorded: status "blocked" needs a summary — the exact question or blocker for the user.');
-				pendingHandoff = { ...handoff, signal: { status: "blocked", summary: text, at } };
-				await persistPendingHandoff(pendingHandoff);
+				state.handoff = { ...handoff, signal: { status: "blocked", summary: text, at } };
+				await persistPendingHandoff(state.handoff);
 				return reply(
 					"Recorded as blocked. Now ask the user that question in plain chat and end your turn — the execution stays " +
 						"armed, and when they answer you continue from where you stopped.",
@@ -4270,8 +4303,8 @@ function registerDoneTool(pi: ExtensionAPI): void {
 						"Fix the task (and re-run readyset_verify) or correct the citation, then call readyset_done again.",
 				);
 			}
-			pendingHandoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at } };
-			await persistPendingHandoff(pendingHandoff);
+			state.handoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at } };
+			await persistPendingHandoff(state.handoff);
 			await appendContext(cwd, handoff.changeId, "Apply", `Execution signalled done: ${text || "(no summary)"}`).catch(() => {});
 			return reply(
 				"Recorded as done. End your turn now with a short report for the user; Readyset closes the execution, restores " +
@@ -4597,10 +4630,10 @@ export async function executeBrainstorm(
 		// spending real turns on it.
 		const contentCheck = validateBrainstormContent(chosen.raw);
 
-		// Consumed here, one-shot -- see grillRoundState's doc comment for exactly what this
+		// Consumed here, one-shot -- see state.grillRounds's doc comment for exactly what this
 		// does and doesn't attest to.
-		const grillingSkippedAsking = grillRoundState.active && grillRoundState.rounds === 0;
-		grillRoundState.active = false;
+		const grillingSkippedAsking = state.grillRounds.active && state.grillRounds.rounds === 0;
+		state.grillRounds.active = false;
 
 		if (!contentCheck.ok || grillingSkippedAsking) {
 			const issues: string[] = [];
@@ -4860,17 +4893,17 @@ export default function (pi: ExtensionAPI) {
 	};
 	if (typeof toolCallHost.on === "function") {
 		toolCallHost.on("tool_call", (event, ctx) => {
-			if (outsideRepoState.cwd !== undefined && ctx?.cwd === outsideRepoState.cwd) {
+			if (state.outsideRepo.cwd !== undefined && ctx?.cwd === state.outsideRepo.cwd) {
 				const call = event as { toolName?: string; input?: Record<string, unknown> };
-				const kind = classifyOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, outsideRepoState.cwd);
+				const kind = classifyOutsideRepoAccess(call.toolName ?? "", call.input ?? {}, state.outsideRepo.cwd);
 				if (kind) noteOutsideRepoCall(call.toolName ?? "", call.input ?? {}, kind);
 			}
-			if (activeGrillSession?.active) {
+			if (state.grill?.active) {
 				const call = event as { toolName?: string; input?: Record<string, unknown> };
 				if ((call.toolName === "write" || call.toolName === "write_file") && typeof call.input?.path === "string") {
 					const p = call.input.path;
 					if (p.includes(".ai/brainstorms") && p.endsWith(".md")) {
-						activeGrillSession.writtenBrainstormFile = p;
+						state.grill.writtenBrainstormFile = p;
 					}
 				}
 			}
@@ -4886,7 +4919,7 @@ export default function (pi: ExtensionAPI) {
 			// when the session is already settling. `agent_end` fires once per genuinely settled run.
 			if (endEv?.willContinue) return;
 			// A settled execution handoff is handled first, before the grill block, so it still runs
-			// when activeGrillSession is unset (the usual case: approve fires long after grilling).
+			// when state.grill is unset (the usual case: approve fires long after grilling).
 			// We await it so *our own* restore and `apply` `end` write complete before this handler
 			// returns — nothing externally waits on this handler: omp dispatches the extension
 			// `agent_end` notification detached (`void this.#emitAgentEndNotification(...)` in
@@ -4903,7 +4936,7 @@ export default function (pi: ExtensionAPI) {
 					"warning",
 				);
 			}
-			if (activeGrillSession?.active && sessionMatches(ctx as unknown as ReviewCtx, activeGrillSession.sessionId, ctx.cwd)) {
+			if (state.grill?.active && sessionMatches(ctx as unknown as ReviewCtx, state.grill.sessionId, ctx.cwd)) {
 				// Guarded here (not inside runGrillEndTransition) because this is where the session
 				// identity is available on the hook ctx: a subagent's own terminal agent_end shares
 				// the parent's cwd, so without this guard its settle would drive the parent's
@@ -4925,7 +4958,7 @@ export default function (pi: ExtensionAPI) {
 		});
 		// Verification gate: blocks the session from settling (Claude/Codex-compatible
 		// `decision: "block"`) when a checked task in the change readyset_verify is currently
-		// attached to (activeVerifyChangeId -- armed for the same handoff this file tracks) lacks a
+		// attached to (state.verifyChangeId -- armed for the same handoff this file tracks) lacks a
 		// `_Verified:` note. omp itself does not cap how many times a hook may return `block` --
 		// left unbounded, a model that never adds the note would loop forever, so this file enforces
 		// its own cap (MAX_VERIFICATION_SENDBACKS) per handoff. Only the session that armed the
@@ -4939,12 +4972,12 @@ export default function (pi: ExtensionAPI) {
 			const check = await sessionStopVerificationCheck(cwd, sessionId).catch(() => undefined);
 			if (!check) return undefined;
 			const counterKey = `${sessionId ?? "unknown-session"}:${check.changeId}`;
-			const blocked = sessionStopBlockCounts.get(counterKey) ?? 0;
+			const blocked = state.sessionStopBlocks.get(counterKey) ?? 0;
 			if (blocked >= MAX_VERIFICATION_SENDBACKS) return undefined; // cap reached: let the session stop
-			sessionStopBlockCounts.set(counterKey, blocked + 1);
-			if (pendingHandoff?.changeId === check.changeId) {
-				pendingHandoff = { ...pendingHandoff, verificationBlocks: (pendingHandoff.verificationBlocks ?? 0) + 1 };
-				await persistPendingHandoff(pendingHandoff);
+			state.sessionStopBlocks.set(counterKey, blocked + 1);
+			if (state.handoff?.changeId === check.changeId) {
+				state.handoff = { ...state.handoff, verificationBlocks: (state.handoff.verificationBlocks ?? 0) + 1 };
+				await persistPendingHandoff(state.handoff);
 			}
 			return {
 				decision: "block" as const,
@@ -4987,10 +5020,10 @@ export default function (pi: ExtensionAPI) {
 			// give the session its model back before this command pins anything of its own --
 			// otherwise a new applyGrillModel/withPinnedModel would capture the stale grill pin as
 			// "the model to restore". The grill session itself is left alone (a brainstorm it
-			// wrote may still be picked below; see grillRoundState). The cwd fallback is trivially true:
+			// wrote may still be picked below; see state.grillRounds). The cwd fallback is trivially true:
 			// a /readyset command is user-driven, so only a known, different session id opts out.
-			if (activeGrillSession && sessionMatches(ctx as unknown as ReviewCtx, activeGrillSession.sessionId, ctx.cwd)) {
-				await restoreGrillModel(pi, ctx as unknown as ReviewCtx, activeGrillSession);
+			if (state.grill && sessionMatches(ctx as unknown as ReviewCtx, state.grill.sessionId, ctx.cwd)) {
+				await restoreGrillModel(pi, ctx as unknown as ReviewCtx, state.grill);
 			}
 
 			// Risk-based code-review policy, resolved once for the run. `--review
