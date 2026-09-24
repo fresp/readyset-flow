@@ -65,7 +65,7 @@ await test("completely empty body -> flags all four sections missing", () => {
 await test("Decision present but no 'Chosen option:' line -> flagged", () => {
 	const body = FULLY_RESOLVED.replace("- Chosen option: Option A\n- Rationale: simplest fit", "Still thinking about it.");
 	const result = validateBrainstormContent(withFrontmatter(body));
-	assert.ok(result.issues.some((i) => i.section === "Decision" && /Chosen option/.test(i.problem)));
+	assert.ok(result.issues.some((i) => i.section === "Decision" && /chosen option/i.test(i.problem)));
 });
 
 await test("Seam left as the literal unfilled '<...>' template placeholder -> flagged", () => {
@@ -251,6 +251,23 @@ await test("loadBrainstorms: new clarity fields populate; a file without them le
 	assert.equal(old?.recommendedLane, "full", "no signal -> ambiguous -> full");
 });
 
+
+await test("Decision that opens with 'Option X' (how grilled brainstorms phrase it) counts as resolved", () => {
+	for (const decision of ["Option A — inline in `src/routes/products.mjs`.", "- Option B: a separate sort module", "**Option A** — inline comparator map", "- Add `sort` handling inline in `src/routes/products.mjs` (Option A)."]) {
+		const body = FULLY_RESOLVED.replace("- Chosen option: Option A\n- Rationale: simplest fit", decision);
+		const result = validateBrainstormContent(body);
+		assert.ok(!result.issues.some((i) => i.section === "Decision"), `resolved: ${decision}`);
+	}
+	const placeholder = FULLY_RESOLVED.replace("- Chosen option: Option A", "- Chosen option: <Option A / Option B>");
+	assert.ok(validateBrainstormContent(placeholder).issues.some((i) => i.section === "Decision"), "the unfilled template placeholder is still flagged");
+	const torn = FULLY_RESOLVED.replace("- Chosen option: Option A\n- Rationale: simplest fit", "Option A vs Option B — still weighing both.");
+	assert.ok(validateBrainstormContent(torn).issues.some((i) => i.section === "Decision"), "weighing two options is not a decision");
+});
+
+await test("grill prompt's brainstorm template carries the Chosen option line the validator looks for", async () => {
+	const { grillTurnPrompt } = await import("../src/lib/readyset-prompts.ts");
+	assert.match(grillTurnPrompt("idea", "2026-01-01", "ask"), /## Decision\n- Chosen option: <Option A \/ Option B>/);
+});
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

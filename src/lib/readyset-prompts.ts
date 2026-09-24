@@ -636,7 +636,7 @@ export function grillTurnPrompt(ideaText: string, today: string, laneDefault: La
 			`# riskFlag: cross-cutting|migration|api-change|security  (only when it applies; omit otherwise)\n` +
 			"---\n\n" +
 			"## Problem / Context\n## Options Explored\n### Option A: <name>\n### Option B: <name>\n" +
-			"## Leaning Direction\n## Decision\n## Assumed\n- none\n## Seam\n## Scope\n## Acceptance Criteria\n## Spec Impact\n" +
+			"## Leaning Direction\n## Decision\n- Chosen option: <Option A / Option B>\n- Rationale: <one line>\n## Assumed\n- none\n## Seam\n## Scope\n## Acceptance Criteria\n## Spec Impact\n" +
 			"## Git Workflow\n- Branch: <type>/<slug>\n- Inference reason: <one line>\n" +
 			"- Lane: <full | fast> — <one line>\n" +
 			"## Open Questions\n## Technical Constraints & Notes from Repo\n## Next Step\n\n" +

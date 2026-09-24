@@ -413,8 +413,13 @@ export function validateBrainstormContent(raw: string): BrainstormContentCheck {
 	const decision = extractSection(body, "Decision")?.trim();
 	if (!decision) {
 		issues.push({ section: "Decision", problem: "section missing or empty" });
-	} else if (!/Chosen option\s*:\s*\S/i.test(decision)) {
-		issues.push({ section: "Decision", problem: "no filled-in 'Chosen option:' line found" });
+	} else if (!/Chosen option\s*:\s*[^<\s]/i.test(decision) && new Set([...decision.matchAll(/\bOption\s+([A-Z0-9])\b/g)].map((m) => m[1])).size !== 1) {
+		// A decision is resolved when it names the option it chose: the template's `Chosen option:`
+		// line, or a section that names exactly one option ("Option A — inline in routes/…", "… (Option
+		// A)"). The latter is how grilled brainstorms actually phrase it; requiring the exact template
+		// line flagged every one of them as unresolved (smoke-real T01, all three readyset arms).
+		// Naming no option, or weighing two ("Option A vs Option B"), is still unresolved.
+		issues.push({ section: "Decision", problem: "no chosen option found (a 'Chosen option:' line, or exactly one 'Option <X>' named)" });
 	}
 
 	const seam = extractSection(body, "Seam")?.trim();
