@@ -17,7 +17,7 @@
  */
 
 import type { Dirent } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { structuralCheckSummary } from "./readyset-structural-check.ts";
 import { parseFrontmatter } from "./readyset-brainstorm.ts";
@@ -355,6 +355,66 @@ export async function readApproveBase(cwd: string, changeId: string): Promise<st
 	const raw = await readFile(changePaths(cwd, changeId).context, "utf8").catch(() => undefined);
 	if (raw === undefined) return undefined;
 	return parseApproveBaseEntry(raw)?.sha;
+}
+
+/** File, inside a change directory, holding a handed-off execution that has not settled yet.
+ *  Written when the gate hands execution off to core omp, rewritten at each pause, deleted when
+ *  the handoff settles (settled, stalled, superseded or orphaned). The in-memory handoff state in
+ *  readyset-review.ts is lost on an omp restart/crash/resume; this file is what lets the next
+ *  terminal settle (or `/readyset --review <id>`) still close the `apply` window, re-attach
+ *  readyset_verify and apply the review policy instead of leaving an unbalanced `apply` `start`.
+ *  JSON rather than another CONTEXT.md marker because it is mutable state, not a log entry. */
+export const HANDOFF_STATE_FILE = "handoff.json";
+
+export interface PersistedHandoff {
+	changeId: string;
+	/** The arming session's id, when the host exposes one. */
+	sessionId?: string;
+	/** ISO timestamp of the approve that armed this handoff. */
+	armedAt: string;
+	/** `computePauseFingerprint` at the last pause, if any. */
+	pauseFingerprint?: string;
+	/** The review policy resolved at arm time (readyset-review.ts `ArmedReviewPolicy`), kept
+	 *  opaque here: this file owns the format, the extension owns the meaning. */
+	reviewPolicy?: unknown;
+}
+
+export async function writeHandoffState(cwd: string, state: PersistedHandoff): Promise<void> {
+	await writeFile(join(changePaths(cwd, state.changeId).dir, HANDOFF_STATE_FILE), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
+/** The persisted handoff for one change, or `undefined` when there is none or it is malformed. */
+export async function readHandoffState(cwd: string, changeId: string): Promise<PersistedHandoff | undefined> {
+	const raw = await readFile(join(changePaths(cwd, changeId).dir, HANDOFF_STATE_FILE), "utf8").catch(() => undefined);
+	if (raw === undefined) return undefined;
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (parsed === null || typeof parsed !== "object") return undefined;
+		const p = parsed as Partial<PersistedHandoff>;
+		if (p.changeId !== changeId || typeof p.armedAt !== "string") return undefined;
+		if (p.sessionId !== undefined && typeof p.sessionId !== "string") return undefined;
+		if (p.pauseFingerprint !== undefined && typeof p.pauseFingerprint !== "string") return undefined;
+		return p as PersistedHandoff;
+	} catch {
+		return undefined;
+	}
+}
+
+export async function clearHandoffState(cwd: string, changeId: string): Promise<void> {
+	await rm(join(changePaths(cwd, changeId).dir, HANDOFF_STATE_FILE), { force: true });
+}
+
+/** Every unsettled persisted handoff under `readyset/changes/` (archived changes excluded),
+ *  newest `armedAt` first. Never throws. */
+export async function listHandoffStates(cwd: string): Promise<PersistedHandoff[]> {
+	const entries = await readdir(join(cwd, READYSET_ROOT, "changes"), { withFileTypes: true }).catch(() => [] as Dirent[]);
+	const found: PersistedHandoff[] = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.name === "archive") continue;
+		const state = await readHandoffState(cwd, entry.name);
+		if (state) found.push(state);
+	}
+	return found.sort((a, b) => b.armedAt.localeCompare(a.armedAt));
 }
 
 /** The phases a Readyset run records boundaries for. */

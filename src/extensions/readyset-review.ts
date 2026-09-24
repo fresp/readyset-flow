@@ -31,6 +31,10 @@ import {
 	ensureDirtyBaseline,
 	readApproveBase,
 	writeApproveBase,
+	clearHandoffState,
+	listHandoffStates,
+	readHandoffState,
+	writeHandoffState,
 	ensureReadysetRoot,
 	brainstormRequestText,
 	findDocFileWarnings,
@@ -1437,6 +1441,9 @@ export let pendingHandoff:
 			restoreTo: unknown;
 			cwd: string;
 			sessionId?: string;
+			/** ISO timestamp of the approve that armed this handoff (persisted; see
+			 *  `persistPendingHandoff`). */
+			armedAt?: string;
 			/** The progress+tree fingerprint (`computePauseFingerprint`) recorded at the LAST pause,
 			 *  so the next terminal settle can tell "still working" from "stopped making progress" —
 			 *  see `handlePendingHandoff`'s pause branch. `undefined` before the first pause. */
@@ -1459,6 +1466,62 @@ export let handoffRestoreTarget: unknown;
 export function resetPendingHandoff(): void {
 	pendingHandoff = undefined;
 	handoffRestoreTarget = undefined;
+}
+
+/**
+ * Mirrors `pendingHandoff` to `readyset/changes/<id>/handoff.json` (readyset-spec.ts
+ * `HANDOFF_STATE_FILE`). Module state dies with the omp process; without this, a restart, crash
+ * or session resume mid-execution left the `apply` window open forever, readyset_verify detached,
+ * the session_stop gate silent and the review policy never applied. `restoreTo` is NOT persisted:
+ * it is an opaque host model object, and a fresh process has no pin of this run's to undo anyway.
+ * Never throws -- persistence is best-effort, the in-memory handoff still works without it.
+ */
+async function persistPendingHandoff(handoff: NonNullable<typeof pendingHandoff>): Promise<void> {
+	await writeHandoffState(handoff.cwd, {
+		changeId: handoff.changeId,
+		...(handoff.sessionId !== undefined ? { sessionId: handoff.sessionId } : {}),
+		armedAt: handoff.armedAt ?? new Date().toISOString(),
+		...(handoff.pauseFingerprint !== undefined ? { pauseFingerprint: handoff.pauseFingerprint } : {}),
+		...(handoff.reviewPolicy !== undefined ? { reviewPolicy: handoff.reviewPolicy } : {}),
+	}).catch(() => {});
+}
+
+/** `${cwd}\0${sessionId}` pairs already scanned for a persisted handoff this process, so the scan
+ *  (a readdir of readyset/changes/) runs once per session per repo, not on every agent_end. Keyed by
+ *  session too: a subagent's own first agent_end must not use up the parent's one scan. */
+const handoffRehydrationChecked = new Set<string>();
+
+/**
+ * Re-attaches a handed-off execution armed by THIS session in an earlier process (see
+ * `persistPendingHandoff`), once per session per cwd. Called at every entry point that consults
+ * `pendingHandoff`: the agent_end settle, the session_stop gate, readyset_verify and the
+ * /readyset command. A no-op while a handoff is already armed in memory. Matching uses
+ * `sessionMatches`, so a different session's handoff is never adopted (it is closed explicitly by
+ * `/readyset --review <id>` instead); with no session id on either side it falls back to cwd.
+ */
+export async function rehydratePendingHandoff(ctx: { cwd?: string; ui?: unknown; sessionManager?: { getSessionId?: () => string } }): Promise<void> {
+	if (pendingHandoff !== undefined || !ctx.cwd) return;
+	const cwd = ctx.cwd;
+	const sessionId = ctx.sessionManager?.getSessionId?.();
+	const key = `${cwd}\u0000${sessionId ?? ""}`;
+	if (handoffRehydrationChecked.has(key)) return;
+	handoffRehydrationChecked.add(key);
+	const mine = (await listHandoffStates(cwd).catch(() => [])).find((h) => sessionMatches(ctx, h.sessionId, cwd));
+	if (!mine || pendingHandoff !== undefined) return;
+	pendingHandoff = {
+		changeId: mine.changeId,
+		restoreTo: undefined,
+		cwd,
+		sessionId: mine.sessionId,
+		armedAt: mine.armedAt,
+		pauseFingerprint: mine.pauseFingerprint,
+		reviewPolicy: mine.reviewPolicy as ArmedReviewPolicy | undefined,
+	};
+	activeVerifyChangeId = mine.changeId;
+	(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
+		`Readyset re-attached to the handed-off execution of "${mine.changeId}" (approved ${mine.armedAt}, before this omp process started).`,
+		"info",
+	);
 }
 
 /**
@@ -1782,6 +1845,8 @@ export async function settleHandoff(
 		outcome,
 		...(diff ? { diff } : {}),
 	}).catch(() => {});
+	// The window is closed: the persisted copy must not be re-attached by a later process.
+	await clearHandoffState(ctx.cwd, handoff.changeId).catch(() => {});
 
 	// readyset_verify is only meaningful while THIS handoff's execution is live.
 	if (activeVerifyChangeId === handoff.changeId) activeVerifyChangeId = undefined;
@@ -1977,6 +2042,7 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 			return;
 		}
 		pendingHandoff = { ...handoff, pauseFingerprint: fingerprint };
+		await persistPendingHandoff(pendingHandoff);
 		await appendContext(
 			ctx.cwd,
 			handoff.changeId,
@@ -3356,8 +3422,10 @@ async function reviewAndMaybeExecute(
 			restoreTo: restoreTarget,
 			cwd: ctx.cwd,
 			sessionId: armingSessionId,
+			armedAt: new Date().toISOString(),
 			reviewPolicy: { mode: reviewMode, fullLane: reviewFullLane, thresholds: reviewThresholds, protectedPaths, testPaths },
 		};
+		await persistPendingHandoff(pendingHandoff);
 		// readyset_verify is only meaningful while THIS change's Apply is live — armed here (the
 		// handoff is about to fire), cleared by settleHandoff once it settles for real.
 		activeVerifyChangeId = chosen.changeId;
@@ -3529,6 +3597,22 @@ async function runOnDemandReview(
 			"error",
 		);
 		return;
+	}
+
+	// A handoff for this change that never settled and is not armed in this process -- another
+	// session's, or one armed before an omp restart that no session has re-attached. Asking to
+	// review the change is the user saying execution is over, so close the `apply` window first
+	// (`handoff-orphaned`: no diff, no review policy -- this review IS the review) rather than
+	// leaving it open forever. The one handoff armed in this process was already superseded by
+	// the command handler before this ran.
+	const orphan = await readHandoffState(ctx.cwd, changeId);
+	if (orphan && pendingHandoff?.changeId !== changeId) {
+		await settleHandoff(pi, ctx, { changeId, restoreTo: undefined }, "handoff-orphaned");
+		ctx.ui.notify(
+			`Closed the handed-off execution of "${changeId}" that never settled (approved ${orphan.armedAt}` +
+				`${orphan.sessionId ? `, session ${orphan.sessionId}` : ""}) as handoff-orphaned before reviewing.`,
+			"warning",
+		);
 	}
 
 	const lane = (await readChangeLane(ctx.cwd, changeId)) ?? "full";
@@ -3880,6 +3964,7 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 		approval: "exec",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const { taskId, command } = params as ReadysetVerifyParams;
+			await rehydratePendingHandoff(ctx as unknown as ReviewCtx).catch(() => {});
 			const changeId = activeVerifyChangeId;
 			if (!changeId) {
 				return {
@@ -4528,6 +4613,7 @@ export default function (pi: ExtensionAPI) {
 			// invisible. The try/catch below exists for exactly that reason, and keeps a failure from
 			// taking down the grill-transition block.
 			try {
+				await rehydratePendingHandoff(ctx);
 				await handlePendingHandoff(pi, ctx as unknown as ReviewCtx);
 			} catch (err) {
 				(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
@@ -4568,6 +4654,7 @@ export default function (pi: ExtensionAPI) {
 			const cwd = ctx?.cwd;
 			if (!cwd) return undefined;
 			const sessionId = ctx?.sessionManager?.getSessionId?.() ?? (event as { session_id?: string } | undefined)?.session_id;
+			await rehydratePendingHandoff({ ...ctx, sessionManager: sessionId === undefined ? undefined : { getSessionId: () => sessionId } }).catch(() => {});
 			const check = await sessionStopVerificationCheck(cwd, sessionId).catch(() => undefined);
 			if (!check) return undefined;
 			const counterKey = `${sessionId ?? "unknown-session"}:${check.changeId}`;
@@ -4606,7 +4693,9 @@ export default function (pi: ExtensionAPI) {
 			// session's settle was never observed) must not linger. Settle it instead of dropping it:
 			// settling restores the model this session had before the run and closes the `apply`
 			// boundary (handoff-superseded), where the old resetPendingHandoff cleared the state with
-			// no restore and left the session stuck on the execution model.
+			// no restore and left the session stuck on the execution model. A handoff this session
+			// armed in an earlier omp process is re-attached first, so it is superseded the same way.
+			await rehydratePendingHandoff(ctx as unknown as ReviewCtx).catch(() => {});
 			await supersedePendingHandoff(pi, ctx as unknown as ReviewCtx);
 			// Same idea for a grill pin whose brainstorm was never written (grilling abandoned):
 			// give the session its model back before this command pins anything of its own --

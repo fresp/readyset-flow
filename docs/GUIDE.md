@@ -699,6 +699,11 @@ CONTEXT.md       append-only audit trail — one entry per phase transition, wri
                  baseline the gate invariant and scope check subtract (see "What it deliberately
                  does not do")
 REVIEW.md        code-review phase findings, written after implementation, before archive
+handoff.json     transient: exists only while an approved change's handed-off execution is
+                 unsettled (session id, approve time, last pause fingerprint, review policy).
+                 Lets a restarted/resumed omp process re-attach the handoff so the `apply`
+                 window still closes; deleted when it settles. `/readyset --review <id>` closes
+                 one left behind by another session as `handoff-orphaned`
 ```
 
 The **fast lane** carries a smaller set — no `design.md` and no spec delta:

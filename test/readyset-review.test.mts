@@ -1750,6 +1750,103 @@ await test("session_stop verification gate: a verified task, or no cwd, never bl
   assert.equal(await sessionStop({ session_id: sessionId }, {}), undefined, "no cwd on the event ctx -- never blocks");
 });
 
+// --- Persisted handoff (survives an omp restart) -------------------------------------------------
+
+const fileExists = (p: string) => readFile(p, "utf8").then(() => true, () => false);
+
+await test("persisted handoff: armed at approve, cleared when a supersede settles it", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-20-persist-a.md", {
+    title: "Persist A", status: "proposed", created: "2026-07-20", change_id: "persist-a",
+  });
+  const dir = await writeProposedChange(cwd, "persist-a", ["- src/keep.ts"]);
+  const { fakeUiWrap, handler, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-20 · Persist A");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  const state = JSON.parse(await readFile(join(dir, "handoff.json"), "utf8"));
+  assert.equal(state.changeId, "persist-a");
+  assert.equal(state.sessionId, sessionId);
+  assert.equal(typeof state.armedAt, "string");
+  assert.equal(state.reviewPolicy?.mode, "auto", "the review policy travels with the handoff");
+
+  // The next /readyset command supersedes the in-memory handoff -- and removes the file with it.
+  fakeUiWrap.selectQueue.push(""); // dismiss the picker
+  await handler("", ctx);
+  assert.equal(await fileExists(join(dir, "handoff.json")), false, "a settled handoff leaves no persisted copy");
+});
+
+await test("persisted handoff: a restarted process re-attaches this session's handoff, gates session_stop, and settles it", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-21-persist-b.md", {
+    title: "Persist B", status: "proposed", created: "2026-07-21", change_id: "persist-b",
+  });
+  const dir = await writeProposedChange(cwd, "persist-b", ["- src/keep.ts"]);
+
+  // Process 1: approve and hand off, then "crash" (the module instance is simply abandoned).
+  const first = await gateCtx(cwd);
+  first.fakeUiWrap.selectQueue.push("2026-07-21 · Persist B");
+  first.fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await first.handler("", first.ctx);
+  assert.equal(await fileExists(join(dir, "handoff.json")), true);
+
+  // Process 2: a fresh module instance -- no in-memory handoff at all.
+  const fakePiWrap = makeFakePi(cwd);
+  const { agentEnd, sessionStop } = await loadHandlerAgentEndAndSessionStop(fakePiWrap.pi);
+  const ui = makeFakeUi();
+
+  // A different session's settle does not adopt it.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, ui.ui, "someone-else"));
+  assert.equal(await fileExists(join(dir, "handoff.json")), true, "another session never adopts the handoff");
+
+  // The arming session's session_stop re-attaches it and is gated again.
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 no note\n- [ ] 1.2 todo\n", "utf8");
+  const blocked = await sessionStop({ session_id: first.sessionId }, { cwd, ui: ui.ui });
+  assert.equal(blocked?.decision, "block", "the session_stop gate works again after a restart");
+  assert.ok(ui.notifications.some((n) => /re-attached to the handed-off execution of "persist-b"/.test(n.message)));
+
+  // Its terminal settle closes the apply window and removes the persisted copy.
+  await markTasksDone(cwd, "persist-b");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, ui.ui, first.sessionId));
+  const applyEvents = (await readPhaseEvents(cwd, "persist-b")).filter((e) => e.phase === "apply");
+  assert.deepEqual(applyEvents.map((e) => e.edge), ["start", "end"], "the apply window is balanced across the restart");
+  assert.equal(applyEvents[1].outcome, "handoff-settled");
+  assert.equal(await fileExists(join(dir, "handoff.json")), false);
+});
+
+await test("persisted handoff: --review <id> from another session closes an orphaned handoff before reviewing", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-22-persist-c.md", {
+    title: "Persist C", status: "proposed", created: "2026-07-22", change_id: "persist-c",
+  });
+  const dir = await writeProposedChange(cwd, "persist-c", ["- src/keep.ts"]);
+
+  const first = await gateCtx(cwd);
+  first.fakeUiWrap.selectQueue.push("2026-07-22 · Persist C");
+  first.fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await first.handler("", first.ctx);
+
+  // A new process, a new session: the old one is gone and never settled.
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  const ctx = { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => "new-session" } };
+  await markTasksDone(cwd, "persist-c");
+  fakePiWrap.queueEffect(async () => {
+    await writeFile(join(dir, "REVIEW.md"), "## Findings\n\nnone\n\n## Blocking\n\nnone\n", "utf8");
+  });
+  ui.selectQueue.push("Not yet");
+  await handler("--review persist-c", ctx);
+
+  assert.ok(ui.notifications.some((n) => /as handoff-orphaned before reviewing/.test(n.message)));
+  const applyEvents = (await readPhaseEvents(cwd, "persist-c")).filter((e) => e.phase === "apply");
+  assert.deepEqual(applyEvents.map((e) => e.edge), ["start", "end"]);
+  assert.equal(applyEvents[1].outcome, "handoff-orphaned");
+  assert.equal(await fileExists(join(dir, "handoff.json")), false);
+  assert.ok(fakePiWrap.calls.some((c) => /Critically review the implementation/.test(c.prompt)), "the review still ran");
+});
+
 await test("review policy at settle: mode=never writes the skip stub", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-13-policy-never.md", {
