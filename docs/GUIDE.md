@@ -765,9 +765,27 @@ src/
     readyset-structural-check.ts  the shared "(structural check)" summary wording validateChange
                              and validateBrainstormContent both use
     readyset-evidence.ts    readyset_verify's runtime — spawns the command, persists the
-                             immutable evidence record, correlates it back to tasks.md
+                             immutable evidence record, correlates it back to tasks.md and to
+                             the `evidence E00N` citations in its _Verified: notes
+    readyset-types.ts       shared types, and the one mutable store: ReadysetState /
+                             createReadysetState() (created once per extension instance)
+    readyset-runtime.ts     createRuntime(state): everything that reads or writes that state —
+                             model pin, grilling, the execution handoff (arm/pause/settle/persist/
+                             rehydrate), the session_stop check, and the readyset_ask/verify/done tools
+    readyset-prompts.ts     every phase prompt and compaction guidance — pure string builders
+    readyset-host.ts        the omp host seam: asReviewCtx/asHostEvents (the only host casts),
+                             model switching, firing a turn and waiting for it, compaction
+    readyset-gate-ui.ts     the Review Gate: snapshot, panel, review document, sidebar, classic menu
+    readyset-repair.ts      the automatic follow-up turns: scope-contract repair and trim
+    readyset-review-policy.ts  review-trigger inputs and the honest REVIEW.md skip stub
+    readyset-git.ts         what a run changed, diff stats against the approve base, pause fingerprint
+    readyset-budget.ts      turn and wall-clock budgets
+    readyset-outside-repo.ts  the stay-in-repo tripwire's classifier
+    readyset-args.ts        `/readyset` argument parsing
   extensions/
-    readyset-review.ts      the /readyset command itself
+    readyset-review.ts      the /readyset command: the gate loop, executeBrainstorm, on-demand
+                             review/archive, and hook wiring. The only file omp loads directly;
+                             it creates the state and the runtime and imports everything else
   skill/
     SKILL.md                reference doc for the phase order + file formats; read by an agent
                              working a Readyset change directly, not loaded by the extension —
