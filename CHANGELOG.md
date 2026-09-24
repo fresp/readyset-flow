@@ -6,6 +6,25 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## Unreleased (planned 0.18.0)
+
+Execution now ends on an explicit signal instead of an inference, verification claims are checked against the evidence they cite, the phase budget actually stops a runaway turn, and the extension is split into focused modules with its machine state out of `CONTEXT.md`.
+
+### Added
+- **`readyset_done`**: the executing model signals the end of a handed-off execution. `done` is accepted only when every task is checked, has a `_Verified:` note and no evidence conflict, and it settles the handoff as `handoff-done`. `blocked` carries the exact question for the user and counts as an explicit pause, never a stall. The checkbox/fingerprint inference remains the fallback.
+- **Evidence citations**: the apply prompt recommends `readyset_verify` and asks for the record to be cited as `evidence E00N` in the task's note. A citation of a missing record, another task's record, or a failed run is an evidence conflict, shown in the gate and refused by `readyset_done`.
+- **`readyset.phaseBudget.minutes`** (default 20, fractions allowed, `0` = measure only): the wall-clock ceiling per Explore/Propose turn.
+- The `apply` `end` event records how the execution got there (`handoff`: pauses, blocks, verification blocks, rehydrated, signal) and the review policy's decision at settle (`reviewPolicy`).
+
+### Changed
+- **The phase budget is enforced**: a turn past its ceiling is aborted (`ctx.abort()`), recorded as `budget-aborted` / `budget-aborted-partial`, and the run continues with what it wrote. It used to be checked only after the turn returned.
+- **Turn reserves**: contract repair and trim no longer reserve turns for Apply/Review, which stopped drawing on the turn budget in 0.16; they keep exactly one turn free for a Refine.
+- **Machine state moved out of `CONTEXT.md`**: phase events go to the change's `events.jsonl` (append-only), the dirty baseline and approve base to `state.json`. `CONTEXT.md` is human-readable only. Legacy markers are still read, so in-flight changes survive the upgrade. readyset-bench reads both formats.
+- **Internal**: the 5k-line extension is split into `src/lib/readyset-{types,runtime,prompts,host,gate-ui,repair,review-policy,git,budget,outside-repo,args}.ts`; state is one per-instance `ReadysetState`; host objects are cast in two adapter functions instead of 15 places. No behavior change from the split itself.
+
+### Fixed
+- `/readyset --review <id>` looked for an `apply` `end` event with outcome `applied`, which the handoff never writes, so its `diff-size` trigger always saw an empty diff. The diff is now measured live against the approve base.
+
 ## 0.17.0 - 2026-09-24
 
 Makes the handed-off execution trustworthy: it runs on the model you pinned, pauses and settles correctly, survives an omp restart, has to show verification before it stops, and gets the risk-based review policy applied when it is done.
