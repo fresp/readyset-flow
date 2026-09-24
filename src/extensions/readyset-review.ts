@@ -67,8 +67,6 @@ import {
 } from "../lib/readyset-spec.ts";
 import {
 	DEFAULT_ARTIFACT_BUDGETS,
-	DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
-	DEFAULT_REVIEW_THRESHOLDS,
 	type ArtifactBudgets,
 	type LaneDefault,
 	readArtifactBudgets,
@@ -3282,28 +3280,50 @@ async function writeReviewSkipStub(cwd: string, changeId: string, result: Review
  * review); the Explore/Propose caller passes its own map, this loop passes the same map on
  * for Refine/Apply/Code-review so an override covers its phase wherever that phase fires.
  */
+/** Everything `reviewAndMaybeExecute` needs beyond the change itself, resolved once by
+ *  `executeBrainstorm`. One object instead of 13 positional parameters: every field is named at
+ *  the call site, and a new one cannot silently shift the others. */
+export interface GateRunOptions {
+	phaseModels: Map<string, { model: string; source: string }>;
+	lane: "full" | "fast";
+	laneSource: PhaseEvent["laneSource"];
+	compactMode: "auto" | "always" | "never";
+	minContextPercent: number;
+	artifactBudgets: ArtifactBudgets;
+	reviewMode: ReviewMode;
+	reviewFullLane: ReviewFullLane;
+	reviewThresholds: ParsedReviewThresholds;
+	protectedPaths: string[];
+	testPaths: string[];
+	/** The run's pinned model (--model / readyset.model.default) and its source label. Carried
+	 *  explicitly because the pin lives in `executeBrainstorm`'s closure, not in `phaseModels`, and
+	 *  the approve branch needs it to work out which model the handed-off execution runs on. */
+	pinnedModel: string | undefined;
+	pinnedModelSource: string;
+}
+
 async function reviewAndMaybeExecute(
 	pi: ExtensionAPI,
 	ctx: ReviewCtx,
 	initial: BrainstormMeta,
 	budget: TurnBudget,
-	phaseModels: Map<string, { model: string; source: string }> = new Map(),
-	reviewLane: "full" | "fast" = "full",
-	reviewLaneSource: PhaseEvent["laneSource"] = "brainstorm",
-	compactMode: "auto" | "always" | "never" = "auto",
-	minContextPercent: number = DEFAULT_COMPACT_MIN_CONTEXT_PERCENT,
-	artifactBudgets: ArtifactBudgets = DEFAULT_ARTIFACT_BUDGETS.full,
-	reviewMode: ReviewMode = "auto",
-	reviewFullLane: ReviewFullLane = "always",
-	reviewThresholds: ParsedReviewThresholds = { ...DEFAULT_REVIEW_THRESHOLDS, warning: undefined },
-	protectedPaths: string[] = [],
-	testPaths: string[] = [],
-	// The run's pinned model (--model / readyset.model.default) and its source label. Carried
-	// explicitly because the pin lives in `executeBrainstorm`'s closure, not in `phaseModels`, and
-	// the approve branch needs it to work out which model the handed-off execution runs on.
-	pinnedModel: string | undefined = undefined,
-	pinnedModelSource: string = "",
+	opts: GateRunOptions,
 ): Promise<void> {
+	const {
+		phaseModels,
+		lane: reviewLane,
+		laneSource: reviewLaneSource,
+		compactMode,
+		minContextPercent,
+		artifactBudgets,
+		reviewMode,
+		reviewFullLane,
+		reviewThresholds,
+		protectedPaths,
+		testPaths,
+		pinnedModel,
+		pinnedModelSource,
+	} = opts;
 	let chosen = initial;
 
 	// This loop owns the gate/refine/apply/review/archive boundaries. It is module-scope, so it
@@ -4543,12 +4563,28 @@ export async function executeBrainstorm(
 	const fallbackChain = fallbackFromFlag ? [fallbackFromFlag] : (resolvedConfigFallback?.chain ?? []);
 	const fallbackChainSource = fallbackFromFlag ? "--fallback-model flag" : (resolvedConfigFallback?.source ?? "");
 
+	const gateRunOptions: GateRunOptions = {
+		phaseModels: phaseModelOverrides,
+		lane: effectiveLane,
+		laneSource: phaseLaneSource,
+		compactMode,
+		minContextPercent,
+		artifactBudgets,
+		reviewMode: effectiveReviewMode,
+		reviewFullLane,
+		reviewThresholds,
+		protectedPaths: scopeProtected.paths,
+		testPaths: testPathsResult.paths,
+		pinnedModel,
+		pinnedModelSource,
+	};
+
 	await withPinnedModel(pi, reviewCtx, pinnedModel, pinnedModelSource, fallbackChain, fallbackChainSource, async () => {
 		if (isProposed(chosen.status)) {
 			// Defensive: a change that predates the baseline mechanism has no capture
 			// yet. This never overwrites an existing baseline (first capture wins).
 			await ensureDirtyBaseline(ctx.cwd, chosen.changeId, await currentDirtyPaths(ctx.cwd).catch(() => []));
-			await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths, pinnedModel, pinnedModelSource);
+			await reviewAndMaybeExecute(pi, reviewCtx, chosen, budget, gateRunOptions);
 			return;
 		}
 
@@ -4794,7 +4830,7 @@ export async function executeBrainstorm(
 			return;
 		}
 
-		await reviewAndMaybeExecute(pi, reviewCtx, after, budget, phaseModelOverrides, effectiveLane, phaseLaneSource, compactMode, minContextPercent, artifactBudgets, effectiveReviewMode, reviewFullLane, reviewThresholds, scopeProtected.paths, testPathsResult.paths, pinnedModel, pinnedModelSource);
+		await reviewAndMaybeExecute(pi, reviewCtx, after, budget, gateRunOptions);
 	});
 }
 
