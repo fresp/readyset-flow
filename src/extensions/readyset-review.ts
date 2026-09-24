@@ -83,7 +83,6 @@ import {
 	type ReviewFullLane,
 	type ReviewMode,
 } from "../lib/readyset-omp-config.ts";
-import { matchesAnyGlob } from "../lib/readyset-glob.ts";
 import {
 	evaluateReviewTriggers,
 	type ReviewTriggerInput,
@@ -2188,7 +2187,6 @@ async function runContractRepair(
 	const afterRaw = await checkScopeRefs(ctx.cwd, changeId, appliedRefs);
 	const after = applied ? { ...afterRaw, newButExists: [] } : afterRaw;
 	const remaining = scopeRefProblems(after).length;
-	const fixed = problems.length - remaining;
 	await appendContext(
 		ctx.cwd,
 		changeId,
@@ -2970,9 +2968,6 @@ async function reviewAndMaybeExecute(
 	const recordRepair = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; artifactChars?: PhaseEvent["artifactChars"] } = {}) =>
 		recordPhase(chosen.changeId, phase, edge, extra);
 
-	const recordReconcile = (phase: PhaseName, edge: "start" | "end", extra: { model?: string; outcome?: string; counts?: PhaseEvent["counts"] } = {}) =>
-		recordPhase(chosen.changeId, phase, edge, extra);
-
 	for (;;) {
 		// Gate boundary opens before the review snapshot is taken (the panel the user sees) and
 		// closes once `choice` is resolved. The gate is UI, not a model turn, so no `model` field.
@@ -3197,7 +3192,16 @@ async function reviewAndMaybeExecute(
 		// nothing to restore and short-circuits. `sessionId` is the arming session's own id (the
 		// command ctx has sessionManager), so a subagent's settle in the same cwd cannot end it.
 		const armingSessionId = ctx.sessionManager?.getSessionId?.();
-		pendingHandoff = { changeId: chosen.changeId, restoreTo: restoreTarget, cwd: ctx.cwd, sessionId: armingSessionId };
+		pendingHandoff = {
+			changeId: chosen.changeId,
+			restoreTo: restoreTarget,
+			cwd: ctx.cwd,
+			sessionId: armingSessionId,
+			reviewPolicy: { mode: reviewMode, fullLane: reviewFullLane, thresholds: reviewThresholds, protectedPaths, testPaths },
+		};
+		// readyset_verify is only meaningful while THIS change's Apply is live — armed here (the
+		// handoff is about to fire), cleared by settleHandoff once it settles for real.
+		activeVerifyChangeId = chosen.changeId;
 
 		if (typeof ctx.ui.setEditorText === "function") {
 			ctx.ui.setEditorText("");

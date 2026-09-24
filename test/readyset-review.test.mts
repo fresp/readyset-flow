@@ -330,6 +330,43 @@ async function loadHandlerAndAgentEnd(fakePi: { sendUserMessage: (prompt: string
   return { handler: capturedHandler.handler, agentEnd: async (event, ctx) => void (await capturedAgentEnd!(event, ctx)) };
 }
 
+// Same as loadHandlerAndAgentEnd, plus the readyset_verify tool's execute() from the SAME module
+// instance, so activeVerifyChangeId (module-level) is genuinely shared between the handler's
+// approve branch and the tool.
+async function loadHandlerAgentEndAndVerify(fakePi: { sendUserMessage: (prompt: string, opts: unknown) => void }): Promise<{
+  handler: (args: string, ctx: unknown) => Promise<void>;
+  agentEnd: (event: unknown, ctx: unknown) => Promise<void>;
+  verifyExecute: (toolCallId: string, params: { taskId: string; command: string }, signal: unknown, onUpdate: unknown, ctx: unknown) => Promise<{ content: { type: string; text: string }[] }>;
+}> {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as {
+    default: (pi: unknown) => void;
+  };
+  let capturedHandler: { handler: (args: string, ctx: unknown) => Promise<void> } | undefined;
+  let capturedAgentEnd: ((event: unknown, ctx: unknown) => Promise<void> | void) | undefined;
+  let capturedVerify: { execute: (...args: unknown[]) => Promise<unknown> } | undefined;
+  mod.default({
+    ...fakePi,
+    registerCommand(_name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      capturedHandler = def;
+    },
+    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
+      if (event === "agent_end") capturedAgentEnd = handler;
+    },
+    registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+      if (def.name === "readyset_verify") capturedVerify = def;
+    },
+    zod: fakeZod,
+  } as any);
+  if (!capturedHandler) throw new Error("registerCommand was never called");
+  if (!capturedAgentEnd) throw new Error("the agent_end handler was never registered");
+  if (!capturedVerify) throw new Error("readyset_verify was never registered");
+  return {
+    handler: capturedHandler.handler,
+    agentEnd: async (event, ctx) => void (await capturedAgentEnd!(event, ctx)),
+    verifyExecute: capturedVerify.execute as any,
+  };
+}
+
 await test("full happy path: open -> explore -> propose -> approve & execute -> code review -> archive", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-01-01-my-feature.md", {
@@ -1433,6 +1470,85 @@ await test("handoff model: ctx without sessionManager falls back to cwd matching
 
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui)); // no sessionManager
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "falls back to cwd matching and settles");
+});
+
+await test("readyset_verify: attached while the handoff is armed, detached again once it settles", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-12-verify-wire.md", {
+    title: "Verify Wire", status: "proposed", created: "2026-07-12", change_id: "verify-wire",
+  });
+  await writeProposedChange(cwd, "verify-wire", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const { handler, agentEnd, verifyExecute } = await loadHandlerAgentEndAndVerify(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const sessionId = "verify-session";
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+
+  // Before any handoff is armed: not attached to anything.
+  const before = await verifyExecute("t1", { taskId: "1.1", command: "true" }, undefined, undefined, ctx);
+  assert.match(before.content[0].text, /isn't attached to an active Apply turn/);
+
+  fakeUiWrap.selectQueue.push("2026-07-12 · Verify Wire");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  // Armed: readyset_verify now records evidence for this change.
+  const during = await verifyExecute("t2", { taskId: "1.1", command: "true" }, undefined, undefined, ctx);
+  assert.match(during.content[0].text, /Evidence E\d+ recorded/, "readyset_verify recorded evidence: " + JSON.stringify(during));
+
+  // Settling (all tasks done) detaches it again.
+  await markTasksDone(cwd, "verify-wire");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  const after = await verifyExecute("t3", { taskId: "1.1", command: "true" }, undefined, undefined, ctx);
+  assert.match(after.content[0].text, /isn't attached to an active Apply turn/);
+});
+
+await test("review policy at settle: mode=never writes the skip stub", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-13-policy-never.md", {
+    title: "Policy Never", status: "proposed", created: "2026-07-13", change_id: "policy-never",
+  });
+  await writeProposedChange(cwd, "policy-never", ["- src/keep.ts"]);
+
+  const { fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-13 · Policy Never");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("--review never", ctx);
+
+  await markTasksDone(cwd, "policy-never");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+
+  const review = await readFile(join(cwd, "readyset", "changes", "policy-never", "REVIEW.md"), "utf8");
+  assert.match(review, /Review skipped \(never\)/);
+});
+
+await test("review policy at settle: auto mode with an open decision fires the trigger and recommends review instead of writing a skip stub", async () => {
+  const cwd = await freshRepo();
+  // readyset.review.fullLane: auto -- otherwise the default (always) reviews every full-lane
+  // change unconditionally and the open-decisions trigger never gets a chance to fire.
+  await writeConfig("readyset:\n  review:\n    fullLane: auto\n");
+  await writeBrainstorm(cwd, "2026-07-13-policy-auto.md", {
+    title: "Policy Auto", status: "proposed", created: "2026-07-13", change_id: "policy-auto",
+  });
+  await writeOpenDecisionChange(cwd, "policy-auto");
+
+  const { fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-13 · Policy Auto");
+  fakeUiWrap.selectQueue.push("Approve & Execute, keep context");
+  await handler("", ctx);
+
+  await markTasksDone(cwd, "policy-auto");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+
+  assert.ok(
+    fakeUiWrap.notifications.some((n) => /Review recommended for "policy-auto": .*open-decisions/.test(n.message)),
+    "review-recommended notice fired with the trigger name: " + JSON.stringify(fakeUiWrap.notifications),
+  );
+  const reviewPath = join(cwd, "readyset", "changes", "policy-auto", "REVIEW.md");
+  const exists = await readFile(reviewPath, "utf8").catch(() => undefined);
+  assert.equal(exists, undefined, "no skip stub is written when review is recommended, not skipped");
+  await clearConfig();
 });
 
 await test("on-demand review that writes no REVIEW.md reports 'ran but wrote no REVIEW.md' and does not default to Archive now", async () => {
