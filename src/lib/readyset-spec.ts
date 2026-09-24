@@ -1403,12 +1403,20 @@ export interface VerificationCheck {
  * TDD-style check: a task marked `- [x]` is only as trustworthy as the evidence attached to
  * it. This counts, among checked tasks, how many are immediately followed by a line starting
  * with `_Verified:` (the note format `applyTurnPrompt` asks the model to leave — the actual
- * command run and its result). This is still just a structural check (a note that says
+ * command run and its result). The note may also be written as a sub-bullet
+ * (`  - _Verified: …_`, `*` or `+` too): models reach for that form often, and treating it as
+ * missing made the `session_stop` gate block a run that had in fact verified every task. This is
+ * still just a structural check (a note that says
  * "_Verified: ran it, looks fine_" passes exactly the same as one with real command output
  * pasted in) — it cannot confirm the verification is genuine, only that one was left. Surface
  * the `missing` count to the user; a run of checked tasks with no verification notes at all
  * is a strong signal the model claimed completion without checking.
  */
+/** A `_Verified:` note line: indented, optionally as a `-`/`*`/`+` sub-bullet. */
+const VERIFIED_NOTE_RE = /^\s*(?:[-*+]\s+)?_Verified:/i;
+/** The same prefix plus trailing whitespace, stripped to get at the note's own text. */
+const VERIFIED_NOTE_PREFIX_RE = /^\s*(?:[-*+]\s+)?_Verified:\s*/i;
+
 export async function checkTaskVerification(cwd: string, changeId: string): Promise<VerificationCheck | undefined> {
 	const paths = changePaths(cwd, changeId);
 	const raw = await readFile(paths.tasks, "utf8").catch(() => undefined);
@@ -1424,7 +1432,7 @@ export async function checkTaskVerification(cwd: string, changeId: string): Prom
 		for (let j = i + 1; j < lines.length; j++) {
 			if (lines[j].trim() === "") continue;
 			if (/^\s*-\s*\[[ xX]\]/.test(lines[j])) break; // hit the next task, no note found
-			if (/^\s*_Verified:/i.test(lines[j])) {
+			if (VERIFIED_NOTE_RE.test(lines[j])) {
 				withVerificationNote++;
 				if (noteNamesCommand(lines[j])) withCommandNote++;
 			}
@@ -1439,7 +1447,7 @@ export async function checkTaskVerification(cwd: string, changeId: string): Prom
  *  decide whether the review's `no-evidence` trigger is satisfied — a false negative costs one
  *  review turn, a false positive is the reason this is deliberately generous about backticks. */
 function noteNamesCommand(noteLine: string): boolean {
-	const after = noteLine.replace(/^\s*_Verified:\s*/i, "");
+	const after = noteLine.replace(VERIFIED_NOTE_PREFIX_RE, "");
 	if (/`[^`]+`/.test(after)) return true;
 	const firstToken = after.match(/^\s*([A-Za-z0-9_.-]+)/)?.[1] ?? "";
 	return /^(npm|pnpm|yarn|bun|node|npx|deno|go|cargo|make|python|python3|pytest|mvn|gradle|dotnet|ruby|php|curl|bash|sh|git|docker)\b/.test(firstToken);

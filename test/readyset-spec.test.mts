@@ -502,6 +502,27 @@ await test("checkTaskVerification: withCommandNote counts notes naming a runnabl
   assert.equal(result?.withCommandNote, 2, "only the backticked and the runner-token notes count");
 });
 
+await test("checkTaskVerification: a _Verified: note written as a sub-bullet still counts", async () => {
+  const cwd = await freshCwd();
+  const paths = await scaffoldChange(cwd, "bullet-note-change");
+  await writeFile(
+    paths.tasks,
+    [
+      "- [x] 1.1 dash bullet",
+      "  - _Verified: ran `npm test`, 3/3 pass_",
+      "- [x] 1.2 star bullet",
+      "  * _Verified: curl returned 200_",
+      "- [x] 1.3 plain",
+      "  _Verified: doc-only, no behavior to check_",
+      "- [x] 1.4 no note",
+      "  - a plain sub-bullet is not a note",
+    ].join("\n"),
+    "utf8",
+  );
+  const result = await checkTaskVerification(cwd, "bullet-note-change");
+  assert.deepEqual(result, { checkedTasks: 4, withVerificationNote: 3, missing: 1, withCommandNote: 2 });
+});
+
 await test("checkTaskVerification: no tasks.md -> undefined", async () => {
   const cwd = await freshCwd();
   await scaffoldChange(cwd, "no-tasks-change");
