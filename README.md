@@ -30,7 +30,7 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 ## Use
 
 ```
-/readyset --idea "let users export their data as CSV"
+/readyset let users export their data as CSV
 ```
 
 - **Grill** interrogates the idea until it's unambiguous — a real Q&A, not a rubber stamp. It also
@@ -56,7 +56,7 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 Pin a cheaper model per phase with `--phase-model grill=... --phase-model explore=...` (see the
 [full guide](docs/GUIDE.md#per-phase-models)).
 
-Already have a brainstorm sitting in `.ai/brainstorms/`? Run `/readyset` with no `--idea` and pick
+Already have a brainstorm sitting in `.ai/brainstorms/`? Run `/readyset` with no idea and pick
 it — Grill is skipped, since the ambiguity's already resolved.
 
 ## Why

@@ -92,7 +92,7 @@ A `/readyset` change moves through five stages — you only see the ones that st
 
 | Stage | What happens | Who can skip it |
 |---|---|---|
-| **1. Grill** | Only for a raw idea (`--idea "..."`). Interrogates ambiguity until Decision/Seam/Scope/Acceptance Criteria resolve. Immediately offers to proceed with Explore & Propose upon completion. | Skipped if a brainstorm already exists in `.ai/brainstorms/`. |
+| **1. Grill** | Only for a raw idea (`/readyset <idea>`). Interrogates ambiguity until Decision/Seam/Scope/Acceptance Criteria resolve. Immediately offers to proceed with Explore & Propose upon completion. | Skipped if a brainstorm already exists in `.ai/brainstorms/`. |
 | **2. Explore** | Reads the real repo and writes what it found to `EXPLORATION.md`, before anything gets proposed. | Never skipped for a not-yet-proposed brainstorm — **except on the fast lane**, which folds it into Propose. |
 | **3. Propose** | Writes `proposal.md` / `design.md` / `specs/**/spec.md` / `tasks.md`, grounded in Explore's findings, plus the `## Files This Change Will Touch` scope contract. | Never skipped. |
 | **4. Review gate** | Approve, **Refine**, or **Discard** — Discard is the default. Approving hands off execution directly to native core omp. | Never skipped — the gate Readyset exists to enforce. |
@@ -168,8 +168,10 @@ own section).
 
 ## Grilling — turning an idea into a brainstorm
 
-A brainstorm under `.ai/brainstorms/` is no longer a hard prerequisite. `--idea <text>` (or
-picking **"Type a new idea"** in the normal picker) starts a **grilling** turn instead:
+A brainstorm under `.ai/brainstorms/` is no longer a hard prerequisite. `/readyset <idea text>`
+(or the explicit `--idea <text>`, or picking **"Type a new idea"** in the normal picker) starts a
+**grilling** turn instead. The idea needs no quotes: everything from its first word to the end of the
+line is the idea, so flags such as `--lang` or `--lane` go before it. Grilling is
 mattpocock/skills-style interrogation — map the open decision branches, ask a round of frontier
 questions with a recommended answer each, never accept a passive "okay" on anything load-bearing,
 repeat until the design tree resolves.
@@ -230,11 +232,11 @@ then Propose — the same content-check gate that catches an under-filled grilli
 ### Language
 
 By default, grilling's reactive rule kicks in: reply in whatever language you use, once you use
-it — round 1 itself arrives in English. `--lang <language>` (before `--idea`) opens the discussion
+it — round 1 itself arrives in English. `--lang <language>` (before the idea) opens the discussion
 in that language from round 1:
 
 ```
-/readyset --lang Indonesian --idea "let users export their data as CSV"
+/readyset --lang Indonesian let users export their data as CSV
 ```
 
 Or set a default once (`--lang` still wins if given); `readyset.lang` works as an alias:
@@ -291,7 +293,7 @@ pin**:
 
 ```
 /readyset --phase-model grill=spark/minimax-m3 --phase-model explore=spark/minimax-m3 \
-  --idea "let users export their data as CSV"
+  let users export their data as CSV
 ```
 
 ```yaml

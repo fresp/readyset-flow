@@ -43,8 +43,13 @@ export interface ReadysetArgs {
  * substrings. So this tokenizes the raw string itself.
  *
  * Quoting is honored the way a shell would for a single shell-style token (`--model "a b"`), and
- * `--idea` consumes every remaining token joined back with single spaces, so a raw idea needs no
- * quoting and can't be followed by other flags (which is why `--lang` must come before it).
+ * the idea consumes every remaining token joined back with single spaces, so it needs no quoting
+ * and can't be followed by other flags (which is why `--lang` etc. must come before it).
+ *
+ * The idea is either `--idea <text>` or, more simply, the bare text itself: the first token that
+ * is neither a `--flag` nor a flag's value starts the idea (`/readyset let users export CSV`).
+ * That is why every value-taking flag consumes its value token here, even an invalid one — a
+ * `--lane medium` must never turn "medium" into the start of an idea.
  */
 export function parseReadysetArgs(raw: string): ReadysetArgs {
 	const tokens: string[] = [];
@@ -73,22 +78,30 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 
 	const parsed: ReadysetArgs = { all: false, fast: false };
 	const phaseModels: { phase: string; model: string }[] = [];
+	// The next token as this flag's value, or undefined when there is none or it is another flag.
+	const valueAt = (i: number): string | undefined => {
+		const v = tokens[i + 1];
+		return v === undefined || v.startsWith("--") ? undefined : v;
+	};
 	for (let i = 0; i < tokens.length; i++) {
 		const token = tokens[i];
 		if (token === "--all") parsed.all = true;
 		else if (token === "--fast") parsed.fast = true;
 		else if (token === "--lane") {
-			const value = (tokens[i + 1] ?? "").toLowerCase();
-			if (value === "fast" || value === "full") {
+			// An unknown value is kept (and consumed) so the handler can warn about it by name;
+			// the handler only honors fast|full.
+			const value = valueAt(i)?.toLowerCase();
+			if (value !== undefined) {
 				parsed.lane = value;
 				i++;
 			}
 		} else if (token === "--compact") {
 			// Deliberately NOT defaulted here: leaving it undefined lets the handler tell "unset"
-			// from an explicit bad value (same pattern as --lane), so the caller can warn.
-			const value = (tokens[i + 1] ?? "").toLowerCase();
-			if (value === "auto" || value === "always" || value === "never") {
-				parsed.compact = value;
+			// from an explicit bad value (same pattern as --lane), so the caller can warn. A bad
+			// value is still consumed so it cannot start a bare idea.
+			const value = valueAt(i)?.toLowerCase();
+			if (value !== undefined) {
+				if (value === "auto" || value === "always" || value === "never") parsed.compact = value;
 				i++;
 			}
 		} else if (token === "--review") {
@@ -105,25 +118,33 @@ export function parseReadysetArgs(raw: string): ReadysetArgs {
 				parsed.reviewTarget = value;
 				i++;
 			}
-		} else if (token === "--lang") parsed.lang = tokens[i + 1];
-		else if (token === "--model") parsed.model = tokens[i + 1];
-		else if (token === "--fallback-model") parsed.fallbackModel = tokens[i + 1];
-		else if (token === "--phase-model") {
+		} else if (token === "--lang" || token === "--model" || token === "--fallback-model") {
+			const value = valueAt(i);
+			if (value !== undefined) {
+				if (token === "--lang") parsed.lang = value;
+				else if (token === "--model") parsed.model = value;
+				else parsed.fallbackModel = value;
+				i++;
+			}
+		} else if (token === "--phase-model") {
 			// `--phase-model <phase>=<spec>` (e.g. `--phase-model explore=cliproxy/glm-5.2`);
 			// repeatable, one phase per flag. Unknown phases are rejected at use time, not
 			// here, so a typo degrades to a warning rather than silently changing behavior.
-			const pair = tokens[i + 1] ?? "";
+			const pair = valueAt(i) ?? "";
 			const eq = pair.indexOf("=");
-			if (eq > 0) {
-				phaseModels.push({ phase: pair.slice(0, eq).toLowerCase(), model: pair.slice(eq + 1) });
-				i++;
-			}
+			if (pair !== "") i++;
+			if (eq > 0) phaseModels.push({ phase: pair.slice(0, eq).toLowerCase(), model: pair.slice(eq + 1) });
 		}
 		else if (token === "--idea") {
 			const rest = tokens.slice(i + 1).join(" ").trim();
 			if (rest !== "") parsed.idea = rest;
 			break;
+		} else if (!token.startsWith("--")) {
+			// Bare text: the idea itself, `/readyset <idea>` — everything from here to the end.
+			parsed.idea = tokens.slice(i).join(" ").trim();
+			break;
 		}
+		// Any other `--something` is an unknown flag and is ignored.
 	}
 	if (phaseModels.length > 0) parsed.phaseModels = phaseModels;
 	return parsed;

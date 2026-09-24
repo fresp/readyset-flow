@@ -2965,7 +2965,7 @@ await test("'No full-lane brainstorms found' warning still fires with no brainst
   const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
   await handler("", ctx);
 
-  assert.ok(fakeUiWrap.notifications.some((n) => /No full-lane brainstorms found/.test(n.message) && /--idea/.test(n.message)));
+  assert.ok(fakeUiWrap.notifications.some((n) => /No full-lane brainstorms found/.test(n.message) && /run \/readyset <your raw idea>/.test(n.message)));
   assert.equal(fakePiWrap.calls.length, 0);
 });
 
@@ -3908,11 +3908,22 @@ await test("parseReadysetArgs reads the raw argument string the way omp hands it
 
   assert.equal(parse('--model "a b"').model, "a b", "a quoted value stays one token");
   assert.equal(parse("--model").model, undefined, "a flag with no value is undefined, not a crash");
-  assert.equal(parse("just some words").idea, undefined, "plain words are not mistaken for an idea");
+  assert.equal(parse("just some words").idea, "just some words", "bare text is the idea: /readyset <idea>");
+  assert.equal(parse('"add csv export"').idea, "add csv export", "a quoted bare idea works too");
+  const bare = parse("--lang Indonesian --lane fast let users export --all their data");
+  assert.equal(bare.lang, "Indonesian");
+  assert.equal(bare.lane, "fast");
+  assert.equal(bare.idea, "let users export --all their data", "everything after the first bare word is idea text, flags included");
+  assert.equal(bare.all, false, "a flag inside the idea text is not parsed as a flag");
+  assert.equal(parse("--model m1 fix the rounding bug").idea, "fix the rounding bug", "a flag's value is never the start of the idea");
+  assert.equal(parse("--compact sometimes fix it").idea, "fix it", "an invalid flag value is consumed, not taken as the idea");
+  assert.equal(parse("--review my-change").idea, undefined, "--review <change-id> is not an idea");
+  assert.equal(parse("--idea").idea, undefined, "a bare --idea is still no idea");
 
   assert.equal(parse("--lane fast").lane, "fast");
   assert.equal(parse("--lane FULL").lane, "full", "lane values are case-insensitive");
-  assert.equal(parse("--lane medium").lane, undefined, "an unknown lane is ignored, never a silent default");
+  assert.equal(parse("--lane medium").lane, "medium", "an unknown lane is kept so the handler can warn about it (it only honors fast|full)");
+  assert.equal(parse("--lane medium").idea, undefined, "and it is consumed, never the start of an idea");
   assert.equal(parse("--lane").lane, undefined, "a bare --lane is ignored, not a crash");
 
   const phases = parse("--model big/main --phase-model explore=small/fast --phase-model grill=small/fast");
@@ -5719,6 +5730,16 @@ await test("outside-repo tripwire: an outside bash call during Explore shows at 
   const gateEnd = events.find((event) => event.phase === "gate" && event.edge === "end");
   assert.equal(gateEnd?.outsideRepo, 1, "the gate end event carries the outsideRepo count");
   assert.equal(gateEnd?.outsideRepoTmp, 1, "the gate end event carries the outsideRepoTmp count");
+});
+
+await test("/readyset <bare idea> starts grilling just like --idea", async () => {
+  const cwd = await freshRepo();
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  await handler("let users export their data as CSV", { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle });
+  assert.equal(fakePiWrap.calls.length, 1, "exactly one grill turn fired, no picker");
+  assert.match(fakePiWrap.calls[0].prompt, /let users export their data as CSV/);
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

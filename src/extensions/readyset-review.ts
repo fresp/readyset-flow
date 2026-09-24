@@ -1249,8 +1249,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("readyset", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +
-			"(flags: --all, --fast, --idea <raw idea text> to grill a new brainstorm from scratch, --lang <language> to open " +
-			"grilling's discussion in that language from round 1 (must come before --idea), --model <spec> to pin a model " +
+			"(/readyset <raw idea text> — or --idea <text> — grills a new brainstorm from scratch; flags go before the idea: --all, --fast, " +
+			"--lang <language> to open grilling's discussion in that language from round 1, --model <spec> to pin a model " +
 			"for this run's turns, --fallback-model <spec> if the pin fails to apply, " +
 			"--lane <fast|full> to force the lane for the run and list fast-lane brainstorms in the picker (--fast only filters the picker; neither flag alone forces a lane), " +
 			"--review auto|always|never|<change-id> to control (or re-run) the code-review turn)",
@@ -1388,9 +1388,9 @@ export default function (pi: ExtensionAPI) {
 			const resolvedConfigLanguage = langFromFlag ? undefined : await readPreferredLanguage();
 			const preferredLanguage = langFromFlag ?? resolvedConfigLanguage?.language;
 
-			// --idea skips the picker entirely: everything after it is joined back into the raw idea
-			// text (so it need not be quoted as a single arg), and grilling starts immediately. Must
-			// come last among flags on the command line.
+			// An idea (bare text, or --idea <text>) skips the picker entirely: everything from its first
+			// word on is joined back into the raw idea text (so it need not be quoted), and grilling
+			// starts immediately. Flags must come before it.
 			const ideaFromFlag = parsedArgs.idea ?? "";
 			if (ideaFromFlag) {
 				const grillModel = await applyGrillModel(pi, asReviewCtx(ctx), parsedArgs);
@@ -1415,7 +1415,7 @@ export default function (pi: ExtensionAPI) {
 			if (items.length === 0) {
 				ctx.ui.notify(
 					`No full-lane brainstorms found in ${BRAINSTORM_DIR}/ (--fast or --lane includes fast-lane, --all includes archived)` +
-						(canGrillFromScratch ? ` -- or run /readyset --idea "<your raw idea>" to grill a new one into existence.` : ""),
+						(canGrillFromScratch ? ` -- or run /readyset <your raw idea> to grill a new one into existence.` : ""),
 					"warning",
 				);
 				return;

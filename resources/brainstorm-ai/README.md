@@ -77,7 +77,7 @@ sequenceDiagram
 
 ## Relationship to Readyset's own grilling
 
-Readyset's own grilling turn (`/readyset --idea`, see the README's "Grilling from outside omp")
+Readyset's own grilling turn (`/readyset <idea>`, see the README's "Grilling from outside omp")
 matches this skill's closing discipline and file shape deliberately: Decision/Seam/Scope/
 Acceptance Criteria, the same auto-derived branch-type/lane rules, the same `.ai/brainstorms/`
 file shape. A brainstorm this skill writes and one Readyset's own grilling writes are
