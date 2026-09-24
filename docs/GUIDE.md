@@ -304,9 +304,29 @@ execution* runs on. On Approve & Execute the execution model is, in order:
 3. else the session's current model, untouched.
 
 That model stays active for the whole handed-off execution turn, and the model the session had
-before `/readyset` is restored on the first **terminal** `agent_end` for that execution. An
-automatic continuation (`willContinue`, e.g. an auto-retry) is not a terminal settle, so it does
-not trigger the restore. Readyset notifies which model execution runs on and where it came from.
+before `/readyset` is restored once that execution actually finishes. Three details matter here:
+
+- **Where the restore target comes from.** When a pin exists (`--model` / `readyset.model.default`)
+  the pre-pin model is captured when the pin is applied. When only the apply override exists,
+  the pre-apply session model is captured in the approve branch, immediately before the execution
+  model is applied — so `--phase-model apply=<spec>` on its own still restores. If applying the
+  execution model fails (no key, unresolved spec, host without `pi.setModel`), nothing is captured
+  and the settle has nothing to restore.
+- **Settling is pause-aware.** A *terminal* `agent_end` with tasks still unfinished means execution
+  paused to ask a question or report a blocker, not that it finished: the execution model stays
+  active, the handoff stays armed, and the pause is recorded (`outcome: "handoff-paused"` plus a
+  `CONTEXT.md` line). The restore happens when all tasks are done, or when the next `/readyset`
+  command **supersedes** the handoff — that path restores the pre-run model and records
+  `outcome: "handoff-superseded"`, so an interleaved run can never leave the session stuck. An
+  automatic continuation (`willContinue`, e.g. an auto-retry) is never a terminal settle, so it
+  neither pauses nor settles.
+- **Matching is by session, not directory.** omp rebinds a parent-imported extension factory into
+  subagent runtimes in the same process, so a `task` subagent's own terminal `agent_end` shares the
+  parent's working directory. The handoff is keyed by the arming session's id, so a subagent's
+  settle cannot restore the parent's model or close its `apply` window. Host builds without
+  `sessionManager` fall back to matching on the working directory.
+
+Readyset notifies which model execution runs on and where it came from.
 
 The `configure` wizard does **not** cover phase models (it stays limited to language, default
 model, and fallback chain) — `readyset.model.phases` is hand-edited YAML.
@@ -508,7 +528,11 @@ Picks a brainstorm, then depending on its status:
   and exits immediately. Before that send it applies the execution model (apply phase override → run pin, see
   [Per-phase models](#per-phase-models)), keeps the session's pre-`/readyset` model pinned back until the handed-off
   execution settles, then restores it and records the balancing `apply` `end` phase event
-  (`outcome: "handoff-settled"`, carrying the model execution actually ran on).
+  (`outcome: "handoff-settled"`, carrying the model execution actually ran on). "Settles" is
+  pause-aware and session-keyed: a terminal `agent_end` with tasks still unfinished keeps the
+  execution model active (`outcome: "handoff-paused"`), a subagent's own settle cannot end the
+  parent's handoff, and a new `/readyset` before the handoff settles restores the model itself
+  (`outcome: "handoff-superseded"`).
   Core omp executes the tasks natively, with full support for subagents, parallel tool
   calls, and real-time task checklist updates.
 - **On-demand Code Review & Archiving**. After omp finishes implementing the tasks, run
