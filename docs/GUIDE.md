@@ -27,10 +27,12 @@ This is the detailed reference. For the two-minute version, see the [README](../
 
 The name is the point: a plan you can audit is anchored to the real state of the repo — real file
 contents, real commit hashes, real test runs — not assumptions. That is a claim about evidence,
-not about quality: two independent benchmarks measured Readyset's plans as no better grounded
-than a single read-only pass (grounding ~50% in blind judging, twice). What EXPLORATION.md
-provides is an auditable trail — every repo claim in proposal/design/specs/tasks should point
-back to a numbered exploration entry, so a reviewer can check each one. Readyset fuses three sources:
+not about quality: an early, pre-EXPLORATION.md version of Readyset was measured as no better
+grounded than a single read-only pass, which is exactly the gap EXPLORATION.md exists to close.
+What EXPLORATION.md provides is an auditable trail — every repo claim in proposal/design/specs/
+tasks should point back to a numbered exploration entry, so a reviewer can check each one. See
+[BENCHMARK.md](BENCHMARK.md) for the numbers this claim used to cite, and its note on why they are
+not currently trusted as a live measurement of the current version. Readyset fuses three sources:
 
 - **omp `/plan`'s grounding discipline** — cite real files/line numbers/commit hashes, catch
   actual drift. The harshest habit of the three, and the easiest to skip under pressure — so it's
@@ -312,19 +314,40 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   model is applied — so `--phase-model apply=<spec>` on its own still restores. If applying the
   execution model fails (no key, unresolved spec, host without `pi.setModel`), nothing is captured
   and the settle has nothing to restore.
-- **Settling is pause-aware.** A *terminal* `agent_end` with tasks still unfinished means execution
-  paused to ask a question or report a blocker, not that it finished: the execution model stays
-  active, the handoff stays armed, and the pause is recorded (`outcome: "handoff-paused"` plus a
-  `CONTEXT.md` line). The restore happens when all tasks are done, or when the next `/readyset`
-  command **supersedes** the handoff — that path restores the pre-run model and records
-  `outcome: "handoff-superseded"`, so an interleaved run can never leave the session stuck. An
-  automatic continuation (`willContinue`, e.g. an auto-retry) is never a terminal settle, so it
-  neither pauses nor settles.
+- **Settling is pause-aware and idempotent.** A *terminal* `agent_end` with tasks still unfinished
+  means execution paused to ask a question or report a blocker, not that it finished: the execution
+  model stays active, the handoff stays armed, and the pause is recorded as a `CONTEXT.md` line
+  only — never a new phase event, so N pauses never leave N unbalanced `apply` `start` events.
+  Each pause is fingerprinted (tasks.md's done/total count plus the raw `git status` text); if the
+  *next* pause's fingerprint is identical to the last one, nothing observably happened in between —
+  the run has genuinely stalled — and it settles right there as `outcome: "handoff-stalled"` rather
+  than arming forever. Real progress between two pauses just updates the fingerprint and the
+  `CONTEXT.md` note. The restore also happens once all tasks are done (`outcome:
+  "handoff-settled"`), or when the next `/readyset` command **supersedes** the handoff — that path
+  restores the pre-run model and records `outcome: "handoff-superseded"`, so an interleaved run can
+  never leave the session stuck. An automatic continuation (`willContinue`, e.g. an auto-retry) is
+  never a terminal settle, so it neither pauses nor settles.
 - **Matching is by session, not directory.** omp rebinds a parent-imported extension factory into
   subagent runtimes in the same process, so a `task` subagent's own terminal `agent_end` shares the
   parent's working directory. The handoff is keyed by the arming session's id, so a subagent's
-  settle cannot restore the parent's model or close its `apply` window. Host builds without
-  `sessionManager` fall back to matching on the working directory.
+  settle cannot restore the parent's model, close its `apply` window, or spend its
+  `session_stop` verification budget (below). Host builds without `sessionManager` fall back to
+  matching on the working directory.
+- **The approve-base commit is captured too.** `git rev-parse HEAD` at approve time is recorded in
+  `CONTEXT.md` alongside the handoff. Scope, review triggers and the diff stats on the balancing
+  `apply` `end` event are all measured against that commit — the current dirty worktree UNIONED
+  with whatever has been committed since (`git diff --name-only <base>..HEAD`) — so a commit the
+  handed-off execution makes mid-run (leaving the tree clean again) is never invisible.
+- **`readyset_verify` is live for the whole handoff**, and the risk-based review policy
+  (`readyset.review.mode`/`fullLane`) is actually applied once it settles for real (not on a pause
+  or a supersede): `never`, or `auto` with no trigger, writes `REVIEW.md`'s skip stub explaining
+  why; `always`, or `auto` on a full-lane change (`fullLane: always`, the default), or `auto` with
+  a trigger firing, notifies that review is recommended and names `/readyset --review <id>`.
+  Planning-only paths (`readyset/**`, `.ai/brainstorms/**`) never count toward a trigger — the model
+  updating its own `tasks.md`/`CONTEXT.md` is not a reason to recommend review.
+- **A `session_stop` verification gate** blocks the session from ending (up to twice per session)
+  while a checked task in the actively-armed change lacks a `_Verified:` note, so "forgot to
+  annotate, moved on" doesn't slip past silently.
 
 Readyset notifies which model execution runs on and where it came from.
 
@@ -505,7 +528,10 @@ Picks a brainstorm, then depending on its status:
 - Scope is checked **again after Execute**: the gate's check runs before Execute, so it only sees
   what Propose changed. A file touched outside the contract during Execute is named at the
   **Archive now?** prompt (and recorded in `CONTEXT.md`) — advisory, not a block, since
-  implementation legitimately touches more files than planning. Because execution is omp's turn,
+  implementation legitimately touches more files than planning. What counts as "changed this run"
+  is the dirty worktree UNIONED with whatever has been committed since the approve-base commit
+  (see [Per-phase models](#per-phase-models)'s handoff section) — a commit the handed-off execution
+  makes mid-run, leaving the tree clean again, is still counted. Because execution is omp's turn,
   not Readyset's, Readyset does not revert or repair anything here: the deviations are surfaced
   when you run the review, and judged there.
   - Apply is also told to keep the **diff minimal**: touch only files in the scope contract and
