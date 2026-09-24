@@ -1298,11 +1298,12 @@ await test("handoff model: a terminal agent_end with tasks unfinished pauses the
   assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "no restore while tasks are unfinished");
   assert.ok(fakeUiWrap.notifications.some((n) => /Execution paused at 1\/3 tasks/.test(n.message)), "the pause is notified: " + JSON.stringify(fakeUiWrap.notifications));
   const events = await phaseEventsArchivedOrLive(cwd, "handoff-pause");
-  assert.ok(
-    events.some((e) => e.phase === "apply" && e.edge === "start" && e.outcome === "handoff-paused"),
-    "a pause record exists on the apply phase: " + JSON.stringify(events),
-  );
+  const applyStarts = events.filter((e) => e.phase === "apply" && e.edge === "start");
+  assert.equal(applyStarts.length, 1, "the pause writes no new apply start event -- only the original handoff-omp one: " + JSON.stringify(events));
+  assert.equal(applyStarts[0].outcome, "handoff-omp");
   assert.ok(!events.some((e) => e.phase === "apply" && e.edge === "end"), "no apply end while paused");
+  const context = await readFile(join(dir, "CONTEXT.md"), "utf8");
+  assert.match(context, /Execution paused at 1\/3 tasks/, "the pause is recorded in CONTEXT.md");
 
   // A later terminal agent_end with all tasks checked settles for real.
   await writeFile(join(dir, "tasks.md"), "- [x] 1.1 done\n  _Verified: ran it_\n- [x] 1.2 done\n  _Verified: ran it_\n- [x] 1.3 done\n  _Verified: ran it_\n", "utf8");
@@ -1313,6 +1314,63 @@ await test("handoff model: a terminal agent_end with tasks unfinished pauses the
   const applyEnds = after.filter((e) => e.phase === "apply" && e.edge === "end");
   assert.equal(applyEnds.length, 1, "exactly one apply end event");
   assert.equal(applyEnds[0].outcome, "handoff-settled");
+});
+
+await test("handoff model: two pauses with no progress in between settle as handoff-stalled, not forever-armed", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-07-handoff-stall.md", {
+    title: "Handoff Stall", status: "proposed", created: "2026-07-07", change_id: "handoff-stall",
+  });
+  const dir = await writeProposedChange(cwd, "handoff-stall", ["- src/keep.ts"]);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 done\n  _Verified: ran it_\n- [ ] 1.2 todo\n- [ ] 1.3 todo\n", "utf8");
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-07 · Handoff Stall");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  await handler("--model pinned-model", ctx);
+
+  // First pause: progress unchanged from arming -> stays armed, fingerprint recorded.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "still armed after the first pause");
+
+  // Second terminal agent_end with the SAME tasks.md/tree state -> nothing changed -> stalled.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "a stalled handoff still restores the model");
+  assert.ok(fakeUiWrap.notifications.some((n) => /stalled/.test(n.message)), "the stall is notified: " + JSON.stringify(fakeUiWrap.notifications));
+
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-stall");
+  const applyEnds = events.filter((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnds.length, 1, "exactly one apply end event, balancing the single apply start");
+  assert.equal(applyEnds[0].outcome, "handoff-stalled");
+
+  // A third terminal agent_end must be a no-op: the handoff is gone.
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  const finalEvents = await phaseEventsArchivedOrLive(cwd, "handoff-stall");
+  assert.equal(finalEvents.filter((e) => e.phase === "apply" && e.edge === "end").length, 1, "no double settle");
+});
+
+await test("handoff model: a pause followed by real progress stays armed (no stall) and updates the pause note", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-07-handoff-progress.md", {
+    title: "Handoff Progress", status: "proposed", created: "2026-07-07", change_id: "handoff-progress",
+  });
+  const dir = await writeProposedChange(cwd, "handoff-progress", ["- src/keep.ts"]);
+  await writeFile(join(dir, "tasks.md"), "- [ ] 1.1 todo\n- [ ] 1.2 todo\n- [ ] 1.3 todo\n", "utf8");
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-07 · Handoff Progress");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  await handler("--model pinned-model", ctx);
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "armed after the first pause");
+
+  // Real progress happened between the two pauses.
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 done\n  _Verified: ran it_\n- [ ] 1.2 todo\n- [ ] 1.3 todo\n", "utf8");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "still armed — progress happened, not stalled");
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-progress");
+  assert.ok(!events.some((e) => e.phase === "apply" && e.edge === "end"), "no settle while genuinely progressing");
 });
 
 await test("handoff model: an unreadable tasks.md counts as done so the handoff cannot get stuck", async () => {

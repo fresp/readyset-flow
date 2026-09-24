@@ -16,6 +16,7 @@ import {
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { basename, join, relative } from "node:path";
 import {
@@ -1389,7 +1390,20 @@ export function resetActiveGrillSession(): void {
  * state here is shared and a subagent's terminal agent_end shares the parent's cwd.
  */
 export let pendingHandoff:
-	| { changeId: string; restoreTo: unknown; cwd: string; sessionId?: string }
+	| {
+			changeId: string;
+			restoreTo: unknown;
+			cwd: string;
+			sessionId?: string;
+			/** `git rev-parse HEAD` captured at approve time, before the handoff fires — see
+			 *  `pathsChangedThisRun`/`applyDiffStats`'s use of it (Fix: approve-base diffing).
+			 *  `undefined` for a repo with no commits yet. */
+			baseSha?: string;
+			/** The progress+tree fingerprint (`computePauseFingerprint`) recorded at the LAST pause,
+			 *  so the next terminal settle can tell "still working" from "stopped making progress" —
+			 *  see `handlePendingHandoff`'s pause branch. `undefined` before the first pause. */
+			pauseFingerprint?: string;
+	  }
 	| undefined;
 
 /**
@@ -1644,6 +1658,11 @@ export async function settleHandoff(
 			"A new /readyset command superseded the handed-off execution — the model this session had before the run is restored (handoff-superseded).",
 			"warning",
 		);
+	} else if (outcome === "handoff-stalled") {
+		ctx.ui.notify(
+			"The handed-off execution paused twice with no observable progress in between — treating it as stalled and restoring the model this session had before the run.",
+			"warning",
+		);
 	} else {
 		ctx.ui.notify("Execution settled — restored the model this session had before the run.", "info");
 	}
@@ -1658,6 +1677,26 @@ export async function settleHandoff(
 async function executionComplete(cwd: string, changeId: string): Promise<boolean> {
 	const progress = await getProgress(cwd, changeId).catch(() => undefined);
 	return progress === undefined || progress.total === 0 || progress.done === progress.total;
+}
+
+/**
+ * Fingerprints "how far execution has gotten" at a pause: tasks.md's done/total count plus the
+ * raw `git status --porcelain` text (so a change that only rewrites work already counted, or
+ * only rearranges the tree without ticking a box, still shows as movement). Two pauses with the
+ * same fingerprint mean nothing observable changed between them — see `handlePendingHandoff`'s
+ * pause branch, which settles as `"handoff-stalled"` rather than pausing forever. Never throws:
+ * an unreadable tasks.md or a git failure still yields a stable (if degraded) fingerprint rather
+ * than blocking the pause record.
+ */
+async function computePauseFingerprint(cwd: string, changeId: string): Promise<string> {
+	const progress = await getProgress(cwd, changeId).catch(() => undefined);
+	const run = promisify(execFile);
+	const status = await run("git", ["status", "--porcelain", "-uall"], { cwd, timeout: 30000 })
+		.then((r) => r.stdout)
+		.catch(() => "");
+	return createHash("sha1")
+		.update(`${progress?.done ?? -1}/${progress?.total ?? -1}\n${status}`)
+		.digest("hex");
 }
 
 /**
@@ -1682,24 +1721,31 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 	if (!handoff) return;
 	if (!sessionMatches(ctx, handoff.sessionId, handoff.cwd)) return; // another session's settle: leave it
 	if (!(await executionComplete(ctx.cwd, handoff.changeId))) {
-		// Execution paused to ask a question / report a blocker. Keep the handoff armed and the
-		// execution model active. The pause is recorded as an `apply` `start` event (the only legal
-		// `edge` values are start|end — readyset-spec.ts), same phase as the original apply start,
-		// so start/end stay balanced and executionModelOf (which finds the FIRST apply start) still
-		// returns the execution model. handoffRestoreTarget is deliberately NOT cleared here: the
-		// arm must survive until the real settle.
+		// Execution paused to ask a question / report a blocker. Idempotent: the pause is recorded
+		// in CONTEXT.md ONLY, never as a new `apply` `start` phase event — the old behavior wrote one
+		// per pause, so N pauses left N unbalanced `start`s and no `end` (round-3's own probe). A
+		// fingerprint of tasks.md progress + the raw working-tree status is compared against the
+		// fingerprint the LAST pause recorded: identical means nothing observable happened between
+		// the two pauses — the model has genuinely stopped making progress — so this settles as
+		// `"handoff-stalled"` instead of arming forever. A changed fingerprint means real work
+		// happened; the handoff stays armed, only the fingerprint and the CONTEXT.md note update.
 		const progress = await getProgress(ctx.cwd, handoff.changeId).catch(() => undefined);
 		const done = progress?.done ?? 0;
 		const total = progress?.total ?? 0;
-		await appendPhaseEvent(ctx.cwd, handoff.changeId, {
-			phase: "apply",
-			edge: "start",
-			at: new Date().toISOString(),
-			lane: (await readChangeLane(ctx.cwd, handoff.changeId)) ?? "full",
-			laneSource: "brainstorm",
-			model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
-			outcome: "handoff-paused",
-		}).catch(() => {});
+		const fingerprint = await computePauseFingerprint(ctx.cwd, handoff.changeId);
+		if (handoff.pauseFingerprint !== undefined && handoff.pauseFingerprint === fingerprint) {
+			pendingHandoff = undefined;
+			handoffRestoreTarget = undefined;
+			await appendContext(
+				ctx.cwd,
+				handoff.changeId,
+				"Apply",
+				`Execution paused twice at ${done}/${total} tasks with no observable progress in between — settling as stalled.`,
+			).catch(() => {});
+			await settleHandoff(pi, ctx, handoff, "handoff-stalled");
+			return;
+		}
+		pendingHandoff = { ...handoff, pauseFingerprint: fingerprint };
 		await appendContext(
 			ctx.cwd,
 			handoff.changeId,
