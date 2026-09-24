@@ -470,7 +470,7 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 		"(e.g. an inline TODO or a short note left by the person working in this repo) and uncommitted hunk intact when you edit a " +
 		"file — never strip, reword, reformat, or delete a stray comment or a hunk you did not write, and " +
 		"never delete or stage away an untracked file that was already there. Edit AROUND it." +
-		"Keep going until every task is complete or you are blocked, then report progress as N/M tasks." +
+		"\n\nKeep going until every task is complete or you are blocked, then report progress as N/M tasks." +
 		openDecisionsBlock
 	);
 }
@@ -605,6 +605,11 @@ export function codeReviewTurnPrompt(
 	changedPaths: string[] = [],
 ): string {
 	const paths = changePaths("", changeId);
+	// Lane-aware read list, same reasoning as applyTurnPrompt's: the fast lane never writes
+	// design.md or a spec delta, and its scenarios live under proposal.md's `## Acceptance`.
+	const readList = lane === "fast"
+		? `${paths.proposal} (its \`## Acceptance\` scenarios) and ${paths.tasks}`
+		: `${paths.proposal}, ${paths.design}, every specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks}`;
 	const triggerLine = triggerResult && triggerResult.fired.length > 0
 		? `This review was triggered by: ${triggerResult.fired.join(", ")}. Focus your findings on these.\n\n`
 		: "";
@@ -613,8 +618,8 @@ export function codeReviewTurnPrompt(
 		(changedPaths.length > 0
 			? `the files this run changed are ${changedPaths.join(", ")}. `
 			: "read the diff of the files this run changed. ") +
-		`Then read ${paths.proposal}, ${paths.design}, every specs/**/spec.md under ${paths.specsDir}, and ${paths.tasks} ` +
-		"(including its _Verified: notes) for the scenarios those files are supposed to satisfy. Read any other file only " +
+		`Then read ${readList} ` +
+		"(including tasks.md's _Verified: notes) for the scenarios those files are supposed to satisfy. Read any other file only " +
 		"when the diff needs context to be judged — do not read the whole repo. You did not write this implementation; " +
 		"your job is to find problems " +
 		"in it, not to confirm it's fine.\n\n" +

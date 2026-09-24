@@ -5020,6 +5020,34 @@ await test("lane-aware grounding: fast-lane propose/apply never mention EXPLORAT
   assert.match(fullApply, /specs\/\*\*/, "full lane apply still reads specs/**");
   assert.doesNotMatch(fastApply, /design\.md/, "fast lane apply never mentions design.md -- it doesn't exist");
   assert.doesNotMatch(fastApply, /specs\/\*\*/, "fast lane apply never mentions specs/** -- fast lane carries no spec delta");
+
+  const fullReview = mod.codeReviewTurnPrompt("x", "full");
+  const fastReview = mod.codeReviewTurnPrompt("x", "fast");
+  assert.match(fullReview, /design\.md/, "full lane review still reads design.md");
+  assert.match(fullReview, /specs\/\*\*/, "full lane review still reads specs/**");
+  assert.doesNotMatch(fastReview, /design\.md/, "fast lane review never mentions design.md -- it doesn't exist");
+  assert.doesNotMatch(fastReview, /specs\/\*\*/, "fast lane review never mentions specs/**");
+  assert.match(fastReview, /## Acceptance/, "fast lane review points at proposal.md's Acceptance scenarios");
+});
+
+await test("prompts: no two sentences glued together across string concatenation", async () => {
+  const mod = await loadMod();
+  const prompts: [string, string][] = [
+    ["apply full", mod.applyTurnPrompt("x", [], "full")],
+    ["apply fast", mod.applyTurnPrompt("x", [], "fast")],
+    ["review full", mod.codeReviewTurnPrompt("x", "full")],
+    ["review fast", mod.codeReviewTurnPrompt("x", "fast")],
+    ["explore", mod.exploreTurnPrompt({ changeId: "x", file: ".ai/brainstorms/x.md" } as any, [])],
+    ["propose full", mod.proposeTurnPrompt({ changeId: "x", file: ".ai/brainstorms/x.md" } as any, "full")],
+    ["propose fast", mod.proposeTurnPrompt({ changeId: "x", file: ".ai/brainstorms/x.md" } as any, "fast")],
+    ["refine", mod.refineTurnPrompt("x", "fb", [])],
+    ["grill", mod.grillTurnPrompt("idea", "2026-01-01", "ask")],
+  ];
+  for (const [name, prompt] of prompts) {
+    // A lowercase word, a period, then an uppercase letter with no space: "it.Keep".
+    const glued = prompt.match(/\b[a-z]{2,}[.!?][A-Z][a-z]/g) ?? [];
+    assert.deepEqual(glued, [], `${name} prompt has a glued sentence boundary`);
+  }
 });
 
 await test("grill prompt: the per-task commit-only/merge-request question and its template field are gone", async () => {
