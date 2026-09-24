@@ -475,6 +475,11 @@ export function applyTurnPrompt(changeId: string, openDecisions: OpenDecision[] 
 		"file — never strip, reword, reformat, or delete a stray comment or a hunk you did not write, and " +
 		"never delete or stage away an untracked file that was already there. Edit AROUND it." +
 		"\n\nKeep going until every task is complete or you are blocked, then report progress as N/M tasks." +
+		"\n\nSignal the outcome with the `readyset_done` tool — it is how Readyset knows execution is over, " +
+		"instead of guessing from checkboxes. When every task is checked and has its `_Verified:` note, call " +
+		"`readyset_done` with status \"done\" and a one-line summary as your last action. If you cannot continue " +
+		"without the user (an unclear requirement, missing access, a decision outside the spec), call it with " +
+		"status \"blocked\" and the exact question, then ask that question and end your turn." +
 		openDecisionsBlock
 	);
 }
@@ -1424,6 +1429,13 @@ export function resetActiveGrillSession(): void {
  * parent-imported extension factory into subagent runtimes in the same process, so module-level
  * state here is shared and a subagent's terminal agent_end shares the parent's cwd.
  */
+/** What the executing model reported through `readyset_done` (see registerDoneTool). */
+export interface HandoffSignal {
+	status: "done" | "blocked";
+	summary: string;
+	at: string;
+}
+
 /** The risk-based review policy captured at arm time, so the settle path (which runs from the
  *  `agent_end` hook — no access to the command handler's local config reads) can apply it without
  *  re-resolving config. Mirrors the same fields `reviewAndMaybeExecute` already threads through. */
@@ -1451,6 +1463,15 @@ export let pendingHandoff:
 			/** The review policy this run resolved, captured so a real settle (not a pause or a
 			 *  supersede) can apply it — see `applyReviewPolicyAtSettle`. */
 			reviewPolicy?: ArmedReviewPolicy;
+			/** Running counts, recorded on the `apply` `end` event (PhaseEvent `handoff`). */
+			pauses?: number;
+			blocks?: number;
+			verificationBlocks?: number;
+			/** True when this handoff was re-attached from handoff.json after a restart. */
+			rehydrated?: boolean;
+			/** The executing model's latest readyset_done signal, consumed by the next terminal
+			 *  settle (`done` settles as handoff-done; `blocked` is an explicit, non-stall pause). */
+			signal?: HandoffSignal;
 	  }
 	| undefined;
 
@@ -1483,6 +1504,10 @@ async function persistPendingHandoff(handoff: NonNullable<typeof pendingHandoff>
 		armedAt: handoff.armedAt ?? new Date().toISOString(),
 		...(handoff.pauseFingerprint !== undefined ? { pauseFingerprint: handoff.pauseFingerprint } : {}),
 		...(handoff.reviewPolicy !== undefined ? { reviewPolicy: handoff.reviewPolicy } : {}),
+		...(handoff.pauses ? { pauses: handoff.pauses } : {}),
+		...(handoff.blocks ? { blocks: handoff.blocks } : {}),
+		...(handoff.verificationBlocks ? { verificationBlocks: handoff.verificationBlocks } : {}),
+		...(handoff.signal ? { signal: handoff.signal } : {}),
 	}).catch(() => {});
 }
 
@@ -1516,6 +1541,11 @@ export async function rehydratePendingHandoff(ctx: { cwd?: string; ui?: unknown;
 		armedAt: mine.armedAt,
 		pauseFingerprint: mine.pauseFingerprint,
 		reviewPolicy: mine.reviewPolicy as ArmedReviewPolicy | undefined,
+		pauses: mine.pauses,
+		blocks: mine.blocks,
+		verificationBlocks: mine.verificationBlocks,
+		rehydrated: true,
+		signal: mine.signal,
 	};
 	activeVerifyChangeId = mine.changeId;
 	(ctx.ui as { notify?: (m: string, l?: string) => void } | undefined)?.notify?.(
@@ -1822,18 +1852,33 @@ async function executionModelOf(cwd: string, changeId: string): Promise<string |
 export async function settleHandoff(
 	pi: ExtensionAPI,
 	ctx: ReviewCtx,
-	handoff: { changeId: string; restoreTo: unknown; reviewPolicy?: ArmedReviewPolicy },
+	handoff: {
+		changeId: string;
+		restoreTo: unknown;
+		reviewPolicy?: ArmedReviewPolicy;
+		pauses?: number;
+		blocks?: number;
+		verificationBlocks?: number;
+		rehydrated?: boolean;
+		signal?: HandoffSignal;
+	},
 	outcome: string,
 ): Promise<void> {
-	// A real settle (the execution actually ran to completion, or stalled with real diff behind
-	// it) gets its diff measured NOW, live, against the approve base — not read back from a stale
-	// event later. `handoff-superseded` skips this: the handoff was abandoned mid-run by a new
-	// /readyset command, so there is nothing conclusive to measure or review yet.
-	const isRealSettle = outcome === "handoff-settled" || outcome === "handoff-stalled";
+	// A real settle (the execution signalled done, ran every task to completion, or stalled with
+	// real diff behind it) gets its diff measured NOW, live, against the approve base — not read
+	// back from a stale event later — and the review policy applied. `handoff-superseded` and
+	// `handoff-orphaned` skip both: the execution was abandoned mid-run, nothing is conclusive.
+	const isRealSettle = outcome === "handoff-done" || outcome === "handoff-settled" || outcome === "handoff-stalled";
 	const changedPaths = isRealSettle
 		? await pathsChangedThisRun(ctx.cwd, handoff.changeId).catch(() => [] as string[])
 		: undefined;
 	const diff = changedPaths ? await applyDiffStats(ctx.cwd, handoff.changeId, changedPaths).catch(() => undefined) : undefined;
+
+	// The review decision is taken BEFORE the apply `end` event is written, so the event can carry
+	// it (the bench reads the settle's decision from there rather than from notify text).
+	const reviewDecision = isRealSettle && changedPaths && handoff.reviewPolicy
+		? await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }).catch(() => undefined)
+		: undefined;
 
 	await appendPhaseEvent(ctx.cwd, handoff.changeId, {
 		phase: "apply",
@@ -1844,6 +1889,14 @@ export async function settleHandoff(
 		model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
 		outcome,
 		...(diff ? { diff } : {}),
+		handoff: {
+			pauses: handoff.pauses ?? 0,
+			blocks: handoff.blocks ?? 0,
+			verificationBlocks: handoff.verificationBlocks ?? 0,
+			rehydrated: handoff.rehydrated === true,
+			...(handoff.signal ? { signal: handoff.signal.status } : {}),
+		},
+		...(reviewDecision ? { reviewPolicy: reviewDecision } : {}),
 	}).catch(() => {});
 	// The window is closed: the persisted copy must not be re-attached by a later process.
 	await clearHandoffState(ctx.cwd, handoff.changeId).catch(() => {});
@@ -1851,8 +1904,8 @@ export async function settleHandoff(
 	// readyset_verify is only meaningful while THIS handoff's execution is live.
 	if (activeVerifyChangeId === handoff.changeId) activeVerifyChangeId = undefined;
 
-	if (isRealSettle && changedPaths && handoff.reviewPolicy) {
-		await applyReviewPolicyAtSettle(ctx, handoff.changeId, handoff.reviewPolicy, changedPaths, diff ?? { files: 0, added: 0, deleted: 0 }).catch(() => {});
+	if (outcome === "handoff-done") {
+		ctx.ui.notify(`Execution of "${handoff.changeId}" signalled done: ${handoff.signal?.summary ?? "(no summary)"}`, "info");
 	}
 
 	if (handoff.restoreTo === undefined) return; // nothing was ever pinned; nothing to restore
@@ -1904,13 +1957,13 @@ async function applyReviewPolicyAtSettle(
 	policy: ArmedReviewPolicy,
 	changedPaths: string[],
 	diff: { files: number; added: number; deleted: number },
-): Promise<void> {
+): Promise<NonNullable<PhaseEvent["reviewPolicy"]>> {
 	const productPaths = changedPaths.filter((p) => !isPlanningPath(p));
 	const lane = (await readChangeLane(ctx.cwd, changeId)) ?? "full";
 
 	if (policy.mode === "never") {
 		await writeReviewSkipStub(ctx.cwd, changeId, { evaluated: [], fired: [], firedSensitivePaths: [] }, "never");
-		return;
+		return { mode: policy.mode, decision: "skipped", triggersFired: [] };
 	}
 
 	// "always", or "auto" on the full lane when the fullLane exemption says full-lane changes
@@ -1922,7 +1975,7 @@ async function applyReviewPolicyAtSettle(
 				`) — run /readyset --review ${changeId}.`,
 			"info",
 		);
-		return;
+		return { mode: policy.mode, decision: "recommended", triggersFired: [] };
 	}
 
 	// "auto": evaluate the same triggers evaluateReviewTriggers always has, against this run's
@@ -1956,12 +2009,13 @@ async function applyReviewPolicyAtSettle(
 
 	if (triggerResult.fired.length === 0) {
 		await writeReviewSkipStub(ctx.cwd, changeId, triggerResult, "auto");
-	} else {
-		ctx.ui.notify(
-			`Review recommended for "${changeId}": ${triggerResult.fired.join(", ")} — run /readyset --review ${changeId}.`,
-			"warning",
-		);
+		return { mode: policy.mode, decision: "skipped", triggersFired: [] };
 	}
+	ctx.ui.notify(
+		`Review recommended for "${changeId}": ${triggerResult.fired.join(", ")} — run /readyset --review ${changeId}.`,
+		"warning",
+	);
+	return { mode: policy.mode, decision: "recommended", triggersFired: triggerResult.fired };
 }
 
 /**
@@ -2016,7 +2070,32 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 	const handoff = pendingHandoff;
 	if (!handoff) return;
 	if (!sessionMatches(ctx, handoff.sessionId, handoff.cwd)) return; // another session's settle: leave it
+	// The executing model's own completion signal wins over every heuristic below: readyset_done
+	// only records `done` once every task is checked and verified (see registerDoneTool), so the
+	// turn that sent it is the end of the execution — no inference from checkboxes or git needed.
+	if (handoff.signal?.status === "done") {
+		pendingHandoff = undefined;
+		handoffRestoreTarget = undefined;
+		await settleHandoff(pi, ctx, handoff, "handoff-done");
+		return;
+	}
 	if (!(await executionComplete(ctx.cwd, handoff.changeId))) {
+		if (handoff.signal?.status === "blocked") {
+			const blockedProgress = await getProgress(ctx.cwd, handoff.changeId).catch(() => undefined);
+			// An explicit block (readyset_done status "blocked"): the model stopped to ask the user
+			// something it cannot resolve alone. That is a pause by definition, never evidence of a
+			// stall — the fingerprint is reset so the stall check starts fresh after the user answers.
+			const summary = handoff.signal.summary;
+			pendingHandoff = { ...handoff, signal: undefined, pauseFingerprint: undefined, blocks: (handoff.blocks ?? 0) + 1 };
+			await persistPendingHandoff(pendingHandoff);
+			const where = `${blockedProgress?.done ?? 0}/${blockedProgress?.total ?? 0} tasks`;
+			await appendContext(ctx.cwd, handoff.changeId, "Apply", `Execution blocked at ${where}: ${summary}`).catch(() => {});
+			ctx.ui.notify(
+				`Execution of "${handoff.changeId}" is blocked at ${where}: ${summary} — answer in chat to let it continue (the execution model stays active), or run /readyset to supersede it.`,
+				"warning",
+			);
+			return;
+		}
 		// Execution paused to ask a question / report a blocker. Idempotent: the pause is recorded
 		// in CONTEXT.md ONLY, never as a new `apply` `start` phase event — the old behavior wrote one
 		// per pause, so N pauses left N unbalanced `start`s and no `end` (round-3's own probe). A
@@ -2041,7 +2120,7 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 			await settleHandoff(pi, ctx, handoff, "handoff-stalled");
 			return;
 		}
-		pendingHandoff = { ...handoff, pauseFingerprint: fingerprint };
+		pendingHandoff = { ...handoff, pauseFingerprint: fingerprint, pauses: (handoff.pauses ?? 0) + 1 };
 		await persistPendingHandoff(pendingHandoff);
 		await appendContext(
 			ctx.cwd,
@@ -4024,6 +4103,98 @@ function registerVerifyTool(pi: ExtensionAPI): void {
 	});
 }
 
+/** Shape of `readyset_done`'s params — see `ReadysetAskParams` for why this is declared and cast
+ *  to rather than inferred from the `pi.zod` schema passed to `registerTool`. */
+interface ReadysetDoneParams {
+	status: "done" | "blocked";
+	summary?: string;
+}
+
+/**
+ * Registers `readyset_done` — the executing model's explicit end-of-execution signal.
+ *
+ * Before it existed, "is the handed-off execution over?" was inferred at every terminal
+ * `agent_end`: all boxes ticked meant settled, anything else a pause, and two pauses with an
+ * identical progress+tree fingerprint a stall. That inference is the fallback now, not the rule:
+ *   - `done` is recorded only when every task in tasks.md is checked AND carries a `_Verified:`
+ *     note (the same check the session_stop gate applies) — otherwise the call is refused with the
+ *     reason, so a premature "done" costs one tool call, not a wrong settle. The next terminal
+ *     settle then closes the handoff as `handoff-done` (diff, review policy, model restore).
+ *   - `blocked` needs the question/blocker as its summary; the next terminal settle records an
+ *     explicit pause (never counted toward a stall) and surfaces the question to the user.
+ * Only the session that armed the handoff may signal it: a subagent reports to its parent, which
+ * decides. Approval tier `read`: it runs nothing, it only records Readyset's own state.
+ */
+function registerDoneTool(pi: ExtensionAPI): void {
+	pi.registerTool({
+		name: "readyset_done",
+		label: "Readyset: Done",
+		description:
+			"Signal that the handed-off execution of an approved Readyset change is over. status \"done\": every task " +
+			"in tasks.md is checked and has its _Verified: note (refused otherwise, with the reason). status \"blocked\": " +
+			"you cannot continue without the user — put the exact question in summary, then ask it. Call it once, as your " +
+			"last action; only meaningful while executing an approved Readyset change.",
+		parameters: pi.zod.object({
+			status: pi.zod.enum(["done", "blocked"]).describe("done = all tasks checked and verified; blocked = need the user"),
+			summary: pi.zod.string().optional().describe("done: one line on what was delivered; blocked: the exact question or blocker"),
+		}),
+		approval: "read",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const reply = (text: string) => ({ content: [{ type: "text" as const, text }] });
+			const { status, summary } = params as ReadysetDoneParams;
+			const c = ctx as unknown as ReviewCtx;
+			await rehydratePendingHandoff(c).catch(() => {});
+			const handoff = pendingHandoff;
+			if (!handoff) {
+				return reply(
+					"readyset_done isn't attached to a handed-off Readyset execution right now, so there is nothing to signal. " +
+						"If you are not executing an approved Readyset change, just finish your reply normally.",
+				);
+			}
+			if (!sessionMatches(c, handoff.sessionId, handoff.cwd)) {
+				return reply(
+					"Only the session that approved this Readyset change can signal its execution. Report your result back to " +
+						"the session that started you instead; it decides when the change is done.",
+				);
+			}
+			const cwd = c.cwd ?? handoff.cwd;
+			const text = (summary ?? "").trim();
+			const at = new Date().toISOString();
+			if (status === "blocked") {
+				if (!text) return reply('Not recorded: status "blocked" needs a summary — the exact question or blocker for the user.');
+				pendingHandoff = { ...handoff, signal: { status: "blocked", summary: text, at } };
+				await persistPendingHandoff(pendingHandoff);
+				return reply(
+					"Recorded as blocked. Now ask the user that question in plain chat and end your turn — the execution stays " +
+						"armed, and when they answer you continue from where you stopped.",
+				);
+			}
+			if (status !== "done") return reply('Not recorded: status must be "done" or "blocked".');
+			const progress = await getProgress(cwd, handoff.changeId).catch(() => undefined);
+			if (progress && progress.done < progress.total) {
+				return reply(
+					`Not recorded: tasks.md still has ${progress.total - progress.done} unchecked task(s) (${progress.done}/${progress.total} done). ` +
+						'Finish and verify them, or call readyset_done with status "blocked" and the question that stops you.',
+				);
+			}
+			const verification = await checkTaskVerification(cwd, handoff.changeId).catch(() => undefined);
+			if (verification && verification.missing > 0) {
+				return reply(
+					`Not recorded: ${verification.missing} checked task(s) in tasks.md have no _Verified: note. Add one under each ` +
+						"(what you ran or checked, and the actual result), then call readyset_done again.",
+				);
+			}
+			pendingHandoff = { ...handoff, signal: { status: "done", summary: text || "(no summary)", at } };
+			await persistPendingHandoff(pendingHandoff);
+			await appendContext(cwd, handoff.changeId, "Apply", `Execution signalled done: ${text || "(no summary)"}`).catch(() => {});
+			return reply(
+				"Recorded as done. End your turn now with a short report for the user; Readyset closes the execution, restores " +
+					"the model and applies the review policy when the turn ends.",
+			);
+		},
+	});
+}
+
 export interface ReadysetArgs {
 	all: boolean;
 	fast: boolean;
@@ -4661,6 +4832,10 @@ export default function (pi: ExtensionAPI) {
 			const blocked = sessionStopBlockCounts.get(counterKey) ?? 0;
 			if (blocked >= MAX_VERIFICATION_SENDBACKS) return undefined; // cap reached: let the session stop
 			sessionStopBlockCounts.set(counterKey, blocked + 1);
+			if (pendingHandoff?.changeId === check.changeId) {
+				pendingHandoff = { ...pendingHandoff, verificationBlocks: (pendingHandoff.verificationBlocks ?? 0) + 1 };
+				await persistPendingHandoff(pendingHandoff);
+			}
 			return {
 				decision: "block" as const,
 				reason:
@@ -4672,6 +4847,7 @@ export default function (pi: ExtensionAPI) {
 	}
 	registerAskTool(pi);
 	registerVerifyTool(pi);
+	registerDoneTool(pi);
 	pi.registerCommand("readyset", {
 		description:
 			"Readyset: propose + review + execute a brainstorm against real repo state, standalone — no /plan or external CLI required " +

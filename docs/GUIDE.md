@@ -320,6 +320,21 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   model is applied — so `--phase-model apply=<spec>` on its own still restores. If applying the
   execution model fails (no key, unresolved spec, host without `pi.setModel`), nothing is captured
   and the settle has nothing to restore.
+- **The executing model signals the end with `readyset_done`.** The apply prompt tells it to call
+  `readyset_done` as its last action:
+  - `status: "done"` is accepted only when every task in `tasks.md` is checked and has its
+    `_Verified:` note. Otherwise the call is refused with the reason, so a premature "done" costs
+    one tool call rather than a wrong settle. The next terminal `agent_end` then closes the handoff
+    as `outcome: "handoff-done"`.
+  - `status: "blocked"` needs the exact question as its summary. It is an explicit pause: the
+    question is surfaced to you, the execution model stays active, and it never counts toward a
+    stall.
+
+  Only the arming session can signal; a subagent is told to report to its parent. When no signal
+  arrives, the checkbox/fingerprint inference below is the fallback. The balancing `apply` `end`
+  event records how the execution got there (`handoff: { pauses, blocks, verificationBlocks,
+  rehydrated, signal }`) and the review policy's decision (`reviewPolicy: { mode, decision,
+  triggersFired }`), so the bench can score handoff outcomes directly.
 - **Settling is pause-aware and idempotent.** A *terminal* `agent_end` with tasks still unfinished
   means execution paused to ask a question or report a blocker, not that it finished: the execution
   model stays active, the handoff stays armed, and the pause is recorded as a `CONTEXT.md` line

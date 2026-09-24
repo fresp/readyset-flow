@@ -377,6 +377,12 @@ export interface PersistedHandoff {
 	/** The review policy resolved at arm time (readyset-review.ts `ArmedReviewPolicy`), kept
 	 *  opaque here: this file owns the format, the extension owns the meaning. */
 	reviewPolicy?: unknown;
+	/** Running counts for the `apply` `end` event's `handoff` stats. */
+	pauses?: number;
+	blocks?: number;
+	verificationBlocks?: number;
+	/** The executing model's readyset_done signal, not yet consumed by a settle/pause. */
+	signal?: { status: "done" | "blocked"; summary: string; at: string };
 }
 
 export async function writeHandoffState(cwd: string, state: PersistedHandoff): Promise<void> {
@@ -436,6 +442,12 @@ export interface PhaseEvent {
 	counts?: { outsideBefore: number; reverted: number; justified: number; unjustifiedAfter: number; blockingBefore?: number; blockingAfter?: number };
 	/** `apply` `end` only: final Apply diff size for the bench. */
 	diff?: { files: number; added: number; deleted: number };
+	/** `apply` `end` only, handed-off execution (0.16+): how the execution got to its settle.
+	 *  `signal` is the executing model's own readyset_done status, when it sent one. */
+	handoff?: { pauses: number; blocks: number; verificationBlocks: number; rehydrated: boolean; signal?: "done" | "blocked" };
+	/** `apply` `end` only, handed-off execution: the risk-based review policy's decision at settle
+	 *  (`skipped` wrote REVIEW.md's stub; `recommended` told the user to run --review). */
+	reviewPolicy?: { mode: "auto" | "always" | "never"; decision: "skipped" | "recommended"; triggersFired: string[] };
 	/** `compact` only: which boundary this compaction preceded. */
 	boundary?: "explore" | "propose" | "apply";
 	/** `compact` only: context usage before/after when the host reported it. */

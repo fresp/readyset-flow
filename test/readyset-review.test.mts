@@ -1847,6 +1847,95 @@ await test("persisted handoff: --review <id> from another session closes an orph
   assert.ok(fakePiWrap.calls.some((c) => /Critically review the implementation/.test(c.prompt)), "the review still ran");
 });
 
+// --- readyset_done: the executing model's explicit completion signal --------------------------
+
+async function loadWithDoneTool(fakePi: ReturnType<typeof makeFakePi>["pi"]) {
+  const mod = (await import(`../src/extensions/readyset-review.ts?t=${Date.now()}-${Math.random()}`)) as { default: (pi: unknown) => void };
+  let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  let agentEnd: ((event: unknown, ctx: unknown) => Promise<void> | void) | undefined;
+  let done: { execute: (...args: unknown[]) => Promise<{ content: { text: string }[] }> } | undefined;
+  mod.default({
+    ...fakePi,
+    registerCommand(_n: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) { handler = def.handler; },
+    on(event: string, h: (event: unknown, ctx: unknown) => void) { if (event === "agent_end") agentEnd = h as any; },
+    registerTool(def: { name: string; execute: (...args: unknown[]) => Promise<any> }) { if (def.name === "readyset_done") done = def as any; },
+    zod: fakeZod,
+  } as any);
+  if (!handler || !agentEnd || !done) throw new Error("handler, agent_end or readyset_done was never registered");
+  return {
+    handler,
+    agentEnd: async (e: unknown, c: unknown) => void (await agentEnd!(e, c)),
+    signal: async (params: { status: string; summary?: string }, ctx: unknown) => (await done!.execute("call", params, undefined, undefined, ctx)).content[0].text,
+  };
+}
+
+async function armDoneHandoff(slug: string, date: string) {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, `${date}-${slug}.md`, { title: slug, status: "proposed", created: date, change_id: slug });
+  const dir = await writeProposedChange(cwd, slug, ["- src/keep.ts"]);
+  const fakePiWrap = makeFakePi(cwd);
+  const loaded = await loadWithDoneTool(fakePiWrap.pi);
+  const ui = makeFakeUi();
+  const sessionId = `${slug}-session`;
+  const ctx = { cwd, ui: ui.ui, waitForIdle: fakePiWrap.waitForIdle, sessionManager: { getSessionId: () => sessionId } };
+  ui.selectQueue.push(`${date} · ${slug}`);
+  ui.selectQueue.push("Approve & Execute, keep context");
+  await loaded.handler("", ctx);
+  return { cwd, dir, ui, sessionId, ...loaded };
+}
+
+await test("readyset_done: refuses 'done' with unchecked or unverified tasks, then settles the handoff as handoff-done", async () => {
+  const { cwd, dir, ui, sessionId, agentEnd, signal } = await armDoneHandoff("done-ok", "2026-07-23");
+  const toolCtx = eventCtx(cwd, ui.ui, sessionId);
+
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: ran it_\n- [ ] 1.2 b\n", "utf8");
+  assert.match(await signal({ status: "done" }, toolCtx), /Not recorded: tasks\.md still has 1 unchecked task/);
+
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: ran it_\n- [x] 1.2 b\n", "utf8");
+  assert.match(await signal({ status: "done" }, toolCtx), /Not recorded: 1 checked task\(s\) in tasks\.md have no _Verified: note/);
+
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: ran it_\n- [x] 1.2 b\n  - _Verified: ran `npm test`, 2/2_\n", "utf8");
+  assert.match(await signal({ status: "done", summary: "shipped the endpoint" }, toolCtx), /Recorded as done/);
+
+  await agentEnd({ willContinue: false }, toolCtx);
+  const applyEnd = (await readPhaseEvents(cwd, "done-ok")).find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-done");
+  assert.equal(applyEnd?.handoff?.signal, "done");
+  assert.ok(applyEnd?.reviewPolicy, "the settle's review decision is recorded on the event");
+  assert.ok(ui.notifications.some((n) => /signalled done: shipped the endpoint/.test(n.message)));
+  assert.equal(await fileExists(join(dir, "handoff.json")), false);
+});
+
+await test("readyset_done: 'blocked' is an explicit pause -- never counted toward a stall, and counted on the settle event", async () => {
+  const { cwd, dir, ui, sessionId, agentEnd, signal } = await armDoneHandoff("done-blocked", "2026-07-24");
+  const toolCtx = eventCtx(cwd, ui.ui, sessionId);
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 a\n  _Verified: ran it_\n- [ ] 1.2 b\n", "utf8");
+
+  assert.match(await signal({ status: "blocked" }, toolCtx), /needs a summary/);
+  // Three blocked turns in a row with an unchanged tree: a fingerprint pause would stall on the second.
+  for (let i = 0; i < 3; i++) {
+    assert.match(await signal({ status: "blocked", summary: "Which DB should the export read from?" }, toolCtx), /Recorded as blocked/);
+    await agentEnd({ willContinue: false }, toolCtx);
+  }
+  assert.ok(ui.notifications.some((n) => /is blocked at 1\/2 tasks: Which DB/.test(n.message)));
+  assert.equal((await readPhaseEvents(cwd, "done-blocked")).filter((e) => e.phase === "apply" && e.edge === "end").length, 0, "still armed: no stall");
+
+  await markTasksDone(cwd, "done-blocked");
+  await agentEnd({ willContinue: false }, toolCtx);
+  const applyEnd = (await readPhaseEvents(cwd, "done-blocked")).find((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnd?.outcome, "handoff-settled", "without a done signal, the checkbox fallback still settles it");
+  assert.equal(applyEnd?.handoff?.blocks, 3);
+});
+
+await test("readyset_done: a subagent session, or no armed handoff, cannot signal", async () => {
+  const { cwd, ui, signal } = await armDoneHandoff("done-sub", "2026-07-25");
+  assert.match(await signal({ status: "done" }, eventCtx(cwd, ui.ui, "a-subagent")), /Only the session that approved/);
+
+  const other = await freshRepo();
+  const loaded = await loadWithDoneTool(makeFakePi(other).pi);
+  assert.match(await loaded.signal({ status: "done" }, eventCtx(other, ui.ui, "nobody")), /isn't attached to a handed-off Readyset execution/);
+});
+
 await test("review policy at settle: mode=never writes the skip stub", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-13-policy-never.md", {
