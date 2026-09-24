@@ -6,6 +6,34 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
+## 0.17.0 - 2026-09-24
+
+Makes the handed-off execution trustworthy: it runs on the model you pinned, pauses and settles correctly, survives an omp restart, has to show verification before it stops, and gets the risk-based review policy applied when it is done.
+
+### Added
+- **Verification gate at session stop**: while a handed-off execution is live, the session that approved it cannot stop with a checked task in `tasks.md` that lacks a `_Verified:` note — it is sent back at most twice per change, then allowed to stop. Subagents spawned during the execution are never gated.
+- **Approve-base tracking**: `HEAD` at approve time is recorded; scope checks, review triggers and the Apply diff stats measure against it, so commits the execution makes mid-run are no longer invisible.
+- **Review policy at settle**: when a handed-off execution settles, `readyset.review.mode` is applied — a skip stub in `REVIEW.md` with the reason, or a notice recommending `/readyset --review <change-id>` that names the triggers that fired.
+- **Handoff survives an omp restart**: the unsettled handoff is mirrored to `readyset/changes/<id>/handoff.json`; the same session re-attaches it after a restart or resume, and `/readyset --review <id>` closes one left behind by another session as `handoff-orphaned`.
+- **`readyset_verify` is live for the whole handed-off execution** again.
+
+### Changed
+- **Execution runs on the pinned model**: the apply phase model (else the run's `--model` pin) is applied before the handoff and the session's previous model is restored once the execution settles — also when only an apply override was set.
+- **Pause-aware settle**: a terminal turn with tasks still unfinished is a pause (the execution model stays active), two pauses with no observable progress settle as `handoff-stalled`, and a new `/readyset` command supersedes an unsettled handoff (restoring the model and closing the `apply` window).
+- **Session identity, not directory**, keys the handoff and the grill session, so a subagent's own settle can never end the parent's.
+- **Grilling runs on the grill model**: `--phase-model grill=` / `readyset.model.phases.grill`, else the run pin, is applied before the grill turn and restored once the brainstorm is written. With `readyset.model` or `modelRoles.default` configured, grilling now runs on that model instead of whatever the session had.
+- **Prompts**: benchmark-specific text removed from the product prompts; grounding is lane-aware; the fast-lane review reads only `proposal.md`'s Acceptance scenarios and `tasks.md`; grilling no longer asks the unused per-task git-flow question.
+- **Benchmark table withdrawn** from the README; `docs/BENCHMARK.md` is labeled as not a verified claim about the current version.
+
+### Fixed
+- The grill→propose transition crashed because the `agent_end` context has no `waitForIdle`.
+- A `_Verified:` note written as a `- _Verified: …` sub-bullet was counted as missing.
+- The `grill` phase event recorded a model grilling never ran on.
+- The archive offer left an unbalanced `archive` `end` event when the change was not archived, and claimed a review stub existed after an on-demand review that wrote nothing.
+- Two sentences in the apply prompt were glued together.
+
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/v0.16.0...v0.17.0
+
 ## 0.16.0 - 2026-09-24
 
 Narrows Readyset to the planning half of the workflow — Grill → Explore → Propose → Review Gate — and hands execution off to omp's native runtime instead of running its own apply/review loop.
@@ -22,7 +50,7 @@ Narrows Readyset to the planning half of the workflow — Grill → Explore → 
 ### Fixed
 - **`--review` argument parsing**: A flag following `--review` (e.g. `--review <change-id> --lane fast`) is no longer swallowed as a target change id.
 
-**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.15.0...0.16.0
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/v0.15.0...v0.16.0
 
 ## 0.15.0 - 2026-09-23
 
@@ -47,7 +75,7 @@ Introduces risk-based code review, open decision handling, bounded review repair
 - **Outside-repo tripwire**: Eliminated false positives on regex patterns, `/dev/*`, and URL route strings.
 - **Fast-lane picker visibility**: An explicit `--lane fast` now properly surfaces fast-lane brainstorms in the interactive picker.
 
-**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.14.0...0.15.0
+**Full Changelog**: https://github.com/fresp/readyset-flow/compare/0.14.0...v0.15.0
 
 ## 0.14.0
 
