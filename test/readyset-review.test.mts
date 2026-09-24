@@ -1146,6 +1146,8 @@ await test("handoff model: --model X pins at the gate, no restore before the han
   );
 
   // The terminal settle restores the pre-run model and records the balancing apply end event.
+  // Mark the tasks done first: a terminal settle with unfinished tasks is a pause, not a completion.
+  await markTasksDone(cwd, "handoff-pin");
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the pre-run model is restored after the execution settles");
   assert.ok(fakeUiWrap.notifications.some((n) => /Execution settled/.test(n.message)));
@@ -1174,6 +1176,7 @@ await test("handoff model: apply override without --model captures the session m
   assert.equal(fakePiWrap.calls.length, 1, "the execution prompt was handed off");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "handoff-applyonly"/);
 
+  await markTasksDone(cwd, "handoff-applyonly");
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
 
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "the session model captured before setModel is restored");
@@ -1223,6 +1226,59 @@ await test("handoff model: a new /readyset before settle supersedes the handoff 
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "no double restore");
 });
 
+await test("handoff model: a terminal agent_end with tasks unfinished pauses the handoff (no restore, still armed, pause recorded)", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-07-handoff-pause.md", {
+    title: "Handoff Pause", status: "proposed", created: "2026-07-07", change_id: "handoff-pause",
+  });
+  const dir = await writeProposedChange(cwd, "handoff-pause", ["- src/keep.ts"]);
+  // 1 of 3 checked -> execution is only paused.
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 done\n  _Verified: ran it_\n- [ ] 1.2 todo\n- [ ] 1.3 todo\n", "utf8");
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-07 · Handoff Pause");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  await handler("--model pinned-model", ctx);
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+
+  assert.ok(!fakePiWrap.setModelCalls.includes("session-default-model"), "no restore while tasks are unfinished");
+  assert.ok(fakeUiWrap.notifications.some((n) => /Execution paused at 1\/3 tasks/.test(n.message)), "the pause is notified: " + JSON.stringify(fakeUiWrap.notifications));
+  const events = await phaseEventsArchivedOrLive(cwd, "handoff-pause");
+  assert.ok(
+    events.some((e) => e.phase === "apply" && e.edge === "start" && e.outcome === "handoff-paused"),
+    "a pause record exists on the apply phase: " + JSON.stringify(events),
+  );
+  assert.ok(!events.some((e) => e.phase === "apply" && e.edge === "end"), "no apply end while paused");
+
+  // A later terminal agent_end with all tasks checked settles for real.
+  await writeFile(join(dir, "tasks.md"), "- [x] 1.1 done\n  _Verified: ran it_\n- [x] 1.2 done\n  _Verified: ran it_\n- [x] 1.3 done\n  _Verified: ran it_\n", "utf8");
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "restored once all tasks are done");
+  const after = await phaseEventsArchivedOrLive(cwd, "handoff-pause");
+  const applyEnds = after.filter((e) => e.phase === "apply" && e.edge === "end");
+  assert.equal(applyEnds.length, 1, "exactly one apply end event");
+  assert.equal(applyEnds[0].outcome, "handoff-settled");
+});
+
+await test("handoff model: an unreadable tasks.md counts as done so the handoff cannot get stuck", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-08-handoff-notasks.md", {
+    title: "Handoff No Tasks", status: "proposed", created: "2026-07-08", change_id: "handoff-notasks",
+  });
+  await writeProposedChange(cwd, "handoff-notasks", ["- src/keep.ts"]);
+  await rm(join(cwd, "readyset", "changes", "handoff-notasks", "tasks.md"), { force: true });
+
+  const { fakePiWrap, fakeUiWrap, handler, agentEnd, ctx, sessionId } = await gateCtx(cwd);
+  fakeUiWrap.selectQueue.push("2026-07-08 · Handoff No Tasks");
+  fakeUiWrap.selectQueue.push("Approve & Execute");
+  await handler("--model pinned-model", ctx);
+
+  await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
+  assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "an unreadable tasks.md still settles");
+});
+
 await test("handoff model: --phase-model apply=Y sets Y before the handoff and restores the original after settle", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-02-handoff-phase.md", {
@@ -1244,6 +1300,7 @@ await test("handoff model: --phase-model apply=Y sets Y before the handoff and r
     fakeUiWrap.notifications.some((n) => /Execution runs on "apply-model" \(from --phase-model flag\)/.test(n.message)),
   );
 
+  await markTasksDone(cwd, "handoff-phase");
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui, sessionId));
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model");
 
@@ -1318,6 +1375,7 @@ await test("handoff model: a failed apply-model pins falls back to the run pin, 
   assert.equal(fakePiWrap.calls.length, 1, "the execution prompt is still handed off");
   assert.match(fakePiWrap.calls[0].prompt, /Implement the Readyset change "handoff-noapply"/);
 
+  await markTasksDone(cwd, "handoff-noapply");
   await agentEnd({ willContinue: false }, eventCtx(cwd, fakeUiWrap.ui));
   assert.ok(
     fakeUiWrap.notifications.some((n) => /Couldn't restore the model this session had before the \/readyset run/.test(n.message) && n.level === "warning"),
@@ -3024,6 +3082,16 @@ await test("F6: (assumed) scenarios are parsed and shown at the gate", async () 
     "the review document lists the assumed scenario",
   );
 });
+
+// Marks every task in a change's tasks.md as done, so a terminal agent_end after approving the
+// change settles the handoff instead of recording a pause (executionComplete reads getProgress).
+async function markTasksDone(cwd: string, changeId: string) {
+  const path = join(cwd, "readyset", "changes", changeId, "tasks.md");
+  const raw = (await readFile(path, "utf8").catch(() => "")) || "";
+  const done = raw.replace(/^(\s*-\s*)\[ \]/gm, "$1[x]");
+  await mkdir(join(cwd, "readyset", "changes", changeId), { recursive: true });
+  await writeFile(path, done, "utf8");
+}
 
 // Reads phase events from the archived CONTEXT.md if the change was archived, else the live path.
 async function phaseEventsArchivedOrLive(cwd: string, changeId: string) {

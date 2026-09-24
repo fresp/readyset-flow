@@ -1619,12 +1619,29 @@ export async function settleHandoff(
 }
 
 /**
+ * True when the handed-off execution has run every task to completion. An unreadable tasks.md
+ * counts as done, so a missing/renamed file cannot leave the handoff armed forever.
+ * Reuses getProgress (readyset-spec.ts) — the same counting helper the gate and trigger input use,
+ * so "all done" means the same thing everywhere.
+ */
+async function executionComplete(cwd: string, changeId: string): Promise<boolean> {
+	const progress = await getProgress(cwd, changeId).catch(() => undefined);
+	return progress === undefined || progress.total === 0 || progress.done === progress.total;
+}
+
+/**
  * Settles a pending execution handoff: records the balancing `apply` `end` phase event and
  * restores the model the session had before the run pinned anything.
  *
  * Runs from the `agent_end` hook, and only on a terminal settle — see the handler's comment for
  * why `agent_end` (`willContinue !== true`) and not `session_stop`. The hook ctx is the general
  * `ExtensionContext`, which is all this needs: cwd, ui, and (for the restore) `pi.setModel`.
+ *
+ * Pause-aware: a terminal `agent_end` with tasks still unfinished means execution paused to ask a
+ * question or report a blocker (applyTurnPrompt tells the model to pause rather than guess), NOT
+ * that it finished. In that case the handoff stays armed, the execution model stays active, and a
+ * pause record is written; the model is restored when the tasks finish or on the next /readyset
+ * command (supersede).
  *
  * The handoff state is cleared first, so a throw later cannot leave a stale handoff armed forever
  * and re-firing on every subsequent agent_end.
@@ -1633,6 +1650,37 @@ export async function handlePendingHandoff(pi: ExtensionAPI, ctx: ReviewCtx): Pr
 	const handoff = pendingHandoff;
 	if (!handoff) return;
 	if (handoff.cwd !== ctx.cwd) return; // a different session's settle: leave it
+	if (!(await executionComplete(ctx.cwd, handoff.changeId))) {
+		// Execution paused to ask a question / report a blocker. Keep the handoff armed and the
+		// execution model active. The pause is recorded as an `apply` `start` event (the only legal
+		// `edge` values are start|end — readyset-spec.ts), same phase as the original apply start,
+		// so start/end stay balanced and executionModelOf (which finds the FIRST apply start) still
+		// returns the execution model. handoffRestoreTarget is deliberately NOT cleared here: the
+		// arm must survive until the real settle.
+		const progress = await getProgress(ctx.cwd, handoff.changeId).catch(() => undefined);
+		const done = progress?.done ?? 0;
+		const total = progress?.total ?? 0;
+		await appendPhaseEvent(ctx.cwd, handoff.changeId, {
+			phase: "apply",
+			edge: "start",
+			at: new Date().toISOString(),
+			lane: (await readChangeLane(ctx.cwd, handoff.changeId)) ?? "full",
+			laneSource: "brainstorm",
+			model: await executionModelOf(ctx.cwd, handoff.changeId).catch(() => undefined),
+			outcome: "handoff-paused",
+		}).catch(() => {});
+		await appendContext(
+			ctx.cwd,
+			handoff.changeId,
+			"Apply",
+			`Execution paused at ${done}/${total} tasks — execution model stays active until all tasks are done or the next /readyset command.`,
+		).catch(() => {});
+		ctx.ui.notify(
+			`Execution paused at ${done}/${total} tasks — execution model stays active. It is restored when all tasks are done or on the next /readyset command.`,
+			"info",
+		);
+		return; // handoff stays armed; handoffRestoreTarget stays set
+	}
 	pendingHandoff = undefined;
 	handoffRestoreTarget = undefined;
 	await settleHandoff(pi, ctx, handoff, "handoff-settled");
