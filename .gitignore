@@ -2,4 +2,3 @@ node_modules/
 *.tgz
 /.commandcode
 /bench
-/docs

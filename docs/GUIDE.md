@@ -351,9 +351,13 @@ before `/readyset` is restored once that execution actually finishes. Three deta
   a trigger firing, notifies that review is recommended and names `/readyset --review <id>`.
   Planning-only paths (`readyset/**`, `.ai/brainstorms/**`) never count toward a trigger — the model
   updating its own `tasks.md`/`CONTEXT.md` is not a reason to recommend review.
-- **A `session_stop` verification gate** blocks the session from ending (up to twice per session)
-  while a checked task in the actively-armed change lacks a `_Verified:` note, so "forgot to
-  annotate, moved on" doesn't slip past silently.
+- **A `session_stop` verification gate** blocks the session that approved the change from ending
+  (up to twice per change) while a checked task in the armed change lacks a `_Verified:` note
+  (plain or as a `- _Verified: …` sub-bullet), so "forgot to annotate, moved on" doesn't slip past
+  silently. Subagents spawned during the execution are never gated.
+- **The handoff survives an omp restart.** It is mirrored to `readyset/changes/<id>/handoff.json`
+  while unsettled; the same session re-attaches it after a restart or resume, and
+  `/readyset --review <id>` closes one another session left behind as `handoff-orphaned`.
 
 Readyset notifies which model execution runs on and where it came from.
 
