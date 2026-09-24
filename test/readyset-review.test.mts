@@ -1377,6 +1377,34 @@ await test("handoff model: ctx without sessionManager falls back to cwd matching
   assert.equal(fakePiWrap.setModelCalls.at(-1), "session-default-model", "falls back to cwd matching and settles");
 });
 
+await test("on-demand review that writes no REVIEW.md reports 'ran but wrote no REVIEW.md' and does not default to Archive now", async () => {
+  const cwd = await freshRepo();
+  await writeBrainstorm(cwd, "2026-07-11-review-empty.md", {
+    title: "Review Empty", status: "approved", created: "2026-07-11", change_id: "review-empty",
+  });
+  await writeProposedChange(cwd, "review-empty", ["- src/keep.ts"]);
+
+  const fakePiWrap = makeFakePi(cwd);
+  const handler = await loadHandler(fakePiWrap.pi);
+  const fakeUiWrap = makeFakeUi();
+  const ctx = { cwd, ui: fakeUiWrap.ui, waitForIdle: fakePiWrap.waitForIdle };
+
+  // The review turn writes nothing at all (no queued effect leaves REVIEW.md missing).
+  fakeUiWrap.selectQueue.push("Address findings first");
+  await handler("--review review-empty", ctx);
+
+  const promptIndex = fakeUiWrap.selectPrompts.findIndex((p) => /REVIEW\.md/.test(p) && /Archive now\?/.test(p));
+  assert.ok(promptIndex !== -1, "the archive prompt fired: " + JSON.stringify(fakeUiWrap.selectPrompts));
+  const prompt = fakeUiWrap.selectPrompts[promptIndex];
+  assert.match(prompt, /ran but wrote no REVIEW\.md/);
+  assert.ok(!/stub/.test(prompt), "the false 'see the stub' wording is gone");
+
+  const opts = fakeUiWrap.selectOptions[promptIndex] as { label: string }[];
+  assert.notEqual(opts[0].label, "Archive now", "archiving is not the default after a failed review");
+  assert.equal(opts[0].label, "Address findings first");
+  assert.ok(opts.some((o) => o.label === "Archive now"), "'Archive now' is still offered, just not first");
+});
+
 await test("handoff model: --phase-model apply=Y sets Y before the handoff and restores the original after settle", async () => {
   const cwd = await freshRepo();
   await writeBrainstorm(cwd, "2026-07-02-handoff-phase.md", {

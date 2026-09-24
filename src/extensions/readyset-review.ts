@@ -3028,7 +3028,7 @@ async function offerArchive(
 		edge: "start" | "end",
 		extra?: { outcome?: string },
 	) => Promise<void>,
-	skipReason: "skipped-flag" | "skipped-no-trigger" | undefined,
+	skipReason: "skipped-flag" | "skipped-no-trigger" | "review-failed" | undefined,
 	restoredPaths: string[],
 	findings: { found: number; fixed: number } | undefined,
 ): Promise<void> {
@@ -3046,14 +3046,24 @@ async function offerArchive(
 		? `Code review done for "${chosen.changeId}" — see ${changePaths(ctx.cwd, chosen.changeId).review}.`
 		: skipReason === "skipped-flag"
 			? `Code review skipped (never): readyset.review.mode = never.`
-			: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
+			: skipReason === "review-failed"
+				? `Code review ran but wrote no REVIEW.md — nothing was checked.`
+				: `Code review skipped (auto): no risk trigger — see the stub in ${changePaths(ctx.cwd, chosen.changeId).review}.`;
+	// A "Re-run review" option is deliberately not added: the extension cannot fire a second
+	// review turn from inside offerArchive without another turn budget and a fresh change-state
+	// read, so a "Re-run review" label would be a dead option. "Address findings first" already
+	// tells the user they can re-run /readyset.
+	const addressFirst = { label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" };
+	const archiveNow = { label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" };
+	const notYet = { label: "Not yet", description: "leave it in readyset/changes/ for now" };
+	// After a review that failed to write REVIEW.md, archiving is not the sensible default: lead
+	// with the option that says "go look at it" instead of "move on".
+	const options = skipReason === "review-failed"
+		? [addressFirst, archiveNow, notYet]
+		: [archiveNow, addressFirst, notYet];
 	const archiveChoice = await ctx.ui.select(
 		`${outsideLine}${tmpLine}${restoredLine}${findingsLine}${driftLine}${reviewLine} Archive now?`,
-		[
-			{ label: "Archive now", description: "moves the change to changes/archive/ and merges deltas into specs/ (append-only, best-effort — review after)" },
-			{ label: "Address findings first", description: "leave it in readyset/changes/ so you can fix review findings, then re-run /readyset" },
-			{ label: "Not yet", description: "leave it in readyset/changes/ for now" },
-		],
+		options,
 	);
 
 	if (archiveChoice !== "Archive now") {
@@ -3215,7 +3225,9 @@ async function runOnDemandReview(
 		reviewContent,
 		driftPaths,
 		recordPhase,
-		undefined,
+		// The truthiness mirrors the reviewOutcome line above: a falsey reviewContent is what that
+		// line calls "no-review", whether the file is missing or empty.
+		!(reviewContent) ? "review-failed" : undefined,
 		[],
 		undefined,
 	);
