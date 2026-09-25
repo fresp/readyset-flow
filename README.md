@@ -34,24 +34,21 @@ Installs globally, tied to `~/.omp/` — available in every repo you work in. Ru
 ```
 
 - **Grill** interrogates the idea until it's unambiguous — a real Q&A, not a rubber stamp. It also
-  proposes a **lane** (`--lane fast|full` to force one): fast folds Explore into Propose, caps the
-  plan, skips the heavier review probes, and writes a smaller artifact set (proposal + tasks only);
-  full is the workflow below. When it finishes, Readyset offers to carry straight on into Explore &
-  Propose — no second `/readyset` run, no re-picking the brainstorm.
+  proposes a **lane** (`--lane fast|full` to force one): fast folds Explore into Propose and writes
+  a smaller artifact set; full is the workflow below. When it finishes, Readyset offers to carry
+  straight on into Explore & Propose — no second `/readyset` run, no re-picking the brainstorm.
 - **Explore** greps the actual repo before anything gets proposed, instead of assuming.
 - **Propose** writes a proposal, design, specs, and tasks — grounded in what Explore found, and
-  with a `## Files This Change Will Touch` scope contract the gate checks against. (The fast lane
-  writes just `proposal.md` and `tasks.md`, with acceptance scenarios under `## Acceptance`.)
+  with a `## Files This Change Will Touch` scope contract the gate checks against.
 - **Review** stops for your Approve / Refine / Discard — **Discard is the default**, so nothing
-  executes without a deliberate look. Approve & Execute compacts first (Explore/Propose context is
-  already persisted to disk); "keep context" is the escape hatch.
-- **Execute** is handed off to core omp: approving captures the approve-base commit and the
-  execution model, dispatches the change's `tasks.md` to omp's native runtime, and Readyset exits,
-  so subagents, parallel tool calls, and live task-checklist updates work as usual. The execution
-  ends when the model calls `readyset_done` (or every task is checked); a turn that stops mid-work
-  just pauses, and the next `/readyset` closes an abandoned one. It is keyed by session id, so a
-  subagent's own settle can never end the parent session's handoff. When it's done, Readyset's risk-based review policy
-  decides whether to recommend `/readyset --review <change-id>` or skip it with an honest reason.
+  executes without a deliberate look.
+- **Execute** is handed off to core omp: approving dispatches `tasks.md` to omp's native runtime
+  and Readyset exits, so subagents, parallel tool calls, and live task-checklist updates work as
+  usual. Readyset runs the project's own tests itself — a baseline right after approve, then again
+  as the execution progresses — instead of trusting a self-reported note. The handoff closes on its
+  own: it settles when the model signals `readyset_done`, when every task gets checked, or when
+  your next `/readyset` supersedes it, no stall inference. When it's done, Readyset's risk-based
+  review policy recommends `/readyset --review <change-id>` or skips it with an honest reason.
 
 Pin a cheaper model per phase with `--phase-model grill=... --phase-model explore=...` (see the
 [full guide](docs/GUIDE.md#per-phase-models)).

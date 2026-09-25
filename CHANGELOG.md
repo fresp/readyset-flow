@@ -6,52 +6,41 @@ package.json`), grouped by the commit that bumped it, and describe real commits 
 rewritten narrative — a version with very few commits between it and the previous bump genuinely
 only had that much change in it.
 
-## Unreleased (planned 0.18.0)
+## 0.17.0 - 2026-09-25
 
-Execution now ends on an explicit signal instead of an inference, verification claims are checked against the evidence they cite, the phase budget actually stops a runaway turn, and the extension is split into focused modules with its machine state out of `CONTEXT.md`.
+Execution now ends on an explicit `readyset_done` signal instead of an inference, verification is deterministic — Readyset runs the project's own tests itself instead of trusting a self-reported note — the handed-off execution runs on the model you pinned, survives an omp restart, and gets the risk-based review policy applied when it settles. The phase budget actually stops a runaway turn, and the extension is split into focused modules with its machine state out of `CONTEXT.md`.
 
 ### Added
-- **`readyset_done`**: the executing model signals the end of a handed-off execution. `done` is accepted only when every task is checked, has a `_Verified:` note and no evidence conflict, and it settles the handoff as `handoff-done`. `blocked` carries the exact question for the user and counts as an explicit pause, never a stall. The checkbox/fingerprint inference remains the fallback.
+- **`readyset_done`**: the executing model signals the end of a handed-off execution. `status: "done"` is accepted once every task is checked, any evidence conflict is resolved, and Readyset's own test run passes (see verification below); it settles the handoff as `handoff-done`. `status: "blocked"` carries the exact question for the user and counts as an explicit pause, never a stall. A terminal turn with every task checked but no signal still settles as `handoff-settled` (the fallback).
+- **Deterministic verification** (`readyset.verify`): Readyset runs the project's own test command itself — once right after approve as a **baseline** (before any code changes, recorded in `state.json`), again at `readyset_done`, at a checkbox settle, and before an on-demand `/readyset --review` — instead of trusting what the model wrote about its checks. Approving is the consent: the gate panel names the command it authorizes (`tests: Approve lets Readyset run …`).
+  - **Runner detection**, in order: a real `package.json` test script (via `pnpm`/`yarn`/`bun run` when their lockfile is present, else `npm test`), `go test ./...`, `cargo test`, `python -m pytest -q`, a Makefile `test:` target. `readyset.verify.command` overrides; `command: none` disables.
+  - **Only new failures count.** A red baseline is recorded and announced; a run that fails only with failures already in the baseline never refuses `done` and never fires `tests-failing` — the apply prompt tells the model to leave those alone.
+  - **`_Verified:` notes** (and the evidence-citation and session-stop checks below) are required only when nothing is detected to run, or `readyset.verify.requireNotes: true` is set — otherwise the test run itself is the verification.
 - **Evidence citations**: the apply prompt recommends `readyset_verify` and asks for the record to be cited as `evidence E00N` in the task's note. A citation of a missing record, another task's record, or a failed run is an evidence conflict, shown in the gate and refused by `readyset_done`.
+- **A `session_stop` verification gate** (only with `readyset.verify.requireNotes: true`) blocks the approving session from ending, up to twice per change, while a checked task lacks a `_Verified:` note. Subagents spawned during the execution are never gated.
+- **Approve-base tracking**: `HEAD` at approve time is recorded; scope checks, review triggers and the Apply diff stats measure against it, so commits the execution makes mid-run are no longer invisible.
+- **Review policy at settle**: when a handed-off execution settles for real (not a pause or a supersede), `readyset.review.mode` is applied — a skip stub in `REVIEW.md` with the reason, or a notice recommending `/readyset --review <change-id>` that names the triggers that fired (including the new `tests-failing` trigger).
+- **Handoff survives an omp restart**: the unsettled handoff is mirrored to `readyset/changes/<id>/handoff.json`; the same session re-attaches it after a restart or resume, and `/readyset --review <id>` closes one left behind by another session as `handoff-orphaned`.
+- **`readyset_verify` is live for the whole handed-off execution** again.
 - **`readyset.phaseBudget.minutes`** (default 20, fractions allowed, `0` = measure only): the wall-clock ceiling per Explore/Propose turn.
-- The `apply` `end` event records how the execution got there (`handoff`: pauses, blocks, verification blocks, rehydrated, signal) and the review policy's decision at settle (`reviewPolicy`).
+- The `apply` `end` event records how the execution got there (`handoff`: pauses, blocks, verification blocks, rehydrated, signal), the test run (`tests: { command, exitCode, passed, durationMs }`) and the review policy's decision at settle (`reviewPolicy`).
 
 ### Changed
+- **`/readyset <idea>` needs no `--idea`**: bare text after the flags is the idea (`--idea` still works). Every value-taking flag now consumes its value, even an invalid one, so a bad `--lane` value can't be mistaken for the start of an idea — an unknown `--lane` value is now warned about by name instead of silently dropped.
+- **Settling without inference**: the handoff settles on exactly three things — `readyset_done` with status `done`, a terminal turn with every task checked, or the next `/readyset` command superseding it. A terminal turn with tasks still unfinished and no signal is a pause: the execution model stays active until one of those three happens. The pause fingerprint and `handoff-stalled` are gone — there is no more guessing at whether a paused execution has stalled.
 - **The phase budget is enforced**: a turn past its ceiling is aborted (`ctx.abort()`), recorded as `budget-aborted` / `budget-aborted-partial`, and the run continues with what it wrote. It used to be checked only after the turn returned.
+- **Execution runs on the pinned model**: the apply phase model (else the run's `--model` pin) is applied before the handoff and the session's previous model is restored once the execution settles — also when only an apply override was set.
+- **Session identity, not directory**, keys the handoff and the grill session, so a subagent's own settle can never end the parent's.
+- **Grilling runs on the grill model**: `--phase-model grill=` / `readyset.model.phases.grill`, else the run pin, is applied before the grill turn and restored once the brainstorm is written. With `readyset.model` or `modelRoles.default` configured, grilling now runs on that model instead of whatever the session had.
+- **The brainstorm validator accepts a grilled `## Decision` that names its chosen option** (`Chosen option: …`), so the brainstorm-gap warning no longer fires on every grilled run.
+- **Prompts**: benchmark-specific text removed from the product prompts; grounding is lane-aware; the fast-lane review reads only `proposal.md`'s Acceptance scenarios and `tasks.md`; grilling no longer asks the unused per-task git-flow question.
+- **Benchmark table withdrawn** from the README; `docs/BENCHMARK.md` is labeled as not a verified claim about the current version.
 - **Turn reserves**: contract repair and trim no longer reserve turns for Apply/Review, which stopped drawing on the turn budget in 0.16; they keep exactly one turn free for a Refine.
 - **Machine state moved out of `CONTEXT.md`**: phase events go to the change's `events.jsonl` (append-only), the dirty baseline and approve base to `state.json`. `CONTEXT.md` is human-readable only. Legacy markers are still read, so in-flight changes survive the upgrade. readyset-bench reads both formats.
-- **Internal**: the 5k-line extension is split into `src/lib/readyset-{types,runtime,prompts,host,gate-ui,repair,review-policy,git,budget,outside-repo,args}.ts`; state is one per-instance `ReadysetState`; host objects are cast in two adapter functions instead of 15 places. No behavior change from the split itself.
+- **Internal**: the 5k-line extension is split into `src/lib/readyset-{types,runtime,prompts,host,gate-ui,repair,review-policy,git,budget,outside-repo,args,verify}.ts`; state is one per-instance `ReadysetState`; host objects are cast in two adapter functions instead of 15 places. No behavior change from the split itself.
 
 ### Fixed
 - `/readyset --review <id>` looked for an `apply` `end` event with outcome `applied`, which the handoff never writes, so its `diff-size` trigger always saw an empty diff. The diff is now measured live against the approve base.
-
-### Lite without the artifact changes (branch `lite-no4`, pending a benchmark)
-- **`/readyset <idea>`**: bare text after the flags is the idea, so `--idea` is no longer needed (it still works). Every value-taking flag now consumes its value, even an invalid one, and an unknown `--lane` value is warned about by name instead of silently dropped.
-- **Verification is deterministic** (`readyset.verify`): Readyset runs the project's test command itself (auto-detected `npm test`, or `readyset.verify.command`; `none` disables) when `readyset_done` says done, at settle, and before `/readyset --review`. A failing run refuses "done" with the output tail, fires the new `tests-failing` review trigger, and is recorded on the `apply`/`review` end events. `_Verified:` notes, evidence citations and the session_stop gate are only required with `readyset.verify.requireNotes: true`; the apply prompt is correspondingly shorter.
-- **No more settle inference**: an unfinished execution pauses until it signals `readyset_done`, checks every task, or the next `/readyset` command supersedes it. The pause fingerprint and `handoff-stalled` are gone.
-- **Verification hardening**: the test command runs once right after approve as a baseline (recorded in `state.json`); only failures that were not in it refuse `done` or fire `tests-failing`, and the apply prompt tells the model to leave the old ones alone. Detection covers pnpm / yarn / bun lockfiles, go, cargo, pytest and a Makefile `test:` target; with nothing detected, `_Verified:` notes are required instead. The gate panel names the command that Approve lets Readyset run.
-- The brainstorm validator accepts a grilled `## Decision` that names its chosen option (`Chosen option: …`), so the brainstorm-gap warning no longer fires on every grilled run.
-
-## 0.17.0 - 2026-09-24
-
-Makes the handed-off execution trustworthy: it runs on the model you pinned, pauses and settles correctly, survives an omp restart, has to show verification before it stops, and gets the risk-based review policy applied when it is done.
-
-### Added
-- **Verification gate at session stop**: while a handed-off execution is live, the session that approved it cannot stop with a checked task in `tasks.md` that lacks a `_Verified:` note — it is sent back at most twice per change, then allowed to stop. Subagents spawned during the execution are never gated.
-- **Approve-base tracking**: `HEAD` at approve time is recorded; scope checks, review triggers and the Apply diff stats measure against it, so commits the execution makes mid-run are no longer invisible.
-- **Review policy at settle**: when a handed-off execution settles, `readyset.review.mode` is applied — a skip stub in `REVIEW.md` with the reason, or a notice recommending `/readyset --review <change-id>` that names the triggers that fired.
-- **Handoff survives an omp restart**: the unsettled handoff is mirrored to `readyset/changes/<id>/handoff.json`; the same session re-attaches it after a restart or resume, and `/readyset --review <id>` closes one left behind by another session as `handoff-orphaned`.
-- **`readyset_verify` is live for the whole handed-off execution** again.
-
-### Changed
-- **Execution runs on the pinned model**: the apply phase model (else the run's `--model` pin) is applied before the handoff and the session's previous model is restored once the execution settles — also when only an apply override was set.
-- **Pause-aware settle**: a terminal turn with tasks still unfinished is a pause (the execution model stays active), two pauses with no observable progress settle as `handoff-stalled`, and a new `/readyset` command supersedes an unsettled handoff (restoring the model and closing the `apply` window).
-- **Session identity, not directory**, keys the handoff and the grill session, so a subagent's own settle can never end the parent's.
-- **Grilling runs on the grill model**: `--phase-model grill=` / `readyset.model.phases.grill`, else the run pin, is applied before the grill turn and restored once the brainstorm is written. With `readyset.model` or `modelRoles.default` configured, grilling now runs on that model instead of whatever the session had.
-- **Prompts**: benchmark-specific text removed from the product prompts; grounding is lane-aware; the fast-lane review reads only `proposal.md`'s Acceptance scenarios and `tasks.md`; grilling no longer asks the unused per-task git-flow question.
-- **Benchmark table withdrawn** from the README; `docs/BENCHMARK.md` is labeled as not a verified claim about the current version.
-
-### Fixed
 - The grill→propose transition crashed because the `agent_end` context has no `waitForIdle`.
 - A `_Verified:` note written as a `- _Verified: …` sub-bullet was counted as missing.
 - The `grill` phase event recorded a model grilling never ran on.

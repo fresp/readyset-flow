@@ -757,10 +757,11 @@ state.json       write-once facts about the change: the pre-existing-dirty basel
                  the approve-base commit, and the test baseline taken right after approve
 REVIEW.md        code-review phase findings, written after implementation, before archive
 handoff.json     transient: exists only while an approved change's handed-off execution is
-                 unsettled (session id, approve time, last pause fingerprint, review policy).
-                 Lets a restarted/resumed omp process re-attach the handoff so the `apply`
-                 window still closes; deleted when it settles. `/readyset --review <id>` closes
-                 one left behind by another session as `handoff-orphaned`
+                 unsettled (arming session id, approve time, pause count, the review policy and
+                 verify settings resolved at approve). Lets a restarted/resumed omp process
+                 re-attach the handoff so the `apply` window still closes; deleted when it
+                 settles. `/readyset --review <id>` closes one left behind by another session as
+                 `handoff-orphaned`
 ```
 
 The **fast lane** carries a smaller set — no `design.md` and no spec delta:
@@ -805,7 +806,10 @@ src/
     readyset-gate-ui.ts     the Review Gate: snapshot, panel, review document, sidebar, classic menu
     readyset-repair.ts      the automatic follow-up turns: scope-contract repair and trim
     readyset-review-policy.ts  review-trigger inputs and the honest REVIEW.md skip stub
-    readyset-git.ts         what a run changed, diff stats against the approve base, pause fingerprint
+    readyset-git.ts         what a run changed, diff stats against the approve base
+    readyset-verify.ts      readyset.verify: detects the project's test command, runs it,
+                             judges a run against the approve-time baseline (only new failures
+                             block), parses failing-test names from its output
     readyset-budget.ts      turn and wall-clock budgets
     readyset-outside-repo.ts  the stay-in-repo tripwire's classifier
     readyset-args.ts        `/readyset` argument parsing

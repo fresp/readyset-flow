@@ -62,7 +62,9 @@ Each phase exists to catch something the previous one is bad at catching on its 
    self-checks/assertions to production code; and never change an existing test's expectations
    unless the requested behavior changes them. A task is only checked off once something actually
    verified it (a test run, a curl, a script execution) — not once code was written that's
-   expected to work. See "The `_Verified:` note" below. Pre-existing uncommitted changes, stray
+   expected to work. Readyset itself runs the project's test command at `readyset_done`, that's
+   the deterministic check; see "Verification" below for when a `_Verified:` note is also
+   required. Pre-existing uncommitted changes, stray
    comments (`// user was editing...`, `// user note...`) and untracked files are the user's active
    work in progress: never clean them up, delete them, or strip them when editing a file — edit
    around them and keep every pre-existing comment and hunk intact.
@@ -150,9 +152,18 @@ comment. A `## Scope deviations` section records any file changed outside the sc
 (`- <path> — <reason>`), and a `## Decisions made during Apply` section records each open decision
 applied at the recommended option (`- <decision> → <chosen option> → <why>`).
 
-### The `_Verified:` note
+### Verification
 
-Immediately below a checked task line, add an indented note in this exact format:
+By default, Readyset verifies deterministically: it runs the project's own test command itself
+(`readyset.verify` — auto-detected, or configured, or `none`) once right after approve as a
+baseline, and again when `readyset_done` is called and at settle. Only a failure that wasn't
+already in the baseline refuses "done" — an exit code is a stronger signal than a self-reported
+note, and Readyset trusts its own run over a claim.
+
+A `_Verified:` note is required only when there's no test command to run (nothing detected in the
+repo, and `readyset.verify.command` isn't set) or `readyset.verify.requireNotes: true` is
+configured. When required, add an indented note immediately below a checked task line, in this
+exact format:
 
 ```
 - [x] 1.1 Add rate limiting to the webhook endpoint
@@ -167,7 +178,7 @@ why rather than leaving the box unexplained:
   _Verified: doc-only, no behavior to check_
 ```
 
-A checked box with no `_Verified:` note under it means the task was marked done without
+When notes are required, a checked box with none under it means the task was marked done without
 anything that actually checked it — `checkTaskVerification()` in `readyset-spec.ts` counts
 these, and the review gate in `/readyset` will stop and offer to send the change back
 for another pass if any are missing. Don't check a box you haven't verified just to look
