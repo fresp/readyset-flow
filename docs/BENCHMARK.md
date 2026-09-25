@@ -1,4 +1,4 @@
-# Benchmark: /plan vs /readyset (0.15.0)
+# Benchmark: /plan vs /readyset (0.17.0)
 
 > **⚠ Not a verified claim about the current version.** Everything below is labelled "0.15.0", but
 > the numbers themselves match an earlier v0.12 run — they were never actually regenerated for
